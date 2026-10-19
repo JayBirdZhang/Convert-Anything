@@ -93,6 +93,8 @@ struct ContentView: View {
             Divider()
             Toggle("Move originals to Trash", isOn: $model.moveOriginalsToTrash)
                 .help("Keeps a backup of each original file in the Trash. Turn off to delete originals.")
+            Toggle("Export every page of PDFs and slides", isOn: $model.exportAllPages)
+                .help("When a multi-page PDF or PowerPoint is renamed to an image format, save every page as an image in a folder. Off: only the first page.")
             Toggle("Show notifications", isOn: $model.showNotifications)
             Toggle("Open at login", isOn: $model.launchAtLogin)
         }
@@ -113,7 +115,7 @@ private struct JobRow: View {
         HStack(alignment: .top, spacing: 8) {
             icon.frame(width: 18)
             VStack(alignment: .leading, spacing: 3) {
-                Text(job.fileURL.lastPathComponent)
+                Text((job.resultURL ?? job.fileURL).lastPathComponent)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 switch job.state {
@@ -142,7 +144,7 @@ private struct JobRow: View {
         switch job.state {
         case .waiting: return "Waiting · \(conversion)"
         case .converting: return conversion
-        case .done: return conversion
+        case .done: return job.pageCount.map { "\(conversion) · \($0) images" } ?? conversion
         case .failed(let message): return message
         case .cancelled: return "Cancelled · name restored"
         case .undone: return "Undone · original restored"

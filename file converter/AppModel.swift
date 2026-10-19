@@ -21,6 +21,8 @@ import UserNotifications
     let started = Date()
     var state: State = .waiting
     var originalInTrash: URL?
+    var resultURL: URL?     // The converted file, or a folder of images when every page was exported
+    var pageCount: Int?
     var task: Task<Void, Never>?
 
     init(originalURL: URL, fileURL: URL, from: Format, to: Format) {
@@ -51,6 +53,9 @@ import UserNotifications
     var showNotifications: Bool {
         didSet { defaults.set(showNotifications, forKey: Keys.notifications) }
     }
+    var exportAllPages: Bool {
+        didSet { defaults.set(exportAllPages, forKey: Keys.allPages) }
+    }
     var launchAtLogin: Bool {
         didSet {
             guard launchAtLogin != (SMAppService.mainApp.status == .enabled) else { return }
@@ -76,6 +81,7 @@ import UserNotifications
         static let paused = "paused"
         static let trashOriginals = "moveOriginalsToTrash"
         static let notifications = "showNotifications"
+        static let allPages = "exportAllPages"
     }
 
     init() {
@@ -85,6 +91,7 @@ import UserNotifications
         isWatching = !defaults.bool(forKey: Keys.paused)
         moveOriginalsToTrash = defaults.object(forKey: Keys.trashOriginals) as? Bool ?? true
         showNotifications = defaults.object(forKey: Keys.notifications) as? Bool ?? true
+        exportAllPages = defaults.object(forKey: Keys.allPages) as? Bool ?? true
         launchAtLogin = SMAppService.mainApp.status == .enabled
 
         watcher.onRename = { [weak self] from, to in self?.handleRename(from: from, to: to) }
@@ -152,7 +159,9 @@ import UserNotifications
             let request = Converter.Request(
                 input: input, from: job.from, to: job.to, workDir: workDir,
                 title: job.fileURL.deletingPathExtension().lastPathComponent,
-                originalDir: job.fileURL.deletingLastPathComponent())
+                originalDir: job.fileURL.deletingLastPathComponent(),
+                allPages: exportAllPages,
+                outputExtension: job.fileURL.pathExtension.lowercased())
             let output = try await Converter.convert(request) { progress in
                 Task { @MainActor in
                     if job.isActive { job.state = .converting(progress: progress) }
@@ -173,17 +182,29 @@ import UserNotifications
                 job.originalInTrash = trashed as URL?
             }
 
-            do {
-                _ = try fileManager.replaceItemAt(job.fileURL, withItemAt: output)
-            } catch {
-                // replaceItemAt needs both files on the same disk; fall back to delete + move.
+            var isFolder: ObjCBool = false
+            if fileManager.fileExists(atPath: output.path, isDirectory: &isFolder), isFolder.boolValue {
+                // Every page became its own image: they go in a folder named after the file, which replaces it.
+                // The renamed file still holds the original contents, which are already backed up.
+                let folder = uniqueURL(job.fileURL.deletingPathExtension())
+                try fileManager.moveItem(at: output, to: folder)
                 try fileManager.removeItem(at: job.fileURL)
-                try fileManager.moveItem(at: output, to: job.fileURL)
+                job.resultURL = folder
+                job.pageCount = try fileManager.contentsOfDirectory(atPath: folder.path).count
+            } else {
+                do {
+                    _ = try fileManager.replaceItemAt(job.fileURL, withItemAt: output)
+                } catch {
+                    // replaceItemAt needs both files on the same disk; fall back to delete + move.
+                    try fileManager.removeItem(at: job.fileURL)
+                    try fileManager.moveItem(at: output, to: job.fileURL)
+                }
+                job.resultURL = job.fileURL
             }
 
             job.state = .done
-            if Date().timeIntervalSince(job.started) > 3 {
-                notify("Converted \(job.fileURL.lastPathComponent)", body: "\(job.from.displayName) → \(job.to.displayName)")
+            if Date().timeIntervalSince(job.started) > 3, let result = job.resultURL {
+                notify("Converted \(result.lastPathComponent)", body: "\(job.from.displayName) → \(job.to.displayName)")
             }
         } catch is CancellationError {
             revertRename(job)
@@ -225,8 +246,9 @@ import UserNotifications
                 throw ConversionError.failed("A file named \(job.originalURL.lastPathComponent) already exists.")
             }
             try fileManager.moveItem(at: trashed, to: job.originalURL)
-            if fileManager.fileExists(atPath: job.fileURL.path) {
-                try fileManager.trashItem(at: job.fileURL, resultingItemURL: nil)
+            let result = job.resultURL ?? job.fileURL
+            if fileManager.fileExists(atPath: result.path) {
+                try fileManager.trashItem(at: result, resultingItemURL: nil)
             }
             job.state = .undone
         } catch {
@@ -235,7 +257,7 @@ import UserNotifications
     }
 
     func reveal(_ job: Job) {
-        let url = job.state == .done ? job.fileURL : job.originalURL
+        let url = job.state == .done ? job.resultURL ?? job.fileURL : job.originalURL
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
@@ -257,6 +279,17 @@ import UserNotifications
 
     func removeFolder(_ path: String) {
         watchedFolders.removeAll { $0 == path }
+    }
+
+    /// "deck", then "deck 2", "deck 3"… if that name is taken.
+    private func uniqueURL(_ url: URL) -> URL {
+        var candidate = url
+        var number = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = url.deletingLastPathComponent().appending(path: "\(url.lastPathComponent) \(number)")
+            number += 1
+        }
+        return candidate
     }
 
     private func trimHistory() {

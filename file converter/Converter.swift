@@ -53,14 +53,18 @@ enum Converter {
         let workDir: URL
         let title: String       // File name without extension, used for document titles
         let originalDir: URL    // Lets pandoc find images referenced by relative path
+        var allPages = false    // PDF/slides → image: render every page into a folder instead of just the first
+        var outputExtension: String?   // The extension as typed (jpg vs jpeg), for naming page images
     }
 
-    /// Returns the URL of the converted file inside `request.workDir`.
+    /// Returns the URL of the converted file inside `request.workDir`, or of a folder of images
+    /// when every page of a multi-page PDF or presentation was rendered.
     static func convert(_ request: Request, progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
         guard let route = route(from: request.from, to: request.to) else {
             throw ConversionError.unsupported(request.from, request.to)
         }
         let output = request.workDir.appending(path: "output.\(request.to.rawValue)")
+        var result = output
         switch route {
         case .image:
             if request.to == .webp {
@@ -75,13 +79,13 @@ enum Converter {
                 try ImageConversion.imageToPDF(request.input, output: output)
             }.value
         case .pdfToImage:
-            try await renderFirstPage(of: request.input, to: request.to, output: output, workDir: request.workDir)
+            result = try await renderPages(of: request.input, request: request, output: output, progress: progress)
         case .fromSlides:
             let pdf = try await LibreOffice.convert(request.input, to: "pdf", workDir: request.workDir)
             if request.to == .pdf {
                 try FileManager.default.moveItem(at: pdf, to: output)
             } else {
-                try await renderFirstPage(of: pdf, to: request.to, output: output, workDir: request.workDir)
+                result = try await renderPages(of: pdf, request: request, output: output, progress: progress)
             }
         case .toSlides:
             try await SlideBuilder.build(request, output: output, progress: progress)
@@ -90,20 +94,64 @@ enum Converter {
         case .media:
             try await MediaConversion.convert(request, output: output, progress: progress)
         }
-        guard FileManager.default.fileExists(atPath: output.path) else {
+        guard FileManager.default.fileExists(atPath: result.path) else {
             throw ConversionError.failed("The converter didn't produce a file.")
         }
-        return output
+        return result
     }
 
-    private static func renderFirstPage(of pdf: URL, to format: Format, output: URL, workDir: URL) async throws {
-        let rendered = format == .webp ? workDir.appending(path: "page.png") : output
-        try await Task.detached(priority: .utility) {
-            try ImageConversion.pdfToImage(pdf, format: format == .webp ? .png : format, output: rendered)
-        }.value
-        if format == .webp {
-            try await writeWebP(from: rendered, to: output, workDir: workDir)
+    /// Renders the first page to `output`, or, with `allPages`, every page of a multi-page PDF
+    /// into a folder of images named "<title> 01", "<title> 02"…
+    private static func renderPages(of pdf: URL, request: Request, output: URL,
+                                    progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+        let format = request.to
+        let rendersWebP = format == .webp
+        let pageCount = PDFDocument(url: pdf)?.pageCount ?? 0
+        let allPages = request.allPages && pageCount > 1
+        let folder = request.workDir.appending(path: "pages")
+        let digits = max(2, String(pageCount).count)
+
+        let title = request.title
+        let typedExtension = request.outputExtension ?? format.rawValue
+        let name: @Sendable (Int, String) -> String = { index, ext in
+            "\(title) \(String(format: "%0\(digits)d", index + 1)).\(ext)"
         }
+
+        // ImageIO can't write WebP, so those pages are rendered as PNG first.
+        let renderFormat: Format = rendersWebP ? .png : format
+        let rendered: [URL] = try await Task.detached(priority: .utility) {
+            guard allPages else {
+                let url = rendersWebP ? request.workDir.appending(path: "page.png") : output
+                try ImageConversion.pdfToImage(pdf, format: renderFormat, output: url)
+                return [url]
+            }
+            guard let document = PDFDocument(url: pdf) else { throw ConversionError.failed("Couldn't read this PDF.") }
+            let directory = rendersWebP ? request.workDir.appending(path: "png-pages") : folder
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var urls: [URL] = []
+            for index in 0..<document.pageCount {
+                try Task.checkCancellation()
+                guard let page = document.page(at: index) else { continue }
+                let url = directory.appending(path: name(index, rendersWebP ? "png" : typedExtension))
+                try ImageConversion.write(ImageConversion.render(page), to: url, format: renderFormat,
+                                          properties: [kCGImageDestinationLossyCompressionQuality: 0.9])
+                urls.append(url)
+                progress(Double(index + 1) / Double(document.pageCount) * (rendersWebP ? 0.5 : 1))
+            }
+            return urls
+        }.value
+
+        guard rendersWebP else { return allPages ? folder : output }
+        guard allPages else {
+            try await writeWebP(from: rendered[0], to: output, workDir: request.workDir)
+            return output
+        }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for (index, png) in rendered.enumerated() {
+            try await writeWebP(from: png, to: folder.appending(path: name(index, "webp")), workDir: request.workDir)
+            progress(0.5 + Double(index + 1) / Double(rendered.count) * 0.5)
+        }
+        return folder
     }
 
     /// Neither ImageIO nor Homebrew's ffmpeg can write WebP, so use Google's cwebp.
@@ -177,9 +225,9 @@ nonisolated enum ImageConversion {
         guard document.write(to: output) else { throw ConversionError.failed("Couldn't write the PDF.") }
     }
 
-    /// Renders the first page at 2x (144 dpi).
-    static func pdfToImage(_ input: URL, format: Format, output: URL) throws {
-        guard let page = PDFDocument(url: input)?.page(at: 0) else {
+    /// Renders one page (the first by default) at 2x (144 dpi).
+    static func pdfToImage(_ input: URL, page index: Int = 0, format: Format, output: URL) throws {
+        guard let page = PDFDocument(url: input)?.page(at: index) else {
             throw ConversionError.failed("Couldn't read this PDF.")
         }
         try write(render(page), to: output, format: format, properties: [kCGImageDestinationLossyCompressionQuality: 0.9])
