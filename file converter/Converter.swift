@@ -234,8 +234,11 @@ nonisolated enum ImageConversion {
     }
 
     static func render(_ page: PDFPage, scale: CGFloat = 2) throws -> CGImage {
-        let bounds = page.bounds(for: .mediaBox)
-        guard let context = CGContext(data: nil, width: Int(bounds.width * scale), height: Int(bounds.height * scale),
+        // The crop box is the visible page; rotated pages (common in scans) swap width and height.
+        let bounds = page.bounds(for: .cropBox)
+        let rotated = abs(page.rotation) % 180 == 90
+        let size = rotated ? CGSize(width: bounds.height, height: bounds.width) : bounds.size
+        guard let context = CGContext(data: nil, width: Int(size.width * scale), height: Int(size.height * scale),
                                       bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                       bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
             throw ConversionError.failed("Couldn't render this PDF.")
@@ -243,7 +246,7 @@ nonisolated enum ImageConversion {
         context.setFillColor(.white)
         context.fill(CGRect(x: 0, y: 0, width: context.width, height: context.height))
         context.scaleBy(x: scale, y: scale)
-        page.draw(with: .mediaBox, to: context)
+        page.draw(with: .cropBox, to: context)
         guard let image = context.makeImage() else { throw ConversionError.failed("Couldn't render this PDF.") }
         return image
     }
