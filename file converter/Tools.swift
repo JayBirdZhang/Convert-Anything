@@ -39,11 +39,12 @@ nonisolated enum Tools {
 
     /// Runs a tool at low priority and returns its stdout. Cancelling the calling task terminates the process.
     @discardableResult
-    static func run(_ tool: String, _ arguments: [String], onLine: (@Sendable (String) -> Void)? = nil) async throws -> String {
+    static func run(_ tool: String, _ arguments: [String], currentDirectory: URL? = nil, onLine: (@Sendable (String) -> Void)? = nil) async throws -> String {
         let box = ProcessBox()
         let process = box.process
         process.executableURL = URL(fileURLWithPath: tool)
         process.arguments = arguments
+        process.currentDirectoryURL = currentDirectory
         process.qualityOfService = .utility
         process.standardInput = FileHandle.nullDevice
 

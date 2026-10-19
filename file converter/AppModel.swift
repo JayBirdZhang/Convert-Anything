@@ -68,7 +68,7 @@ import UserNotifications
 
     private let defaults = UserDefaults.standard
     private let watcher = FolderWatcher()
-    private let videoLane = SerialLane()
+    private let heavyLane = SerialLane()
     private var askedForNotifications = false
 
     private enum Keys {
@@ -133,8 +133,8 @@ import UserNotifications
 
     private func run(_ job: Job) async {
         let heavy = Converter.isHeavy(from: job.from, to: job.to)
-        if heavy { await videoLane.acquire() }
-        defer { if heavy { videoLane.release() } }
+        if heavy { await heavyLane.acquire() }
+        defer { if heavy { heavyLane.release() } }
 
         let fileManager = FileManager.default
         let workDir = fileManager.temporaryDirectory.appending(path: "FileConverter/\(job.id.uuidString)")

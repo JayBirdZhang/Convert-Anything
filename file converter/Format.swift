@@ -4,7 +4,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     // Images
     case png, jpeg, heic, tiff, gif, bmp, webp, avif, ico
     // Documents
-    case pdf, md, txt, html, docx, doc, rtf, odt, epub, tex
+    case pdf, md, txt, html, docx, doc, rtf, odt, epub, tex, pptx
     // Audio
     case mp3, wav, m4a, aac, flac, ogg, opus, aiff
     // Video
@@ -31,7 +31,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     var kind: Kind {
         switch self {
         case .png, .jpeg, .heic, .tiff, .gif, .bmp, .webp, .avif, .ico: .image
-        case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .epub, .tex: .document
+        case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .epub, .tex, .pptx: .document
         case .mp3, .wav, .m4a, .aac, .flac, .ogg, .opus, .aiff: .audio
         case .mp4, .mov, .m4v, .mkv, .webm, .avi: .video
         }
@@ -46,6 +46,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
         case .jpeg: "JPEG"
         case .md: "Markdown"
         case .txt: "plain text"
+        case .pptx: "PowerPoint"
         default: rawValue.uppercased()
         }
     }
@@ -108,7 +109,7 @@ nonisolated enum Sniffer {
             if b[1] & 0xF6 == 0xF0 { return .format(.aac) }   // ADTS
             if b[1] & 0xE0 == 0xE0 { return .format(.mp3) }   // MPEG audio frame sync
         }
-        if at(0, "PK\u{03}\u{04}") { return detectZip(b) }
+        if at(0, "PK\u{03}\u{04}") { return detectZip(url, head: data) }
 
         // Text: no NUL bytes and valid UTF-8 (allowing a character cut off at the 4 KB boundary).
         if !b.contains(0), String(data: data, encoding: .utf8) != nil || String(data: data.dropLast(3), encoding: .utf8) != nil {
@@ -120,12 +121,19 @@ nonisolated enum Sniffer {
         return .unknown
     }
 
-    /// docx, odt and epub are all zip archives; tell them apart by their first entries.
-    private static func detectZip(_ b: [UInt8]) -> Result {
-        let text = String(decoding: b, as: UTF8.self)
-        if text.contains("application/epub+zip") { return .format(.epub) }
-        if text.contains("application/vnd.oasis.opendocument.text") { return .format(.odt) }
-        if text.contains("word/") || text.contains("[Content_Types].xml") { return .format(.docx) }
+    /// docx, pptx, odt and epub are all zip archives. epub and odt name themselves in their first entry;
+    /// Office files are told apart by the folder names listed in the zip's directory at the end of the file.
+    private static func detectZip(_ url: URL, head: Data) -> Result {
+        if head.range(of: Data("application/epub+zip".utf8)) != nil { return .format(.epub) }
+        if head.range(of: Data("application/vnd.oasis.opendocument.text".utf8)) != nil { return .format(.odt) }
+
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return .unknown }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        try? handle.seek(toOffset: size > 65_536 ? size - 65_536 : 0)
+        let tail = (try? handle.readToEnd()) ?? Data()
+        if tail.range(of: Data("ppt/presentation.xml".utf8)) != nil { return .format(.pptx) }
+        if tail.range(of: Data("word/document.xml".utf8)) != nil { return .format(.docx) }
         return .unknown
     }
 }

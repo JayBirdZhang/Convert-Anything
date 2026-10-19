@@ -9,12 +9,21 @@ enum Converter {
         case image          // ImageIO (built in)
         case imageToPDF     // PDFKit
         case pdfToImage     // PDFKit
-        case document       // pandoc + textutil
+        case document       // pandoc + textutil (+ LibreOffice for Office → PDF)
         case media          // ffmpeg
+        case fromSlides     // LibreOffice renders PowerPoint to PDF
+        case toSlides       // One full-slide picture per PDF page or image
     }
 
     static func route(from: Format, to: Format) -> Route? {
         guard from != to else { return nil }
+        if from == .pptx {
+            return to == .pdf || to.kind == .image ? .fromSlides : nil
+        }
+        if to == .pptx {
+            if from == .pdf || from.kind == .image { return .toSlides }
+            return [.md, .txt, .html, .docx, .doc, .rtf, .odt].contains(from) ? .document : nil
+        }
         switch (from.kind, to.kind) {
         case (.image, .image): return .image
         case (.image, .document) where to == .pdf: return .imageToPDF
@@ -27,9 +36,14 @@ enum Converter {
         }
     }
 
-    /// Video conversions can take minutes and use every core, so they run one at a time.
+    /// Video and LibreOffice conversions are slow and use a lot of CPU, so they run one at a time.
     static func isHeavy(from: Format, to: Format) -> Bool {
-        route(from: from, to: to) == .media && (from.kind == .video || to.kind == .video)
+        switch route(from: from, to: to) {
+        case .media: from.kind == .video || to.kind == .video
+        case .fromSlides: true
+        case .document: DocumentConversion.usesLibreOffice(from: from, to: to)
+        default: false
+        }
     }
 
     struct Request: Sendable {
@@ -61,13 +75,16 @@ enum Converter {
                 try ImageConversion.imageToPDF(request.input, output: output)
             }.value
         case .pdfToImage:
-            let rendered = request.to == .webp ? request.workDir.appending(path: "page.png") : output
-            try await Task.detached(priority: .utility) {
-                try ImageConversion.pdfToImage(request.input, format: request.to == .webp ? .png : request.to, output: rendered)
-            }.value
-            if request.to == .webp {
-                try await writeWebP(from: rendered, to: output, workDir: request.workDir)
+            try await renderFirstPage(of: request.input, to: request.to, output: output, workDir: request.workDir)
+        case .fromSlides:
+            let pdf = try await LibreOffice.convert(request.input, to: "pdf", workDir: request.workDir)
+            if request.to == .pdf {
+                try FileManager.default.moveItem(at: pdf, to: output)
+            } else {
+                try await renderFirstPage(of: pdf, to: request.to, output: output, workDir: request.workDir)
             }
+        case .toSlides:
+            try await SlideBuilder.build(request, output: output, progress: progress)
         case .document:
             try await DocumentConversion.convert(request, output: output)
         case .media:
@@ -77,6 +94,16 @@ enum Converter {
             throw ConversionError.failed("The converter didn't produce a file.")
         }
         return output
+    }
+
+    private static func renderFirstPage(of pdf: URL, to format: Format, output: URL, workDir: URL) async throws {
+        let rendered = format == .webp ? workDir.appending(path: "page.png") : output
+        try await Task.detached(priority: .utility) {
+            try ImageConversion.pdfToImage(pdf, format: format == .webp ? .png : format, output: rendered)
+        }.value
+        if format == .webp {
+            try await writeWebP(from: rendered, to: output, workDir: workDir)
+        }
     }
 
     /// Neither ImageIO nor Homebrew's ffmpeg can write WebP, so use Google's cwebp.
@@ -155,8 +182,11 @@ nonisolated enum ImageConversion {
         guard let page = PDFDocument(url: input)?.page(at: 0) else {
             throw ConversionError.failed("Couldn't read this PDF.")
         }
+        try write(render(page), to: output, format: format, properties: [kCGImageDestinationLossyCompressionQuality: 0.9])
+    }
+
+    static func render(_ page: PDFPage, scale: CGFloat = 2) throws -> CGImage {
         let bounds = page.bounds(for: .mediaBox)
-        let scale: CGFloat = 2
         guard let context = CGContext(data: nil, width: Int(bounds.width * scale), height: Int(bounds.height * scale),
                                       bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                       bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
@@ -167,7 +197,7 @@ nonisolated enum ImageConversion {
         context.scaleBy(x: scale, y: scale)
         page.draw(with: .mediaBox, to: context)
         guard let image = context.makeImage() else { throw ConversionError.failed("Couldn't render this PDF.") }
-        try write(image, to: output, format: format, properties: [kCGImageDestinationLossyCompressionQuality: 0.9])
+        return image
     }
 }
 
@@ -211,7 +241,18 @@ nonisolated private extension CGImage {
 // MARK: - Documents
 
 enum DocumentConversion {
+    /// LibreOffice lays out Word and OpenDocument files much more faithfully than converting through HTML.
+    static func usesLibreOffice(from: Format, to: Format) -> Bool {
+        to == .pdf && [.docx, .doc, .rtf, .odt].contains(from) && LibreOffice.path != nil
+    }
+
     static func convert(_ request: Converter.Request, output: URL) async throws {
+        if usesLibreOffice(from: request.from, to: request.to) {
+            let pdf = try await LibreOffice.convert(request.input, to: "pdf", workDir: request.workDir)
+            try FileManager.default.moveItem(at: pdf, to: output)
+            return
+        }
+
         var current = request.input
         var currentFormat = request.from
 
@@ -265,7 +306,7 @@ enum DocumentConversion {
         case .tex: args += ["-t", "latex", "--standalone"]
         case .rtf: args += ["-t", "rtf", "--standalone"]
         case .epub: args += ["-t", "epub3", "--metadata", "title=\(request.title)"]
-        case .docx, .odt: args += ["-t", to.rawValue]
+        case .docx, .odt, .pptx: args += ["-t", to.rawValue]
         default: throw ConversionError.unsupported(from, to)
         }
         try await Tools.run(pandoc, args + [input.path])
