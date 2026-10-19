@@ -19,10 +19,7 @@ import UserNotifications
     let from: Format
     let to: Format
     let started = Date()
-    var state: State = .waiting {
-        didSet { if !isActive && finishedAt == nil { finishedAt = Date() } }
-    }
-    var finishedAt: Date?
+    var state: State = .waiting
     var originalInTrash: URL?
     var resultURL: URL?     // The converted file, or a folder of images when every page was exported
     var pageCount: Int?
@@ -56,9 +53,6 @@ import UserNotifications
     var showNotifications: Bool {
         didSet { defaults.set(showNotifications, forKey: Keys.notifications) }
     }
-    var showProgressPopup: Bool {
-        didSet { defaults.set(showProgressPopup, forKey: Keys.popup) }
-    }
     var exportAllPages: Bool {
         didSet { defaults.set(exportAllPages, forKey: Keys.allPages) }
     }
@@ -85,21 +79,10 @@ import UserNotifications
         return values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
     }
 
-    /// Jobs shown in the progress pop-up: running ones, plus ones that finished in the last few seconds.
-    var hudJobs: [Job] {
-        _ = hudRevision
-        return jobs.filter { job in
-            job.isActive || job.finishedAt.map { Date().timeIntervalSince($0) < ProgressHUD.lingerSeconds } == true
-        }
-    }
-    /// Bumped to make the pop-up re-read `hudJobs`, which depends on the clock.
-    var hudRevision = 0
-
     private let defaults = UserDefaults.standard
     private let watcher = FolderWatcher()
     private let heavyLane = SerialLane()
     private var askedForNotifications = false
-    private var hud: ProgressHUD?
     private let notificationDelegate = NotificationDelegate()
 
     private enum Keys {
@@ -108,7 +91,6 @@ import UserNotifications
         static let trashOriginals = "moveOriginalsToTrash"
         static let notifications = "showNotifications"
         static let allPages = "exportAllPages"
-        static let popup = "showProgressPopup"
     }
 
     init() {
@@ -119,11 +101,9 @@ import UserNotifications
         moveOriginalsToTrash = defaults.object(forKey: Keys.trashOriginals) as? Bool ?? true
         showNotifications = defaults.object(forKey: Keys.notifications) as? Bool ?? true
         exportAllPages = defaults.object(forKey: Keys.allPages) as? Bool ?? true
-        showProgressPopup = defaults.object(forKey: Keys.popup) as? Bool ?? true
         launchAtLogin = SMAppService.mainApp.status == .enabled
 
         UNUserNotificationCenter.current().delegate = notificationDelegate
-        hud = ProgressHUD(model: self)
         watcher.onRename = { [weak self] from, to in self?.handleRename(from: from, to: to) }
         restartWatcher()
     }
@@ -164,13 +144,11 @@ import UserNotifications
             return
         }
         job.task = Task { await run(job) }
-        hud?.jobStarted()
     }
 
     // MARK: Running a conversion
 
     private func run(_ job: Job) async {
-        defer { hud?.jobFinished() }
         let heavy = Converter.isHeavy(from: job.from, to: job.to)
         if heavy { await heavyLane.acquire() }
         defer { if heavy { heavyLane.release() } }
@@ -336,10 +314,6 @@ import UserNotifications
     }
 
     // MARK: Notifications
-
-    func refreshHUD() {
-        hudRevision += 1
-    }
 
     private func notify(_ title: String, body: String, reveal: URL? = nil) {
         guard showNotifications else { return }

@@ -95,8 +95,6 @@ struct ContentView: View {
                 .help("Keeps a backup of each original file in the Trash. Turn off to delete originals.")
             Toggle("Export every page of PDFs and slides", isOn: $model.exportAllPages)
                 .help("When a multi-page PDF or PowerPoint is renamed to an image format, save every page as an image in a folder. Off: only the first page.")
-            Toggle("Show progress pop-up", isOn: $model.showProgressPopup)
-                .help("A small panel in the top-right corner shows conversions in progress, then fades away.")
             Toggle("Notify when conversions finish", isOn: $model.showNotifications)
             Toggle("Open at login", isOn: $model.launchAtLogin)
         }
