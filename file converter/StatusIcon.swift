@@ -1,8 +1,11 @@
 import AppKit
 
-/// Menu-bar icon: the usual arrows when idle, a filling ring while converting.
+/// Menu-bar icon while converting: a ring that fills with progress (just the track when progress
+/// isn't known) around a dot that breathes to show work is happening.
 enum StatusIcon {
-    static func ring(progress: Double) -> NSImage {
+    /// `pulse` is a phase in radians; one full cycle is one breath.
+    static func ring(progress: Double?, pulse: Double) -> NSImage {
+        let breath = 0.5 - 0.5 * cos(pulse)   // 0 → 1 → 0
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: false) { rect in
             let center = NSPoint(x: rect.midX, y: rect.midY)
@@ -13,15 +16,18 @@ enum StatusIcon {
             NSColor.black.withAlphaComponent(0.3).setStroke()
             track.stroke()
 
-            let arc = NSBezierPath()
-            arc.appendArc(withCenter: center, radius: radius, startAngle: 90, endAngle: 90 - 360 * max(0.04, progress), clockwise: true)
-            arc.lineWidth = 2.4
-            arc.lineCapStyle = .round
-            NSColor.black.setStroke()
-            arc.stroke()
+            if let progress {
+                let arc = NSBezierPath()
+                arc.appendArc(withCenter: center, radius: radius, startAngle: 90, endAngle: 90 - 360 * max(0.04, progress), clockwise: true)
+                arc.lineWidth = 2.4
+                arc.lineCapStyle = .round
+                NSColor.black.setStroke()
+                arc.stroke()
+            }
 
-            let dot = NSBezierPath(ovalIn: NSRect(x: center.x - 2, y: center.y - 2, width: 4, height: 4))
-            NSColor.black.setFill()
+            let dotRadius = 1.3 + 1.4 * breath
+            let dot = NSBezierPath(ovalIn: NSRect(x: center.x - dotRadius, y: center.y - dotRadius, width: dotRadius * 2, height: dotRadius * 2))
+            NSColor.black.withAlphaComponent(0.45 + 0.55 * breath).setFill()
             dot.fill()
             return true
         }

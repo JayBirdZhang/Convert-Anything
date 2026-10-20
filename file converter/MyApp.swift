@@ -8,10 +8,10 @@ import SwiftUI
         MenuBarExtra {
             ContentView(model: model)
         } label: {
-            if let progress = model.activeProgress {
-                Image(nsImage: StatusIcon.ring(progress: progress))
+            if model.hasActiveJobs {
+                Image(nsImage: StatusIcon.ring(progress: model.activeProgress, pulse: model.pulsePhase))
             } else {
-                Image(systemName: model.hasActiveJobs ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.triangle.2.circlepath")
+                Image(systemName: "arrow.triangle.2.circlepath")
             }
         }
         .menuBarExtraStyle(.window)

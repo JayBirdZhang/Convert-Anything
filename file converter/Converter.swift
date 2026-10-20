@@ -55,6 +55,7 @@ enum Converter {
         let originalDir: URL    // Lets pandoc find images referenced by relative path
         var allPages = false    // PDF/slides → image: render every page into a folder instead of just the first
         var outputExtension: String?   // The extension as typed (jpg vs jpeg), for naming page images
+        var editableSlides = false     // PDF → pptx: editable text boxes instead of page pictures
     }
 
     /// Returns the URL of the converted file inside `request.workDir`, or of a folder of images

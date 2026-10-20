@@ -53,6 +53,9 @@ import UserNotifications
     var showNotifications: Bool {
         didSet { defaults.set(showNotifications, forKey: Keys.notifications) }
     }
+    var editableSlides: Bool {
+        didSet { defaults.set(editableSlides, forKey: Keys.editableSlides) }
+    }
     var exportAllPages: Bool {
         didSet { defaults.set(exportAllPages, forKey: Keys.allPages) }
     }
@@ -70,6 +73,10 @@ import UserNotifications
     private(set) var jobs: [Job] = []
 
     var hasActiveJobs: Bool { jobs.contains(where: \.isActive) }
+
+    /// Drives the breathing dot in the menu-bar icon. Only ticks while something is converting.
+    private(set) var pulsePhase: Double = 0
+    private var pulseTask: Task<Void, Never>?
 
     /// Average progress of running conversions that report it, for the menu-bar ring.
     var activeProgress: Double? {
@@ -91,6 +98,7 @@ import UserNotifications
         static let trashOriginals = "moveOriginalsToTrash"
         static let notifications = "showNotifications"
         static let allPages = "exportAllPages"
+        static let editableSlides = "editableSlides"
     }
 
     init() {
@@ -101,6 +109,7 @@ import UserNotifications
         moveOriginalsToTrash = defaults.object(forKey: Keys.trashOriginals) as? Bool ?? true
         showNotifications = defaults.object(forKey: Keys.notifications) as? Bool ?? true
         exportAllPages = defaults.object(forKey: Keys.allPages) as? Bool ?? true
+        editableSlides = defaults.object(forKey: Keys.editableSlides) as? Bool ?? true
         launchAtLogin = SMAppService.mainApp.status == .enabled
 
         UNUserNotificationCenter.current().delegate = notificationDelegate
@@ -144,11 +153,13 @@ import UserNotifications
             return
         }
         job.task = Task { await run(job) }
+        updatePulse()
     }
 
     // MARK: Running a conversion
 
     private func run(_ job: Job) async {
+        defer { updatePulse() }
         let heavy = Converter.isHeavy(from: job.from, to: job.to)
         if heavy { await heavyLane.acquire() }
         defer { if heavy { heavyLane.release() } }
@@ -171,7 +182,8 @@ import UserNotifications
                 title: job.fileURL.deletingPathExtension().lastPathComponent,
                 originalDir: job.fileURL.deletingLastPathComponent(),
                 allPages: exportAllPages,
-                outputExtension: job.fileURL.pathExtension.lowercased())
+                outputExtension: job.fileURL.pathExtension.lowercased(),
+                editableSlides: editableSlides)
             let output = try await Converter.convert(request) { progress in
                 Task { @MainActor in
                     if job.isActive { job.state = .converting(progress: progress) }
@@ -227,6 +239,22 @@ import UserNotifications
         } catch {
             revertRename(job)
             fail(job, error.localizedDescription)
+        }
+    }
+
+    private func updatePulse() {
+        if hasActiveJobs, pulseTask == nil {
+            pulseTask = Task {
+                // About 12 frames a second, one breath every 1.6 seconds.
+                while !Task.isCancelled {
+                    pulsePhase += 2 * .pi / 19
+                    try? await Task.sleep(for: .milliseconds(84))
+                }
+            }
+        } else if !hasActiveJobs {
+            pulseTask?.cancel()
+            pulseTask = nil
+            pulsePhase = 0
         }
     }
 
