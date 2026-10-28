@@ -8,7 +8,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 10) {
             header
             Divider()
-            if model.jobs.isEmpty {
+            if model.batches.isEmpty {
                 emptyState
             } else {
                 jobList
@@ -30,7 +30,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 Spacer()
-                if model.jobs.contains(where: { !$0.isActive }) {
+                if model.batches.contains(where: { !$0.isActive }) {
                     Button("Clear History") { model.clearFinished() }
                         .font(.caption)
                 }
@@ -74,6 +74,10 @@ struct ContentView: View {
             Text("notes.md → notes.docx  ·  photo.heic → photo.jpg")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Text("Many files: select them in Finder, right-click → Rename…, and replace the extension.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.vertical, 4)
     }
@@ -81,8 +85,12 @@ struct ContentView: View {
     private var jobList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                ForEach(model.jobs) { job in
-                    JobRow(job: job, model: model)
+                ForEach(model.batches) { batch in
+                    if batch.jobs.count == 1, let job = batch.jobs.first {
+                        JobRow(job: job, model: model)
+                    } else {
+                        BatchRow(batch: batch, model: model)
+                    }
                 }
             }
         }
@@ -198,6 +206,100 @@ private struct JobRow: View {
                         .help("Undo: bring back the original from the Trash")
                 }
                 Button { model.reveal(job) } label: { Image(systemName: "magnifyingglass") }
+                    .help("Show in Finder")
+            }
+        }
+        .buttonStyle(.borderless)
+    }
+}
+
+/// Several files renamed together: one row with combined progress, expandable to the individual files.
+private struct BatchRow: View {
+    let batch: Batch
+    let model: AppModel
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                icon.frame(width: 18)
+                VStack(alignment: .leading, spacing: 3) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("\(batch.jobs.count) files → \(batch.to.displayName)")
+                            Image(systemName: "chevron.right")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .rotationEffect(.degrees(expanded ? 90 : 0))
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(expanded ? "Hide files" : "Show files")
+
+                    if batch.isActive {
+                        ProgressView(value: batch.progress).controlSize(.small)
+                        Text("\(batch.finishedCount) of \(batch.jobs.count) · \(batch.folder.lastPathComponent)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(summary)
+                            .font(.caption)
+                            .foregroundStyle(failedCount > 0 ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 4)
+                actions
+            }
+            if expanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(batch.jobs) { job in
+                        JobRow(job: job, model: model)
+                    }
+                }
+                .padding(.leading, 26)
+            }
+        }
+    }
+
+    private func count(_ matches: (Job.State) -> Bool) -> Int { batch.jobs.count { matches($0.state) } }
+    private var failedCount: Int { count { if case .failed = $0 { true } else { false } } }
+
+    private var summary: String {
+        var parts = ["\(count { $0 == .done }) converted"]
+        if failedCount > 0 { parts.append("\(failedCount) failed") }
+        let cancelled = count { $0 == .cancelled }, undone = count { $0 == .undone }
+        if cancelled > 0 { parts.append("\(cancelled) cancelled") }
+        if undone > 0 { parts.append("\(undone) undone") }
+        return parts.joined(separator: " · ")
+    }
+
+    @ViewBuilder private var icon: some View {
+        if batch.isActive {
+            Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(.blue)
+        } else if failedCount > 0 {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        } else if count({ $0 == .done }) > 0 {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        } else {
+            Image(systemName: "arrow.uturn.backward.circle").foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var actions: some View {
+        HStack(spacing: 6) {
+            if batch.isActive {
+                Button { model.cancel(batch) } label: { Image(systemName: "xmark.circle") }
+                    .help("Cancel the rest and restore their original names")
+            } else {
+                if batch.jobs.contains(where: { $0.state == .done && $0.originalInTrash != nil }) {
+                    Button { model.undoAll(batch) } label: { Image(systemName: "arrow.uturn.backward") }
+                        .help("Undo all: bring back every original from the Trash")
+                }
+                Button { model.reveal(batch) } label: { Image(systemName: "magnifyingglass") }
                     .help("Show in Finder")
             }
         }

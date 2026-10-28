@@ -1,5 +1,6 @@
 import AppKit
 import Observation
+import OSLog
 import ServiceManagement
 import UserNotifications
 
@@ -40,6 +41,38 @@ import UserNotifications
     }
 }
 
+/// Renames that arrive together for the same folder and target format, such as a Finder batch rename.
+/// A single rename is a batch of one.
+@Observable final class Batch: Identifiable {
+    let id = UUID()
+    let folder: URL
+    let to: Format
+    var jobs: [Job] = []
+    var lastAdded = Date()
+    var summarized = false      // Its notification has been sent; later renames start a new batch
+
+    init(folder: URL, to: Format) {
+        self.folder = folder
+        self.to = to
+    }
+
+    var isActive: Bool { jobs.contains(where: \.isActive) }
+    var finishedCount: Int { jobs.count(where: { !$0.isActive }) }
+
+    /// Fraction of the batch's work that's done, counting each file's own progress.
+    var progress: Double {
+        guard !jobs.isEmpty else { return 0 }
+        let total = jobs.reduce(0.0) { sum, job in
+            switch job.state {
+            case .waiting: sum
+            case .converting(let progress): sum + (progress ?? 0)
+            default: sum + 1
+            }
+        }
+        return total / Double(jobs.count)
+    }
+}
+
 @Observable final class AppModel {
     var watchedFolders: [String] {
         didSet { defaults.set(watchedFolders, forKey: Keys.watchedFolders); restartWatcher() }
@@ -70,25 +103,39 @@ import UserNotifications
         }
     }
 
-    private(set) var jobs: [Job] = []
+    /// Newest first.
+    private(set) var batches: [Batch] = []
 
-    var hasActiveJobs: Bool { jobs.contains(where: \.isActive) }
+    var jobs: [Job] { batches.flatMap(\.jobs) }
+    var hasActiveJobs: Bool { batches.contains(where: \.isActive) }
 
     /// Drives the breathing dot in the menu-bar icon. Only ticks while something is converting.
     private(set) var pulsePhase: Double = 0
     private var pulseTask: Task<Void, Never>?
 
-    /// Average progress of running conversions that report it, for the menu-bar ring.
+    /// Overall progress for the menu-bar ring: a single file's own progress (nil when it doesn't report any),
+    /// or, with several files on the go, how much of all of them is done.
     var activeProgress: Double? {
-        let values = jobs.compactMap { job -> Double? in
-            if case .converting(let progress?) = job.state { progress } else { nil }
+        let running = batches.filter(\.isActive)
+        let jobs = running.flatMap(\.jobs)
+        if jobs.count == 1 {
+            if case .converting(let progress) = jobs[0].state { return progress }
+            return nil
         }
-        return values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
+        guard !jobs.isEmpty else { return nil }
+        return running.reduce(0.0) { $0 + $1.progress * Double($1.jobs.count) } / Double(jobs.count)
     }
+
+    /// How long after a rename another one still joins the same batch.
+    private static let batchWindow: TimeInterval = 2
 
     private let defaults = UserDefaults.standard
     private let watcher = FolderWatcher()
-    private let heavyLane = SerialLane()
+    // Video and LibreOffice jobs run one at a time; everything else a few at a time, so a big batch
+    // doesn't start dozens of converters at once.
+    private let heavyLane = Lane(limit: 1)
+    private let lightLane = Lane(limit: max(2, ProcessInfo.processInfo.activeProcessorCount / 2))
+    private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ConvertEverything", category: "conversion")
     private var askedForNotifications = false
     private let notificationDelegate = NotificationDelegate()
 
@@ -144,12 +191,24 @@ import UserNotifications
         guard source != newFormat else { return }
 
         let job = Job(originalURL: oldURL, fileURL: newURL, from: source, to: newFormat)
-        jobs.insert(job, at: 0)
-        trimHistory()
+        let folder = newURL.deletingLastPathComponent()
+        let batch: Batch
+        if let open = batches.first(where: {
+            $0.folder == folder && $0.to == newFormat && !$0.summarized && Date().timeIntervalSince($0.lastAdded) < Self.batchWindow
+        }) {
+            batch = open
+        } else {
+            batch = Batch(folder: folder, to: newFormat)
+            batches.insert(batch, at: 0)
+            trimHistory()
+        }
+        batch.jobs.append(job)
+        batch.lastAdded = Date()
 
         guard Converter.route(from: source, to: newFormat) != nil else {
             revertRename(job)
-            fail(job, ConversionError.unsupported(source, newFormat).localizedDescription)
+            job.state = .failed(ConversionError.unsupported(source, newFormat).localizedDescription)
+            summarizeWhenFinished(batch)
             return
         }
         job.task = Task { await run(job) }
@@ -159,10 +218,13 @@ import UserNotifications
     // MARK: Running a conversion
 
     private func run(_ job: Job) async {
-        defer { updatePulse() }
-        let heavy = Converter.isHeavy(from: job.from, to: job.to)
-        if heavy { await heavyLane.acquire() }
-        defer { if heavy { heavyLane.release() } }
+        defer {
+            updatePulse()
+            if let batch = batches.first(where: { $0.jobs.contains { $0 === job } }) { summarizeWhenFinished(batch) }
+        }
+        let lane = Converter.isHeavy(from: job.from, to: job.to) ? heavyLane : lightLane
+        await lane.acquire()
+        defer { lane.release() }
 
         let fileManager = FileManager.default
         let workDir = fileManager.temporaryDirectory.appending(path: "FileConverter/\(job.id.uuidString)")
@@ -225,11 +287,6 @@ import UserNotifications
             }
 
             job.state = .done
-            if let result = job.resultURL {
-                let detail = job.pageCount.map { " · \($0) images" } ?? ""
-                notify("Converted \(result.lastPathComponent)", body: "\(job.from.displayName) → \(job.to.displayName)\(detail)",
-                       reveal: result)
-            }
         } catch is CancellationError {
             revertRename(job)
             job.state = .cancelled
@@ -238,7 +295,7 @@ import UserNotifications
             job.state = .cancelled
         } catch {
             revertRename(job)
-            fail(job, error.localizedDescription)
+            job.state = .failed(error.localizedDescription)
         }
     }
 
@@ -258,9 +315,51 @@ import UserNotifications
         }
     }
 
-    private func fail(_ job: Job, _ message: String) {
-        job.state = .failed(message)
-        notify("Couldn't convert \(job.fileURL.lastPathComponent)", body: message)
+    /// Sends one notification for the whole batch once all its files are finished and no more renames
+    /// are arriving for it.
+    private func summarizeWhenFinished(_ batch: Batch) {
+        guard !batch.isActive, !batch.summarized else { return }
+        Task {
+            let wait = batch.lastAdded.addingTimeInterval(Self.batchWindow).timeIntervalSinceNow
+            if wait > 0 { try? await Task.sleep(for: .seconds(wait)) }
+            guard !batch.isActive, !batch.summarized,
+                  Date().timeIntervalSince(batch.lastAdded) >= Self.batchWindow else { return }
+            batch.summarized = true
+            summarize(batch)
+        }
+    }
+
+    private func summarize(_ batch: Batch) {
+        let done = batch.jobs.filter { $0.state == .done }
+        let failed = batch.jobs.compactMap { job -> (Job, String)? in
+            if case .failed(let message) = job.state { (job, message) } else { nil }
+        }
+        log.notice("Batch to \(batch.to.rawValue, privacy: .public) finished: \(done.count) converted, \(failed.count) failed, \(batch.jobs.count) total")
+
+        if batch.jobs.count == 1, let job = batch.jobs.first {
+            if job.state == .done, let result = job.resultURL {
+                let detail = job.pageCount.map { " · \($0) images" } ?? ""
+                notify("Converted \(result.lastPathComponent)", body: "\(job.from.displayName) → \(job.to.displayName)\(detail)",
+                       reveal: [result])
+            } else if let (job, message) = failed.first {
+                notify("Couldn't convert \(job.originalURL.lastPathComponent)", body: message)
+            }
+            return
+        }
+
+        let target = batch.to.displayName
+        if failed.isEmpty {
+            guard !done.isEmpty else { return }   // Everything was cancelled
+            notify("Converted \(done.count) files to \(target)", body: "In \(batch.folder.lastPathComponent)",
+                   reveal: done.compactMap(\.resultURL))
+        } else if done.isEmpty {
+            notify("Couldn't convert \(failed.count) files to \(target)", body: failed[0].1)
+        } else {
+            let names = failed.prefix(3).map { $0.0.originalURL.lastPathComponent }.joined(separator: ", ")
+            let more = failed.count > 3 ? " and \(failed.count - 3) more" : ""
+            notify("Converted \(done.count) of \(done.count + failed.count) files to \(target)",
+                   body: "Not converted: \(names)\(more)", reveal: done.compactMap(\.resultURL))
+        }
     }
 
     /// Puts the old name back so the file's extension matches its contents again.
@@ -301,8 +400,22 @@ import UserNotifications
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    func cancel(_ batch: Batch) {
+        batch.jobs.filter(\.isActive).forEach { $0.task?.cancel() }
+    }
+
+    func undoAll(_ batch: Batch) {
+        batch.jobs.filter { $0.state == .done && $0.originalInTrash != nil }.forEach(undo)
+    }
+
+    /// Selects the converted files in Finder, or the folder if none were converted.
+    func reveal(_ batch: Batch) {
+        let results = batch.jobs.filter { $0.state == .done }.compactMap(\.resultURL)
+        NSWorkspace.shared.activateFileViewerSelecting(results.isEmpty ? [batch.folder] : results)
+    }
+
     func clearFinished() {
-        jobs.removeAll { !$0.isActive }
+        batches.removeAll { !$0.isActive }
     }
 
     func addFolder() {
@@ -332,10 +445,11 @@ import UserNotifications
         return candidate
     }
 
+    /// Keeps the 20 most recent finished batches (a batch counts once, however many files it has).
     private func trimHistory() {
         var finished = 0
-        jobs.removeAll { job in
-            guard !job.isActive else { return false }
+        batches.removeAll { batch in
+            guard !batch.isActive else { return false }
             finished += 1
             return finished > 20
         }
@@ -343,7 +457,7 @@ import UserNotifications
 
     // MARK: Notifications
 
-    private func notify(_ title: String, body: String, reveal: URL? = nil) {
+    private func notify(_ title: String, body: String, reveal: [URL] = []) {
         guard showNotifications else { return }
         let center = UNUserNotificationCenter.current()
         if !askedForNotifications {
@@ -353,7 +467,7 @@ import UserNotifications
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        if let reveal { content.userInfo = ["reveal": reveal.path] }
+        if !reveal.isEmpty { content.userInfo = ["reveal": reveal.map(\.path)] }
         center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
 }
@@ -366,24 +480,29 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        guard let path = response.notification.request.content.userInfo["reveal"] as? String else { return }
+        guard let paths = response.notification.request.content.userInfo["reveal"] as? [String] else { return }
         await MainActor.run {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            NSWorkspace.shared.activateFileViewerSelecting(paths.map { URL(fileURLWithPath: $0) })
         }
     }
 }
 
-/// Lets one task through at a time; the rest wait their turn in order.
-final class SerialLane {
-    private var busy = false
+/// Lets up to `limit` tasks through at once; the rest wait their turn in order.
+final class Lane {
+    private let limit: Int
+    private var running = 0
     private var waiting: [CheckedContinuation<Void, Never>] = []
 
+    init(limit: Int) {
+        self.limit = limit
+    }
+
     func acquire() async {
-        guard busy else { busy = true; return }
-        await withCheckedContinuation { waiting.append($0) }
+        guard running >= limit else { running += 1; return }
+        await withCheckedContinuation { waiting.append($0) }   // The releasing task hands over its slot
     }
 
     func release() {
-        if waiting.isEmpty { busy = false } else { waiting.removeFirst().resume() }
+        if waiting.isEmpty { running -= 1 } else { waiting.removeFirst().resume() }
     }
 }
