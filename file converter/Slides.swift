@@ -9,16 +9,19 @@ nonisolated enum LibreOffice {
     }
 
     /// Uses its own settings profile, so it never collides with a LibreOffice window you have open.
-    static func convert(_ input: URL, to type: String, workDir: URL) async throws -> URL {
+    /// `type` is an extension, optionally followed by ":<filter>:<options>" (e.g. for CSV encoding).
+    static func convert(_ input: URL, to type: String, workDir: URL, inputFilter: String? = nil) async throws -> URL {
         guard let soffice = path else {
             throw ConversionError.missingTool("LibreOffice", brewPackage: "--cask libreoffice")
         }
         let profile = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appending(path: "FileConverter/LibreOfficeProfile")
         let outDir = workDir.appending(path: "libreoffice")
-        try await Tools.run(soffice, ["-env:UserInstallation=\(profile.absoluteString)", "--headless", "--norestore",
-                                      "--nolockcheck", "--convert-to", type, "--outdir", outDir.path, input.path])
-        let result = outDir.appending(path: input.deletingPathExtension().lastPathComponent + "." + type)
+        var args = ["-env:UserInstallation=\(profile.absoluteString)", "--headless", "--norestore", "--nolockcheck"]
+        if let inputFilter { args.append("--infilter=\(inputFilter)") }
+        try await Tools.run(soffice, args + ["--convert-to", type, "--outdir", outDir.path, input.path])
+        let ext = type.split(separator: ":").first.map(String.init) ?? type
+        let result = outDir.appending(path: input.deletingPathExtension().lastPathComponent + "." + ext)
         // LibreOffice can exit successfully without writing anything when it can't read the file.
         guard FileManager.default.fileExists(atPath: result.path) else {
             throw ConversionError.failed("LibreOffice couldn't open this file.")
@@ -87,7 +90,7 @@ nonisolated enum SlideBuilder {
                     picture = textlessPage
                     slide.text = PDFText.blocks(on: page)
                 }
-                try ImageConversion.write(ImageConversion.render(picture), to: media.appending(path: "image\(slides.count + 1).png"), format: .png)
+                try ImageConversion.write(ImageConversion.render(picture, scale: request.quality.pageScale), to: media.appending(path: "image\(slides.count + 1).png"), format: .png)
                 slides.append(slide)
                 progress(Double(index + 1) / Double(document.pageCount) * 0.9)
             }

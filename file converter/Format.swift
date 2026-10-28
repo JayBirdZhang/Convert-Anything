@@ -3,14 +3,16 @@ import Foundation
 nonisolated enum Format: String, CaseIterable, Sendable {
     // Images
     case png, jpeg, heic, tiff, gif, bmp, webp, avif, ico
-    // Documents
-    case pdf, md, txt, html, docx, doc, rtf, odt, epub, tex, pptx
+    // Documents (including presentations)
+    case pdf, md, txt, html, docx, doc, rtf, odt, epub, tex, pages, pptx, ppt, key
+    // Spreadsheets
+    case xlsx, xls, ods, csv, numbers
     // Audio
     case mp3, wav, m4a, aac, flac, ogg, opus, aiff
     // Video
     case mp4, mov, m4v, mkv, webm, avi
 
-    enum Kind { case image, document, audio, video }
+    enum Kind { case image, document, spreadsheet, audio, video }
 
     init?(fileExtension ext: String) {
         switch ext.lowercased() {
@@ -31,7 +33,8 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     var kind: Kind {
         switch self {
         case .png, .jpeg, .heic, .tiff, .gif, .bmp, .webp, .avif, .ico: .image
-        case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .epub, .tex, .pptx: .document
+        case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .epub, .tex, .pages, .pptx, .ppt, .key: .document
+        case .xlsx, .xls, .ods, .csv, .numbers: .spreadsheet
         case .mp3, .wav, .m4a, .aac, .flac, .ogg, .opus, .aiff: .audio
         case .mp4, .mov, .m4v, .mkv, .webm, .avi: .video
         }
@@ -39,7 +42,12 @@ nonisolated enum Format: String, CaseIterable, Sendable {
 
     /// Plain-text formats can't be told apart by their bytes, so for these
     /// we trust the file's old extension instead.
-    var isPlainText: Bool { [.md, .txt, .html, .tex].contains(self) }
+    var isPlainText: Bool { [.md, .txt, .html, .tex, .csv].contains(self) }
+
+    var isSlides: Bool { [.pptx, .ppt, .key].contains(self) }
+
+    /// Apple's iWork files all look alike inside, so their old extension says which one it is.
+    var isIWork: Bool { [.pages, .key, .numbers].contains(self) }
 
     var displayName: String {
         switch self {
@@ -47,6 +55,14 @@ nonisolated enum Format: String, CaseIterable, Sendable {
         case .md: "Markdown"
         case .txt: "plain text"
         case .pptx: "PowerPoint"
+        case .ppt: "PowerPoint 97"
+        case .key: "Keynote"
+        case .pages: "Pages"
+        case .numbers: "Numbers"
+        case .xlsx: "Excel"
+        case .xls: "Excel 97"
+        case .doc: "Word 97"
+        case .docx: "Word"
         default: rawValue.uppercased()
         }
     }
@@ -58,6 +74,7 @@ nonisolated enum Sniffer {
     enum Result: Equatable {
         case format(Format)
         case text      // Valid UTF-8 with no recognizable markup
+        case iWork     // A Pages, Numbers or Keynote file
         case unknown
     }
 
@@ -81,7 +98,7 @@ nonisolated enum Sniffer {
         if b.starts(with: [0x00, 0x00, 0x01, 0x00]) { return .format(.ico) }
         if at(0, "%PDF") { return .format(.pdf) }
         if at(0, "{\\rtf") { return .format(.rtf) }
-        if b.starts(with: [0xD0, 0xCF, 0x11, 0xE0]) { return .format(.doc) }
+        if b.starts(with: [0xD0, 0xCF, 0x11, 0xE0]) { return detectLegacyOffice(url) }
         if at(0, "fLaC") { return .format(.flac) }
         if at(0, "FORM") && (at(8, "AIFF") || at(8, "AIFC")) { return .format(.aiff) }
         if at(0, "RIFF") {
@@ -121,11 +138,25 @@ nonisolated enum Sniffer {
         return .unknown
     }
 
+    /// Old Word, Excel and PowerPoint files share one container format; the name of the main stream
+    /// inside (stored as UTF-16) says which one it is.
+    private static func detectLegacyOffice(_ url: URL) -> Result {
+        guard let handle = try? FileHandle(forReadingFrom: url),
+              let data = try? handle.read(upToCount: 2_000_000) else { return .unknown }
+        try? handle.close()
+        func has(_ name: String) -> Bool { data.range(of: name.data(using: .utf16LittleEndian)!) != nil }
+        if has("WordDocument") { return .format(.doc) }
+        if has("Workbook") || has("Book") { return .format(.xls) }
+        if has("PowerPoint Document") { return .format(.ppt) }
+        return .unknown
+    }
+
     /// docx, pptx, odt and epub are all zip archives. epub and odt name themselves in their first entry;
     /// Office files are told apart by the folder names listed in the zip's directory at the end of the file.
     private static func detectZip(_ url: URL, head: Data) -> Result {
         if head.range(of: Data("application/epub+zip".utf8)) != nil { return .format(.epub) }
         if head.range(of: Data("application/vnd.oasis.opendocument.text".utf8)) != nil { return .format(.odt) }
+        if head.range(of: Data("application/vnd.oasis.opendocument.spreadsheet".utf8)) != nil { return .format(.ods) }
 
         guard let handle = try? FileHandle(forReadingFrom: url) else { return .unknown }
         defer { try? handle.close() }
@@ -134,6 +165,8 @@ nonisolated enum Sniffer {
         let tail = (try? handle.readToEnd()) ?? Data()
         if tail.range(of: Data("ppt/presentation.xml".utf8)) != nil { return .format(.pptx) }
         if tail.range(of: Data("word/document.xml".utf8)) != nil { return .format(.docx) }
+        if tail.range(of: Data("xl/workbook.xml".utf8)) != nil { return .format(.xlsx) }
+        if tail.range(of: Data("Index/Document.iwa".utf8)) != nil { return .iWork }
         return .unknown
     }
 }

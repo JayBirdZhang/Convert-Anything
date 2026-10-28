@@ -11,22 +11,31 @@ enum Converter {
         case pdfToImage     // PDFKit
         case document       // pandoc + textutil (+ LibreOffice for Office → PDF)
         case media          // ffmpeg
-        case fromSlides     // LibreOffice renders PowerPoint to PDF
-        case toSlides       // One full-slide picture per PDF page or image
+        case fromSlides     // LibreOffice renders a presentation to PDF
+        case toSlides       // One slide per PDF page or image
+        case office         // LibreOffice converts directly (spreadsheets, Keynote/old PowerPoint → pptx)
+        case textRecognition   // Vision reads the text in an image
     }
 
     static func route(from: Format, to: Format) -> Route? {
-        guard from != to else { return nil }
-        if from == .pptx {
-            return to == .pdf || to.kind == .image ? .fromSlides : nil
+        guard from != to, !to.isIWork else { return nil }   // Pages, Numbers and Keynote can be read but not written
+        if from.isSlides {
+            if to == .pdf || to.kind == .image { return .fromSlides }
+            return to == .pptx ? .office : nil
         }
-        if to == .pptx {
+        if to.isSlides {
+            guard to == .pptx else { return nil }
             if from == .pdf || from.kind == .image { return .toSlides }
-            return [.md, .txt, .html, .docx, .doc, .rtf, .odt].contains(from) ? .document : nil
+            return [.md, .txt, .html, .docx, .doc, .rtf, .odt, .pages].contains(from) ? .document : nil
+        }
+        if from.kind == .spreadsheet || to.kind == .spreadsheet {
+            guard from.kind == .spreadsheet else { return nil }
+            return to.kind == .spreadsheet || to == .pdf || to == .html ? .office : nil
         }
         switch (from.kind, to.kind) {
         case (.image, .image): return .image
         case (.image, .document) where to == .pdf: return .imageToPDF
+        case (.image, .document) where [.txt, .md, .docx, .html, .rtf, .odt].contains(to): return .textRecognition
         case (.document, .image) where from == .pdf: return .pdfToImage
         case (.document, .document): return .document
         case (.audio, .audio), (.video, .audio), (.video, .video): return .media
@@ -40,8 +49,8 @@ enum Converter {
     static func isHeavy(from: Format, to: Format) -> Bool {
         switch route(from: from, to: to) {
         case .media: from.kind == .video || to.kind == .video
-        case .fromSlides: true
-        case .document: DocumentConversion.usesLibreOffice(from: from, to: to)
+        case .fromSlides, .office: true
+        case .document: DocumentConversion.usesLibreOffice(from: from, to: to) || from == .pages
         default: false
         }
     }
@@ -56,6 +65,7 @@ enum Converter {
         var allPages = false    // PDF/slides → image: render every page into a folder instead of just the first
         var outputExtension: String?   // The extension as typed (jpg vs jpeg), for naming page images
         var editableSlides = false     // PDF → pptx: editable text boxes instead of page pictures
+        var quality: Quality = .balanced
     }
 
     /// Returns the URL of the converted file inside `request.workDir`, or of a folder of images
@@ -69,10 +79,10 @@ enum Converter {
         switch route {
         case .image:
             if request.to == .webp {
-                try await writeWebP(from: request.input, to: output, workDir: request.workDir)
+                try await writeWebP(from: request.input, to: output, workDir: request.workDir, quality: request.quality)
             } else {
                 try await Task.detached(priority: .utility) {
-                    try ImageConversion.convert(request.input, to: request.to, output: output)
+                    try ImageConversion.convert(request.input, to: request.to, output: output, quality: request.quality)
                 }.value
             }
         case .imageToPDF:
@@ -90,6 +100,14 @@ enum Converter {
             }
         case .toSlides:
             try await SlideBuilder.build(request, output: output, progress: progress)
+        case .office:
+            // CSV is read and written as UTF-8 with commas; LibreOffice's CSV export writes the first sheet.
+            let type = request.to == .csv ? "csv:Text - txt - csv (StarCalc):44,34,76,1" : request.to.rawValue
+            let converted = try await LibreOffice.convert(request.input, to: type, workDir: request.workDir,
+                                                          inputFilter: request.from == .csv ? "CSV:44,34,76,1" : nil)
+            try FileManager.default.moveItem(at: converted, to: output)
+        case .textRecognition:
+            try await TextRecognition.convertImage(request, output: output)
         case .document:
             try await DocumentConversion.convert(request, output: output)
         case .media:
@@ -123,7 +141,7 @@ enum Converter {
         let rendered: [URL] = try await Task.detached(priority: .utility) {
             guard allPages else {
                 let url = rendersWebP ? request.workDir.appending(path: "page.png") : output
-                try ImageConversion.pdfToImage(pdf, format: renderFormat, output: url)
+                try ImageConversion.pdfToImage(pdf, format: renderFormat, output: url, quality: request.quality)
                 return [url]
             }
             guard let document = PDFDocument(url: pdf) else { throw ConversionError.failed("Couldn't read this PDF.") }
@@ -134,8 +152,8 @@ enum Converter {
                 try Task.checkCancellation()
                 guard let page = document.page(at: index) else { continue }
                 let url = directory.appending(path: name(index, rendersWebP ? "png" : typedExtension))
-                try ImageConversion.write(ImageConversion.render(page), to: url, format: renderFormat,
-                                          properties: [kCGImageDestinationLossyCompressionQuality: 0.9])
+                try ImageConversion.write(ImageConversion.render(page, scale: request.quality.pageScale), to: url, format: renderFormat,
+                                          properties: [kCGImageDestinationLossyCompressionQuality: request.quality.imageQuality])
                 urls.append(url)
                 progress(Double(index + 1) / Double(document.pageCount) * (rendersWebP ? 0.5 : 1))
             }
@@ -144,36 +162,71 @@ enum Converter {
 
         guard rendersWebP else { return allPages ? folder : output }
         guard allPages else {
-            try await writeWebP(from: rendered[0], to: output, workDir: request.workDir)
+            try await writeWebP(from: rendered[0], to: output, workDir: request.workDir, quality: request.quality)
             return output
         }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         for (index, png) in rendered.enumerated() {
-            try await writeWebP(from: png, to: folder.appending(path: name(index, "webp")), workDir: request.workDir)
+            try await writeWebP(from: png, to: folder.appending(path: name(index, "webp")), workDir: request.workDir, quality: request.quality)
             progress(0.5 + Double(index + 1) / Double(rendered.count) * 0.5)
         }
         return folder
     }
 
     /// Neither ImageIO nor Homebrew's ffmpeg can write WebP, so use Google's cwebp.
-    private static func writeWebP(from input: URL, to output: URL, workDir: URL) async throws {
+    private static func writeWebP(from input: URL, to output: URL, workDir: URL, quality: Quality) async throws {
         let cwebp = try Tools.require("cwebp", brewPackage: "webp")
         var source = input
         if ![.png, .jpeg, .tiff, .webp].contains(Format(fileExtension: input.pathExtension)) {
             source = workDir.appending(path: "intermediate.png")
             let png = source
             try await Task.detached(priority: .utility) {
-                try ImageConversion.convert(input, to: .png, output: png)
+                try ImageConversion.convert(input, to: .png, output: png, quality: quality)
             }.value
         }
-        try await Tools.run(cwebp, ["-quiet", "-q", "85", "-metadata", "icc", source.path, "-o", output.path])
+        var args = ["-quiet", "-q", "\(quality.webpQuality)", "-metadata", "icc"]
+        if let side = quality.maxImageSide { args += ["-resize_mode", "down_only", "-resize", "\(side)", "0"] }
+        try await Tools.run(cwebp, args + [source.path, "-o", output.path])
     }
+}
+
+// MARK: - Quality
+
+/// How much to favor quality over file size. Applies to photos, page images, audio and video;
+/// documents and lossless formats aren't affected.
+nonisolated enum Quality: String, CaseIterable, Sendable {
+    case best, balanced, small
+
+    var title: String {
+        switch self {
+        case .best: "Best quality"
+        case .balanced: "Balanced"
+        case .small: "Smaller files"
+        }
+    }
+
+    var imageQuality: Double { switch self { case .best: 0.95; case .balanced: 0.88; case .small: 0.7 } }
+    var webpQuality: Int { switch self { case .best: 92; case .balanced: 84; case .small: 70 } }
+    /// Photos are scaled down so their longest side is at most this many pixels.
+    var maxImageSide: Int? { self == .small ? 2560 : nil }
+    /// PDF and slide pages: 2.5x = 180 dpi, 2x = 144 dpi, 1.5x = 108 dpi.
+    var pageScale: CGFloat { switch self { case .best: 2.5; case .balanced: 2; case .small: 1.5 } }
+
+    var videoToolboxQuality: Int { switch self { case .best: 72; case .balanced: 60; case .small: 45 } }
+    var x264CRF: Int { switch self { case .best: 17; case .balanced: 20; case .small: 26 } }
+    var vp9CRF: Int { switch self { case .best: 26; case .balanced: 32; case .small: 38 } }
+    var maxVideoHeight: Int? { self == .small ? 1080 : nil }
+    var gifSettings: (fps: Int, width: Int) { switch self { case .best: (15, 800); case .balanced: (12, 640); case .small: (10, 480) } }
+
+    var mp3VBR: Int { switch self { case .best: 0; case .balanced: 2; case .small: 5 } }
+    var aacBitrate: String { switch self { case .best: "256k"; case .balanced: "192k"; case .small: "128k" } }
+    var opusBitrate: String { switch self { case .best: "160k"; case .balanced: "128k"; case .small: "96k" } }
 }
 
 // MARK: - Images
 
 nonisolated enum ImageConversion {
-    static func convert(_ input: URL, to format: Format, output: URL) throws {
+    static func convert(_ input: URL, to format: Format, output: URL, quality: Quality = .balanced) throws {
         guard let source = CGImageSourceCreateWithURL(input as CFURL, nil), CGImageSourceGetCount(source) > 0 else {
             throw ConversionError.failed("Couldn't read this image.")
         }
@@ -181,6 +234,7 @@ nonisolated enum ImageConversion {
         let width = properties[kCGImagePropertyPixelWidth] as? Int ?? 0
         let height = properties[kCGImagePropertyPixelHeight] as? Int ?? 0
         var maxSize = max(width, height, 1)
+        if let side = quality.maxImageSide { maxSize = min(maxSize, side) }
         if format == .ico { maxSize = min(maxSize, 256) }
 
         // A full-size "thumbnail" with the transform applied bakes in the EXIF rotation (e.g. iPhone photos).
@@ -202,7 +256,9 @@ nonisolated enum ImageConversion {
             tiff[kCGImagePropertyTIFFOrientation] = 1
             metadata[kCGImagePropertyTIFFDictionary] = tiff
         }
-        metadata[kCGImageDestinationLossyCompressionQuality] = 0.9
+        metadata[kCGImageDestinationLossyCompressionQuality] = quality.imageQuality
+        metadata[kCGImagePropertyPixelWidth] = nil
+        metadata[kCGImagePropertyPixelHeight] = nil
         try write(image, to: output, format: format, properties: metadata)
     }
 
@@ -226,12 +282,13 @@ nonisolated enum ImageConversion {
         guard document.write(to: output) else { throw ConversionError.failed("Couldn't write the PDF.") }
     }
 
-    /// Renders one page (the first by default) at 2x (144 dpi).
-    static func pdfToImage(_ input: URL, page index: Int = 0, format: Format, output: URL) throws {
+    /// Renders one page (the first by default) at the quality's resolution.
+    static func pdfToImage(_ input: URL, page index: Int = 0, format: Format, output: URL, quality: Quality = .balanced) throws {
         guard let page = PDFDocument(url: input)?.page(at: index) else {
             throw ConversionError.failed("Couldn't read this PDF.")
         }
-        try write(render(page), to: output, format: format, properties: [kCGImageDestinationLossyCompressionQuality: 0.9])
+        try write(render(page, scale: quality.pageScale), to: output, format: format,
+                  properties: [kCGImageDestinationLossyCompressionQuality: quality.imageQuality])
     }
 
     static func render(_ page: PDFPage, scale: CGFloat = 2) throws -> CGImage {
@@ -295,7 +352,7 @@ nonisolated private extension CGImage {
 enum DocumentConversion {
     /// LibreOffice lays out Word and OpenDocument files much more faithfully than converting through HTML.
     static func usesLibreOffice(from: Format, to: Format) -> Bool {
-        to == .pdf && [.docx, .doc, .rtf, .odt].contains(from) && LibreOffice.path != nil
+        to == .pdf && [.docx, .doc, .rtf, .odt].contains(from) && LibreOffice.path != nil || from == .pages && to == .pdf
     }
 
     static func convert(_ request: Converter.Request, output: URL) async throws {
@@ -312,6 +369,9 @@ enum DocumentConversion {
         switch request.from {
         case .doc, .rtf:
             current = try await textutil(current, to: "docx", in: request.workDir)
+            currentFormat = .docx
+        case .pages:
+            current = try await LibreOffice.convert(current, to: "docx", workDir: request.workDir)
             currentFormat = .docx
         case .pdf:
             current = try await extractPDFText(current, in: request.workDir)
@@ -375,12 +435,16 @@ enum DocumentConversion {
         return output
     }
 
-    private static func extractPDFText(_ input: URL, in workDir: URL) async throws -> URL {
-        let text = await Task.detached(priority: .utility) {
+    static func extractPDFText(_ input: URL, in workDir: URL) async throws -> URL {
+        var text = await Task.detached(priority: .utility) {
             PDFDocument(url: input)?.string ?? ""
         }.value
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // A scan: read the text off the page images instead.
+            text = try await Task.detached(priority: .utility) { try TextRecognition.text(inPDF: input) }.value
+        }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw ConversionError.failed("This PDF has no selectable text (it may be a scan).")
+            throw ConversionError.failed("No text could be found in this PDF.")
         }
         let output = workDir.appending(path: "extracted.txt")
         try text.write(to: output, atomically: true, encoding: .utf8)
@@ -437,7 +501,7 @@ enum MediaConversion {
     static func convert(_ request: Converter.Request, output: URL, progress: @escaping @Sendable (Double) -> Void) async throws {
         let ffmpeg = try Tools.require("ffmpeg")
         let info = await probe(request.input)
-        let attempts = try plan(from: request.from, to: request.to, info: info)
+        let attempts = try plan(from: request.from, to: request.to, info: info, quality: request.quality)
 
         for (index, args) in attempts.enumerated() {
             let duration = info.duration
@@ -489,9 +553,14 @@ enum MediaConversion {
     }
 
     /// Returns ffmpeg argument lists to try in order: fastest first (copying streams without re-encoding when possible).
-    private static func plan(from: Format, to: Format, info: Info) throws -> [[String]] {
-        let evenSize = ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
-        let aac = ["-c:a", "aac", "-b:a", "192k"]
+    private static func plan(from: Format, to: Format, info: Info, quality: Quality) throws -> [[String]] {
+        // Encoders need even dimensions; "Smaller files" also caps the height.
+        let evenSize = ["-vf", quality.maxVideoHeight.map { "scale=-2:'trunc(min(\($0),ih)/2)*2'" } ?? "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+        let aac = ["-c:a", "aac", "-b:a", quality.aacBitrate]
+        // Copying streams as-is is fastest but keeps the original size, so skip it when smaller files are wanted.
+        let mayCopy = quality != .small
+        let videoToolbox = ["-c:v", "h264_videotoolbox", "-q:v", "\(quality.videoToolboxQuality)", "-pix_fmt", "yuv420p"]
+        let x264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "\(quality.x264CRF)", "-pix_fmt", "yuv420p"]
 
         switch to.kind {
         case .audio:
@@ -499,14 +568,15 @@ enum MediaConversion {
                 throw ConversionError.failed("This file has no audio track.")
             }
             var attempts: [[String]] = []
-            if let codec = info.audioCodecs.first, audioCodecs(for: to).contains(codec) {
+            if mayCopy, let codec = info.audioCodecs.first, audioCodecs(for: to).contains(codec) {
                 attempts.append(["-vn", "-c:a", "copy"])
             }
-            attempts.append(["-vn"] + audioEncoder(for: to))
+            attempts.append(["-vn"] + audioEncoder(for: to, quality: quality))
             return attempts
 
         case .image where to == .gif:
-            return [["-vf", "fps=12,scale='min(640,iw)':-2:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse", "-loop", "0"]]
+            let (fps, width) = quality.gifSettings
+            return [["-vf", "fps=\(fps),scale='min(\(width),iw)':-2:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse", "-loop", "0"]]
 
         case .image:
             return [["-frames:v", "1", "-update", "1"]]
@@ -520,25 +590,23 @@ enum MediaConversion {
                 var attempts: [[String]] = []
                 let copyableVideo = to == .mov ? ["h264", "hevc", "prores", "mjpeg"] : ["h264", "hevc"]
                 let copyableAudio = to == .mov ? ["aac", "alac", "mp3", "pcm_s16le", "pcm_s24le"] : ["aac", "alac", "mp3"]
-                if from != .gif, copyableVideo.contains(video), audioOK(copyableAudio) {
+                if mayCopy, from != .gif, copyableVideo.contains(video), audioOK(copyableAudio) {
                     attempts.append(["-c", "copy", "-sn", "-dn"] + (video == "hevc" ? ["-tag:v", "hvc1"] : []) + faststart)
                 }
                 // Apple's hardware encoder: fast and cool-running. Software x264 as the universal fallback.
-                attempts.append(["-c:v", "h264_videotoolbox", "-q:v", "60", "-pix_fmt", "yuv420p"] + evenSize + aac + ["-sn", "-dn"] + faststart)
-                attempts.append(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"] + evenSize + aac + ["-sn", "-dn"] + faststart)
+                attempts.append(videoToolbox + evenSize + aac + ["-sn", "-dn"] + faststart)
+                attempts.append(x264 + evenSize + aac + ["-sn", "-dn"] + faststart)
                 return attempts
             case .mkv:
-                return [["-c", "copy"],
-                        ["-c:v", "h264_videotoolbox", "-q:v", "60", "-pix_fmt", "yuv420p"] + evenSize + aac,
-                        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"] + evenSize + aac]
+                return (mayCopy ? [["-c", "copy"]] : []) + [videoToolbox + evenSize + aac, x264 + evenSize + aac]
             case .webm:
                 var attempts: [[String]] = []
-                if ["vp8", "vp9", "av1"].contains(video), audioOK(["opus", "vorbis"]) { attempts.append(["-c", "copy", "-sn"]) }
-                attempts.append(["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-row-mt", "1", "-deadline", "good", "-cpu-used", "4",
-                                 "-c:a", "libopus", "-b:a", "128k", "-sn"])
+                if mayCopy, ["vp8", "vp9", "av1"].contains(video), audioOK(["opus", "vorbis"]) { attempts.append(["-c", "copy", "-sn"]) }
+                attempts.append(["-c:v", "libvpx-vp9", "-crf", "\(quality.vp9CRF)", "-b:v", "0", "-row-mt", "1", "-deadline", "good", "-cpu-used", "4"]
+                                + (quality.maxVideoHeight != nil ? evenSize : []) + ["-c:a", "libopus", "-b:a", quality.opusBitrate, "-sn"])
                 return attempts
             case .avi:
-                return [["-c:v", "mpeg4", "-q:v", "3", "-c:a", "libmp3lame", "-q:a", "2"]]
+                return [["-c:v", "mpeg4", "-q:v", quality == .small ? "6" : "3"] + evenSize + ["-c:a", "libmp3lame", "-q:a", "\(quality.mp3VBR)"]]
             default:
                 throw ConversionError.unsupported(from, to)
             }
@@ -560,15 +628,15 @@ enum MediaConversion {
         }
     }
 
-    private static func audioEncoder(for format: Format) -> [String] {
+    private static func audioEncoder(for format: Format, quality: Quality) -> [String] {
         switch format {
-        case .mp3: ["-c:a", "libmp3lame", "-q:a", "2"]
-        case .m4a, .aac: ["-c:a", "aac", "-b:a", "192k"]
+        case .mp3: ["-c:a", "libmp3lame", "-q:a", "\(quality.mp3VBR)"]
+        case .m4a, .aac: ["-c:a", "aac", "-b:a", quality.aacBitrate]
         case .wav: ["-c:a", "pcm_s16le"]
         case .aiff: ["-c:a", "pcm_s16be"]
         case .flac: ["-c:a", "flac"]
         // Homebrew's ffmpeg has no Vorbis encoder; Opus in an Ogg file plays everywhere Vorbis does.
-        case .ogg, .opus: ["-c:a", "libopus", "-b:a", "128k"]
+        case .ogg, .opus: ["-c:a", "libopus", "-b:a", quality.opusBitrate]
         default: []
         }
     }

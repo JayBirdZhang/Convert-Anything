@@ -3,8 +3,21 @@ import SwiftUI
 struct ContentView: View {
     @Bindable var model: AppModel
     @State private var showSettings = false
+    @State private var showFormats = false
 
     var body: some View {
+        Group {
+            if showFormats {
+                FormatsView { showFormats = false }
+            } else {
+                main
+            }
+        }
+        .padding(14)
+        .frame(width: 340)
+    }
+
+    private var main: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
             Divider()
@@ -35,6 +48,12 @@ struct ContentView: View {
                         .font(.caption)
                 }
                 Button {
+                    showFormats = true
+                } label: {
+                    Image(systemName: "info.circle")
+                }
+                .help("What can I convert?")
+                Button {
                     NSApplication.shared.terminate(nil)
                 } label: {
                     Image(systemName: "power")
@@ -48,8 +67,6 @@ struct ContentView: View {
                 settings.padding(.top, 2)
             }
         }
-        .padding(14)
-        .frame(width: 340)
     }
 
     private var header: some View {
@@ -119,8 +136,16 @@ struct ContentView: View {
                 .buttonStyle(.borderless)
 
             Divider()
-            Toggle("Move originals to Trash", isOn: $model.moveOriginalsToTrash)
-                .help("Keeps a backup of each original file in the Trash. Turn off to delete originals.")
+            Picker("Originals", selection: $model.originals) {
+                ForEach(OriginalsMode.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.menu)
+            .help("Move to Trash keeps a backup you can restore by renaming the file back (or ⌘Z in Finder).")
+            Picker("Quality", selection: $model.quality) {
+                ForEach(Quality.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.menu)
+            .help("Smaller files: lower-quality photos (resized to at most 2560 px), audio and video (at most 1080p). Documents aren't affected.")
             Picker("PDF → PowerPoint", selection: $model.editableSlides) {
                 Text("Editable text").tag(true)
                 Text("Page pictures").tag(false)
@@ -129,6 +154,8 @@ struct ContentView: View {
             .help("Editable text: text you can change, laid over the page's images and shapes. Page pictures: each page as an exact, non-editable image.")
             Toggle("Export every page of PDFs and slides", isOn: $model.exportAllPages)
                 .help("When a multi-page PDF or PowerPoint is renamed to an image format, save every page as an image in a folder. Off: only the first page.")
+            Toggle("Combine files renamed to PDF together into one", isOn: $model.combinePDFs)
+                .help("When several files are renamed to .pdf at once, merge them into a single Combined.pdf in name order.")
             Toggle("Notify when conversions finish", isOn: $model.showNotifications)
             Toggle("Open at login", isOn: $model.launchAtLogin)
         }
@@ -201,9 +228,9 @@ private struct JobRow: View {
                 Button { model.cancel(job) } label: { Image(systemName: "xmark.circle") }
                     .help("Cancel and restore the original name")
             } else {
-                if job.state == .done && job.originalInTrash != nil {
+                if job.state == .done && job.canUndo {
                     Button { model.undo(job) } label: { Image(systemName: "arrow.uturn.backward") }
-                        .help("Undo: bring back the original from the Trash")
+                        .help("Undo: bring back the original (you can also rename the file back, or press ⌘Z in Finder)")
                 }
                 Button { model.reveal(job) } label: { Image(systemName: "magnifyingglass") }
                     .help("Show in Finder")
@@ -269,7 +296,7 @@ private struct BatchRow: View {
     private var failedCount: Int { count { if case .failed = $0 { true } else { false } } }
 
     private var summary: String {
-        var parts = ["\(count { $0 == .done }) converted"]
+        var parts = [batch.combinedURL.map { "Combined into \($0.lastPathComponent)" } ?? "\(count { $0 == .done }) converted"]
         if failedCount > 0 { parts.append("\(failedCount) failed") }
         let cancelled = count { $0 == .cancelled }, undone = count { $0 == .undone }
         if cancelled > 0 { parts.append("\(cancelled) cancelled") }
@@ -295,7 +322,7 @@ private struct BatchRow: View {
                 Button { model.cancel(batch) } label: { Image(systemName: "xmark.circle") }
                     .help("Cancel the rest and restore their original names")
             } else {
-                if batch.jobs.contains(where: { $0.state == .done && $0.originalInTrash != nil }) {
+                if batch.jobs.contains(where: { $0.state == .done && $0.canUndo }) {
                     Button { model.undoAll(batch) } label: { Image(systemName: "arrow.uturn.backward") }
                         .help("Undo all: bring back every original from the Trash")
                 }

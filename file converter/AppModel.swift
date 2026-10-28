@@ -1,6 +1,7 @@
 import AppKit
 import Observation
 import OSLog
+import PDFKit
 import ServiceManagement
 import UserNotifications
 
@@ -22,6 +23,7 @@ import UserNotifications
     let started = Date()
     var state: State = .waiting
     var originalInTrash: URL?
+    var keptOriginal: URL?  // With "Keep both", where the original was put back
     var resultURL: URL?     // The converted file, or a folder of images when every page was exported
     var pageCount: Int?
     var task: Task<Void, Never>?
@@ -39,6 +41,8 @@ import UserNotifications
         default: false
         }
     }
+
+    var canUndo: Bool { originalInTrash != nil || keptOriginal != nil }
 }
 
 /// Renames that arrive together for the same folder and target format, such as a Finder batch rename.
@@ -50,6 +54,7 @@ import UserNotifications
     var jobs: [Job] = []
     var lastAdded = Date()
     var summarized = false      // Its notification has been sent; later renames start a new batch
+    var combinedURL: URL?       // When a batch renamed to PDF was merged into one file
 
     init(folder: URL, to: Format) {
         self.folder = folder
@@ -73,6 +78,19 @@ import UserNotifications
     }
 }
 
+/// What happens to the original file after a conversion.
+enum OriginalsMode: String, CaseIterable {
+    case trash, keep, delete
+
+    var title: String {
+        switch self {
+        case .trash: "Move to Trash"
+        case .keep: "Keep next to the new file"
+        case .delete: "Delete"
+        }
+    }
+}
+
 @Observable final class AppModel {
     var watchedFolders: [String] {
         didSet { defaults.set(watchedFolders, forKey: Keys.watchedFolders); restartWatcher() }
@@ -80,8 +98,14 @@ import UserNotifications
     var isWatching: Bool {
         didSet { defaults.set(!isWatching, forKey: Keys.paused); restartWatcher() }
     }
-    var moveOriginalsToTrash: Bool {
-        didSet { defaults.set(moveOriginalsToTrash, forKey: Keys.trashOriginals) }
+    var originals: OriginalsMode {
+        didSet { defaults.set(originals.rawValue, forKey: Keys.originals) }
+    }
+    var quality: Quality {
+        didSet { defaults.set(quality.rawValue, forKey: Keys.quality) }
+    }
+    var combinePDFs: Bool {
+        didSet { defaults.set(combinePDFs, forKey: Keys.combinePDFs) }
     }
     var showNotifications: Bool {
         didSet { defaults.set(showNotifications, forKey: Keys.notifications) }
@@ -138,11 +162,15 @@ import UserNotifications
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ConvertEverything", category: "conversion")
     private var askedForNotifications = false
     private let notificationDelegate = NotificationDelegate()
+    private let undoStore = UndoStore()
 
     private enum Keys {
         static let watchedFolders = "watchedFolders"
         static let paused = "paused"
-        static let trashOriginals = "moveOriginalsToTrash"
+        static let trashOriginals = "moveOriginalsToTrash"   // Older setting, replaced by `originals`
+        static let originals = "originals"
+        static let quality = "quality"
+        static let combinePDFs = "combinePDFs"
         static let notifications = "showNotifications"
         static let allPages = "exportAllPages"
         static let editableSlides = "editableSlides"
@@ -153,7 +181,10 @@ import UserNotifications
         let defaultFolders = ["Desktop", "Documents", "Downloads"].map { home.appending(path: $0).path }
         watchedFolders = defaults.stringArray(forKey: Keys.watchedFolders) ?? defaultFolders
         isWatching = !defaults.bool(forKey: Keys.paused)
-        moveOriginalsToTrash = defaults.object(forKey: Keys.trashOriginals) as? Bool ?? true
+        let oldTrashSetting = defaults.object(forKey: Keys.trashOriginals) as? Bool
+        originals = defaults.string(forKey: Keys.originals).flatMap(OriginalsMode.init) ?? (oldTrashSetting == false ? .delete : .trash)
+        quality = defaults.string(forKey: Keys.quality).flatMap(Quality.init) ?? .balanced
+        combinePDFs = defaults.object(forKey: Keys.combinePDFs) as? Bool ?? true
         showNotifications = defaults.object(forKey: Keys.notifications) as? Bool ?? true
         exportAllPages = defaults.object(forKey: Keys.allPages) as? Bool ?? true
         editableSlides = defaults.object(forKey: Keys.editableSlides) as? Bool ?? true
@@ -171,6 +202,12 @@ import UserNotifications
     // MARK: Deciding whether a rename is a conversion request
 
     private func handleRename(from oldURL: URL, to newURL: URL) {
+        // Renaming a converted file back to its old name (also what ⌘Z in Finder does) restores the original.
+        if let record = undoStore.match(converted: oldURL.path, original: newURL.path) {
+            restoreOriginal(record, at: newURL)
+            return
+        }
+
         let name = newURL.lastPathComponent
         guard !name.hasPrefix("."), !name.hasPrefix("~$"),
               let oldFormat = Format(fileExtension: oldURL.pathExtension),
@@ -184,6 +221,9 @@ import UserNotifications
             source = detected
         case .text:
             source = oldFormat.isPlainText ? oldFormat : .txt
+        case .iWork:
+            guard oldFormat.isIWork else { return }
+            source = oldFormat
         case .unknown:
             return   // Not something we understand; leave it alone.
         }
@@ -245,7 +285,8 @@ import UserNotifications
                 originalDir: job.fileURL.deletingLastPathComponent(),
                 allPages: exportAllPages,
                 outputExtension: job.fileURL.pathExtension.lowercased(),
-                editableSlides: editableSlides)
+                editableSlides: editableSlides,
+                quality: quality)
             let output = try await Converter.convert(request) { progress in
                 Task { @MainActor in
                     if job.isActive { job.state = .converting(progress: progress) }
@@ -257,13 +298,20 @@ import UserNotifications
                 throw ConversionError.failed("The file was moved or deleted while converting.")
             }
 
-            if moveOriginalsToTrash {
+            switch originals {
+            case .trash:
                 // Trash the original under its original name, so it's easy to recognize.
                 let backup = workDir.appending(path: job.originalURL.lastPathComponent)
                 try fileManager.moveItem(at: input, to: backup)
                 var trashed: NSURL?
                 try fileManager.trashItem(at: backup, resultingItemURL: &trashed)
                 job.originalInTrash = trashed as URL?
+            case .keep:
+                let keep = fileManager.fileExists(atPath: job.originalURL.path) ? uniqueFileURL(job.originalURL) : job.originalURL
+                try fileManager.moveItem(at: input, to: keep)
+                job.keptOriginal = keep
+            case .delete:
+                break
             }
 
             var isFolder: ObjCBool = false
@@ -276,14 +324,14 @@ import UserNotifications
                 job.resultURL = folder
                 job.pageCount = try fileManager.contentsOfDirectory(atPath: folder.path).count
             } else {
-                do {
-                    _ = try fileManager.replaceItemAt(job.fileURL, withItemAt: output)
-                } catch {
-                    // replaceItemAt needs both files on the same disk; fall back to delete + move.
-                    try fileManager.removeItem(at: job.fileURL)
-                    try fileManager.moveItem(at: output, to: job.fileURL)
-                }
+                // Write the new contents into the renamed file itself rather than swapping in a new file,
+                // so it stays the same file to Finder (keeping its tags and Finder's ⌘Z for the rename).
+                try overwrite(job.fileURL, with: output)
                 job.resultURL = job.fileURL
+                if let trashed = job.originalInTrash {
+                    undoStore.add(UndoRecord(converted: job.fileURL.path, original: job.originalURL.path,
+                                             trashed: trashed.path, date: Date()))
+                }
             }
 
             job.state = .done
@@ -325,7 +373,34 @@ import UserNotifications
             guard !batch.isActive, !batch.summarized,
                   Date().timeIntervalSince(batch.lastAdded) >= Self.batchWindow else { return }
             batch.summarized = true
+            if combinePDFs, batch.to == .pdf { await combine(batch) }
             summarize(batch)
+        }
+    }
+
+    /// Merges a batch's new PDFs (in name order) into one "Combined.pdf" and trashes the separate ones.
+    private func combine(_ batch: Batch) async {
+        let pdfs = batch.jobs.filter { $0.state == .done }.compactMap(\.resultURL)
+            .filter { $0.pathExtension.lowercased() == "pdf" }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        guard pdfs.count > 1 else { return }
+        let combined = uniqueFileURL(batch.folder.appending(path: "Combined.pdf"))
+        do {
+            try await Task.detached(priority: .utility) {
+                let merged = PDFDocument()
+                for url in pdfs {
+                    guard let document = PDFDocument(url: url) else { continue }
+                    for index in 0..<document.pageCount {
+                        if let page = document.page(at: index) { merged.insert(page, at: merged.pageCount) }
+                    }
+                }
+                guard merged.write(to: combined) else { throw ConversionError.failed("Couldn't write the combined PDF.") }
+            }.value
+            for url in pdfs { try? FileManager.default.trashItem(at: url, resultingItemURL: nil) }
+            batch.jobs.forEach { undoStore.remove(converted: $0.fileURL.path) }
+            batch.combinedURL = combined
+        } catch {
+            log.error("Combining PDFs failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -348,7 +423,11 @@ import UserNotifications
         }
 
         let target = batch.to.displayName
-        if failed.isEmpty {
+        if let combined = batch.combinedURL {
+            let skipped = failed.isEmpty ? "" : " · \(failed.count) couldn't be converted"
+            notify("Combined \(done.count) files into \(combined.lastPathComponent)", body: "In \(batch.folder.lastPathComponent)\(skipped)",
+                   reveal: [combined])
+        } else if failed.isEmpty {
             guard !done.isEmpty else { return }   // Everything was cancelled
             notify("Converted \(done.count) files to \(target)", body: "In \(batch.folder.lastPathComponent)",
                    reveal: done.compactMap(\.resultURL))
@@ -370,6 +449,20 @@ import UserNotifications
         try? fileManager.moveItem(at: job.fileURL, to: job.originalURL)
     }
 
+    /// The converted file now has its old name again: put the original back in its place.
+    private func restoreOriginal(_ record: UndoRecord, at url: URL) {
+        let fileManager = FileManager.default
+        do {
+            try fileManager.trashItem(at: url, resultingItemURL: nil)
+            try fileManager.moveItem(at: URL(fileURLWithPath: record.trashed), to: url)
+            undoStore.remove(converted: record.converted)
+            jobs.first { $0.state == .done && $0.fileURL.path == record.converted }?.state = .undone
+            notify("Restored \(url.lastPathComponent)", body: "The original is back. The converted file is in the Trash.")
+        } catch {
+            notify("Couldn't restore \(url.lastPathComponent)", body: error.localizedDescription)
+        }
+    }
+
     // MARK: Actions from the menu
 
     func cancel(_ job: Job) {
@@ -378,17 +471,21 @@ import UserNotifications
 
     /// Trashes the converted file and brings the original back from the Trash.
     func undo(_ job: Job) {
-        guard job.state == .done, let trashed = job.originalInTrash else { return }
+        guard job.state == .done, job.originalInTrash != nil || job.keptOriginal != nil else { return }
         let fileManager = FileManager.default
         do {
-            guard !fileManager.fileExists(atPath: job.originalURL.path) else {
-                throw ConversionError.failed("A file named \(job.originalURL.lastPathComponent) already exists.")
+            if let trashed = job.originalInTrash {
+                guard !fileManager.fileExists(atPath: job.originalURL.path) else {
+                    throw ConversionError.failed("A file named \(job.originalURL.lastPathComponent) already exists.")
+                }
+                try fileManager.moveItem(at: trashed, to: job.originalURL)
             }
-            try fileManager.moveItem(at: trashed, to: job.originalURL)
+            // With "Keep both" the original is already there; undoing just removes the converted file.
             let result = job.resultURL ?? job.fileURL
             if fileManager.fileExists(atPath: result.path) {
                 try fileManager.trashItem(at: result, resultingItemURL: nil)
             }
+            undoStore.remove(converted: job.fileURL.path)
             job.state = .undone
         } catch {
             notify("Couldn't undo", body: error.localizedDescription)
@@ -405,12 +502,16 @@ import UserNotifications
     }
 
     func undoAll(_ batch: Batch) {
-        batch.jobs.filter { $0.state == .done && $0.originalInTrash != nil }.forEach(undo)
+        batch.jobs.filter { $0.state == .done && $0.canUndo }.forEach(undo)
+        if let combined = batch.combinedURL, FileManager.default.fileExists(atPath: combined.path) {
+            try? FileManager.default.trashItem(at: combined, resultingItemURL: nil)
+            batch.combinedURL = nil
+        }
     }
 
     /// Selects the converted files in Finder, or the folder if none were converted.
     func reveal(_ batch: Batch) {
-        let results = batch.jobs.filter { $0.state == .done }.compactMap(\.resultURL)
+        let results = batch.combinedURL.map { [$0] } ?? batch.jobs.filter { $0.state == .done }.compactMap(\.resultURL)
         NSWorkspace.shared.activateFileViewerSelecting(results.isEmpty ? [batch.folder] : results)
     }
 
@@ -446,6 +547,30 @@ import UserNotifications
     }
 
     /// Keeps the 20 most recent finished batches (a batch counts once, however many files it has).
+    /// "notes.md", then "notes 2.md", "notes 3.md"… if that name is taken.
+    private func uniqueFileURL(_ url: URL) -> URL {
+        let folder = url.deletingLastPathComponent(), ext = url.pathExtension
+        let base = url.deletingPathExtension().lastPathComponent
+        var candidate = url
+        var number = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = folder.appending(path: ext.isEmpty ? "\(base) \(number)" : "\(base) \(number).\(ext)")
+            number += 1
+        }
+        return candidate
+    }
+
+    /// Replaces a file's contents in place, in 8 MB chunks.
+    private func overwrite(_ file: URL, with source: URL) throws {
+        let reader = try FileHandle(forReadingFrom: source)
+        let writer = try FileHandle(forWritingTo: file)
+        defer { try? reader.close(); try? writer.close() }
+        try writer.truncate(atOffset: 0)
+        while let chunk = try reader.read(upToCount: 8 << 20), !chunk.isEmpty {
+            try writer.write(contentsOf: chunk)
+        }
+    }
+
     private func trimHistory() {
         var finished = 0
         batches.removeAll { batch in
