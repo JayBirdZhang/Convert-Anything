@@ -11,7 +11,7 @@ import SwiftUI
             if model.hasActiveJobs {
                 Image(nsImage: StatusIcon.ring(progress: model.activeProgress, pulse: model.pulsePhase))
             } else {
-                Image(systemName: "arrow.triangle.2.circlepath")
+                Image(nsImage: IdleIcon.image)
             }
         }
         .menuBarExtraStyle(.window)

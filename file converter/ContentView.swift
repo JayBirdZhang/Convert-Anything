@@ -35,7 +35,7 @@ struct ContentView: View {
     private var header: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text("File Converter").font(.headline)
+                Text("Convert Everything").font(.headline)
                 Text(model.isWatching ? "Watching \(model.watchedFolders.count) folder\(model.watchedFolders.count == 1 ? "" : "s")" : "Paused")
                     .font(.caption)
                     .foregroundStyle(.secondary)
