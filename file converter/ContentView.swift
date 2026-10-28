@@ -14,19 +14,39 @@ struct ContentView: View {
                 jobList
             }
             Divider()
-            DisclosureGroup("Settings", isExpanded: $showSettings) {
-                settings.padding(.top, 6)
-            }
-            Divider()
-            HStack {
+            // One footer row: the Settings toggle on the left, small Clear History and Quit controls on the right.
+            HStack(spacing: 12) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { showSettings.toggle() }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .rotationEffect(.degrees(showSettings ? 90 : 0))
+                        Text("Settings")
+                    }
+                    .foregroundStyle(.primary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                Spacer()
                 if model.jobs.contains(where: { !$0.isActive }) {
                     Button("Clear History") { model.clearFinished() }
+                        .font(.caption)
                 }
-                Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-                    .keyboardShortcut("q")
+                Button {
+                    NSApplication.shared.terminate(nil)
+                } label: {
+                    Image(systemName: "power")
+                }
+                .keyboardShortcut("q")
+                .help("Quit Convert Everything")
             }
             .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            if showSettings {
+                settings.padding(.top, 2)
+            }
         }
         .padding(14)
         .frame(width: 340)
