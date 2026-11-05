@@ -13,7 +13,7 @@ enum Converter {
         case pdfToImage     // PDFKit
         case document       // AppKit's text system, Markdown, Pages for Word → PDF
         case media          // AVFoundation, Core Audio, LAME
-        case fromSlides     // Quick Look (or Keynote) renders a presentation as PDF (then pages → images)
+        case fromSlides     // Keynote (or Quick Look) renders a presentation as PDF (then pages → images)
         case slidesExport   // Keynote saves older PowerPoint and Keynote files as .pptx
         case toSlides       // One slide per PDF page or image
         case spreadsheet    // Excel ↔ CSV directly; Numbers for the rest
@@ -101,12 +101,15 @@ enum Converter {
             result = try await renderPages(of: request.input, request: request, output: output, progress: progress)
         case .fromSlides:
             let pdf = request.to == .pdf ? output : request.workDir.appending(path: "slides.pdf")
-            // Quick Look needs no other app; Keynote is the fallback (and handles Keynote's own files).
+            // Keynote matches PowerPoint's fonts and layout best. If it isn't installed or doesn't finish,
+            // Quick Look (built into macOS) renders the slides instead.
             do {
-                guard request.from != .key else { throw ConversionError.failed("Keynote file") }
-                try await QuickLookSlides.renderPDF(request.input, workDir: request.workDir, output: pdf)
-            } catch {
                 try await IWork.export(request.input, with: .keynote, as: .pdf, to: pdf)
+            } catch ConversionError.cancelled {
+                throw ConversionError.cancelled
+            } catch where request.from != .key {
+                try? FileManager.default.removeItem(at: pdf)
+                try await QuickLookSlides.renderPDF(request.input, workDir: request.workDir, output: pdf)
             }
             if request.to != .pdf {
                 result = try await renderPages(of: pdf, request: request, output: output, progress: progress)

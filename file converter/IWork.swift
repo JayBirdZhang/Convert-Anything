@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 
 /// Uses Keynote, Numbers and Pages (free Apple apps) to convert Office and iWork files: the app asks
 /// them, through AppleScript, to open the file, export it and close it again without saving.
@@ -34,18 +35,25 @@ nonisolated enum IWork {
 
     /// Exports `input` to `output`. Numbers' CSV export of a file with several tables makes a folder
     /// of CSV files; the returned URL is whatever was written.
+    ///
+    /// The app is started hidden in the background (when it isn't already open) so it never becomes the
+    /// active app: the subscription versions show prompts when they come to the front, and those can stop
+    /// the export. Every step has a time limit, and on a timeout the names of the app's windows are logged
+    /// so whatever was in the way can be seen.
     @discardableResult
-    static func export(_ input: URL, with app: App, as format: ExportFormat, to output: URL) async throws -> URL {
+    static func export(_ input: URL, with app: App, as format: ExportFormat, to output: URL,
+                       openTimeout: Int = 45, totalTimeout: Int = 300) async throws -> URL {
         guard let id = app.installedID else { throw ConversionError.missingApp(app.rawValue) }
 
-        // A uniquely named copy, so the script can find its own document by name (never one you have open),
-        // and wait for it: large files take a while to import, and "open" returns before they're ready.
-        // The app is quit afterwards only if it wasn't open before.
+        // A uniquely named copy, so the script can find its own document by name (never one you have open).
         let token = "Convert Everything \(UUID().uuidString.prefix(8))"
         let copy = input.deletingLastPathComponent().appending(path: "\(token).\(input.pathExtension)")
         try? FileManager.default.removeItem(at: copy)
         try FileManager.default.copyItem(at: input, to: copy)
         defer { try? FileManager.default.removeItem(at: copy) }
+
+        let wasRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: id).isEmpty
+        if !wasRunning { await launchHidden(id) }
 
         let script = """
         on run argv
@@ -53,18 +61,23 @@ nonisolated enum IWork {
             set outputFile to POSIX file (item 2 of argv)
             set baseName to item 3 of argv
             set fullName to item 4 of argv
-            set wasRunning to application id "\(id)" is running
-            tell application id "\(id)" to open inputFile
+            with timeout of 30 seconds
+                tell application id "\(id)" to open inputFile
+            end timeout
             set theDocument to missing value
-            repeat 360 times
+            repeat \(openTimeout * 4) times
                 try
-                    tell application id "\(id)" to set theDocument to document baseName
-                    tell application id "\(id)" to get name of theDocument
+                    with timeout of 5 seconds
+                        tell application id "\(id)" to set theDocument to document baseName
+                        tell application id "\(id)" to get name of theDocument
+                    end timeout
                     exit repeat
                 on error
                     try
-                        tell application id "\(id)" to set theDocument to document fullName
-                        tell application id "\(id)" to get name of theDocument
+                        with timeout of 5 seconds
+                            tell application id "\(id)" to set theDocument to document fullName
+                            tell application id "\(id)" to get name of theDocument
+                        end timeout
                         exit repeat
                     on error
                         set theDocument to missing value
@@ -72,26 +85,32 @@ nonisolated enum IWork {
                     end try
                 end try
             end repeat
-            if theDocument is missing value then
-                if not wasRunning then tell application id "\(id)" to quit
-                error "\(app.rawValue) didn't open the file. If \(app.rawValue) is showing a message or asking for permission, answer it and try again."
-            end if
-            with timeout of 900 seconds
+            if theDocument is missing value then error "OPEN_TIMEOUT"
+            with timeout of \(totalTimeout) seconds
                 tell application id "\(id)"
                     export theDocument to outputFile as \(format.rawValue)
                     close theDocument saving no
                 end tell
             end timeout
-            if not wasRunning then tell application id "\(id)" to quit
         end run
         """
         do {
-            try await Tools.run("/usr/bin/osascript", ["-e", script, copy.path, output.path, token, copy.lastPathComponent])
+            try await withTimeout(seconds: totalTimeout + 30) {
+                try await Tools.run("/usr/bin/osascript", ["-e", script, copy.path, output.path, token, copy.lastPathComponent])
+            }
         } catch ConversionError.failed(let message) where message.contains("-1743") {
+            await cleanUp(id, token: token, quit: !wasRunning)
             throw ConversionError.failed("Convert Everything isn't allowed to use \(app.rawValue). Turn it on in System Settings → Privacy & Security → Automation.")
-        } catch ConversionError.failed(let message) where message.contains("-1712") {
-            throw ConversionError.failed("\(app.rawValue) took too long to respond.")
+        } catch ConversionError.cancelled {
+            await cleanUp(id, token: token, quit: !wasRunning)
+            throw ConversionError.cancelled
+        } catch {
+            let windows = await windowNames(id)
+            log.error("\(app.rawValue, privacy: .public) export failed: \(String(describing: error), privacy: .public); windows: \(windows, privacy: .public)")
+            await cleanUp(id, token: token, quit: !wasRunning)
+            throw ConversionError.failed("\(app.rawValue) didn't finish the export\(windows.isEmpty ? "" : " (it was showing: \(windows))").")
         }
+        if !wasRunning { await cleanUp(id, token: token, quit: true) }
 
         let fileManager = FileManager.default
         if fileManager.fileExists(atPath: output.path) { return output }
@@ -101,6 +120,53 @@ nonisolated enum IWork {
             return match
         }
         throw ConversionError.failed("\(app.rawValue) couldn't export this file.")
+    }
+
+    private static let log = Logger(subsystem: "io.github.jaybirdzhang.ConvertEverything", category: "iwork")
+
+    /// Starts the app without bringing it to the front, and waits until it's ready for AppleScript.
+    private static func launchHidden(_ id: String) async {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        configuration.hides = true
+        configuration.addsToRecentItems = false
+        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+        try? await Task.sleep(for: .seconds(2))
+    }
+
+    /// Closes our document if it's still open, and quits the app when we started it.
+    private static func cleanUp(_ id: String, token: String, quit: Bool) async {
+        let script = """
+        with timeout of 10 seconds
+            tell application id "\(id)"
+                try
+                    close (every document whose name starts with "\(token)") saving no
+                end try
+                \(quit ? "quit saving no" : "")
+            end tell
+        end timeout
+        """
+        _ = try? await withTimeout(seconds: 20) { try await Tools.run("/usr/bin/osascript", ["-e", script]) }
+    }
+
+    /// The titles of the app's windows (a sheet or prompt shows up here), for diagnosing a stuck export.
+    private static func windowNames(_ id: String) async -> String {
+        let script = #"with timeout of 5 seconds\#ntell application id "\#(id)" to get name of every window\#nend timeout"#
+        return ((try? await withTimeout(seconds: 10) { try await Tools.run("/usr/bin/osascript", ["-e", script]) }) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Runs `work`, cancelling it (which stops its process) if it takes longer than `seconds`.
+    static func withTimeout<T: Sendable>(seconds: Int, _ work: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T?.self) { group in
+            group.addTask { try await work() }
+            group.addTask { try await Task.sleep(for: .seconds(seconds)); return nil }
+            guard let first = try await group.next() else { throw ConversionError.failed("Timed out.") }
+            group.cancelAll()
+            guard let value = first else { throw ConversionError.failed("Timed out.") }
+            return value
+        }
     }
 }
 
