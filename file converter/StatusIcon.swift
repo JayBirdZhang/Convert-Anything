@@ -1,11 +1,45 @@
 import AppKit
 
-/// Menu-bar icon when idle: the circling arrows, drawn bold so they read clearly in the menu bar.
+/// Menu-bar icon when idle: the app's prism, with white light going in and three rays coming out
+/// (lighter and lighter, like a spectrum). A template image, so macOS tints it for light and dark menu bars.
 enum IdleIcon {
     static let image: NSImage = {
-        let symbol = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: "Convert Everything")!
-        let image = symbol.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13.5, weight: .bold)) ?? symbol
+        let image = NSImage(size: NSSize(width: 22, height: 18), flipped: false) { _ in
+            NSColor.black.setStroke()
+            let beam = NSBezierPath()
+            beam.move(to: NSPoint(x: 0.9, y: 12.1))
+            beam.line(to: NSPoint(x: 6.9, y: 10.6))
+            beam.lineWidth = 1.6
+            beam.lineCapStyle = .round
+            beam.stroke()
+
+            let prism = NSBezierPath()
+            prism.move(to: NSPoint(x: 10.5, y: 16.2))
+            prism.line(to: NSPoint(x: 16.8, y: 3.8))
+            prism.line(to: NSPoint(x: 4.2, y: 3.8))
+            prism.close()
+            prism.lineWidth = 1.6
+            prism.lineJoinStyle = .round
+            prism.stroke()
+
+            let rays: [(from: NSPoint, to: NSPoint, alpha: CGFloat)] = [
+                (NSPoint(x: 14.4, y: 10.6), NSPoint(x: 21.2, y: 10.4), 1),
+                (NSPoint(x: 15.1, y: 9.0), NSPoint(x: 21.2, y: 7.2), 0.7),
+                (NSPoint(x: 15.8, y: 7.4), NSPoint(x: 21.2, y: 4.0), 0.45),
+            ]
+            for ray in rays {
+                let path = NSBezierPath()
+                path.move(to: ray.from)
+                path.line(to: ray.to)
+                path.lineWidth = 1.4
+                path.lineCapStyle = .round
+                NSColor.black.withAlphaComponent(ray.alpha).setStroke()
+                path.stroke()
+            }
+            return true
+        }
         image.isTemplate = true
+        image.accessibilityDescription = "Convert Everything"
         return image
     }()
 }
