@@ -56,7 +56,7 @@ nonisolated enum IWork {
             set wasRunning to application id "\(id)" is running
             tell application id "\(id)" to open inputFile
             set theDocument to missing value
-            repeat 600 times
+            repeat 360 times
                 try
                     tell application id "\(id)" to set theDocument to document baseName
                     tell application id "\(id)" to get name of theDocument
@@ -72,7 +72,10 @@ nonisolated enum IWork {
                     end try
                 end try
             end repeat
-            if theDocument is missing value then error "The file didn't open in \(app.rawValue)."
+            if theDocument is missing value then
+                if not wasRunning then tell application id "\(id)" to quit
+                error "\(app.rawValue) didn't open the file. If \(app.rawValue) is showing a message or asking for permission, answer it and try again."
+            end if
             with timeout of 900 seconds
                 tell application id "\(id)"
                     export theDocument to outputFile as \(format.rawValue)

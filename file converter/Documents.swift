@@ -38,12 +38,16 @@ enum DocumentConversion {
         switch from {
         case .md:
             let markdown = try readText(input)
-            let showsMath = request.to == .html || request.to == .pdf
-            let html = Markdown.$mathAsMathML.withValue(showsMath) { Markdown.html(from: markdown) }
+            let collector = MathCollector()
+            let mode: Markdown.MathOutput = [.html, .pdf].contains(request.to) ? .mathML : request.to == .docx ? .placeholders(collector) : .tex
+            let html = Markdown.$mathOutput.withValue(mode) { Markdown.html(from: markdown) }
             if request.to == .txt {
                 try plainText(fromHTML: html, baseURL: request.originalDir).write(to: output, atomically: true, encoding: .utf8)
             } else {
                 try await write(html: html, title: request.title, request: request, output: output)
+            }
+            if !collector.items.isEmpty {
+                try await WordMath.insert(collector.items, into: output, workDir: request.workDir)
             }
         case .html:
             let html = try readText(input)
@@ -202,12 +206,17 @@ nonisolated func escapeHTML(_ text: String) -> String {
 /// A compact Markdown reader and writer covering what people actually use: headings, paragraphs,
 /// bold/italic/strikethrough, code, links, images, block quotes, nested lists, tables and rules.
 nonisolated enum Markdown {
-    /// Math ($…$, $$…$$, \(…\), \[…\]) becomes MathML for web pages and PDFs; other formats can't show
-    /// MathML, so there it stays as the LaTeX source.
-    @TaskLocal static var mathAsMathML = true
+    /// Math ($…$, $$…$$, \(…\), \[…\]) becomes MathML for web pages and PDFs, a marker that's later
+    /// replaced with a Word equation for .docx, and stays as LaTeX source in formats that can't show math.
+    enum MathOutput: Sendable { case mathML, tex, placeholders(MathCollector) }
+    @TaskLocal static var mathOutput: MathOutput = .mathML
 
     static func math(_ tex: String, display: Bool) -> String {
-        mathAsMathML ? TeXMath.mathML(tex, display: display) : escapeHTML(display ? "$$\(tex)$$" : "$\(tex)$")
+        switch mathOutput {
+        case .mathML: TeXMath.mathML(tex, display: display)
+        case .tex: escapeHTML(display ? "$$\(tex)$$" : "$\(tex)$")
+        case .placeholders(let collector): collector.add(tex, display: display)
+        }
     }
 
     // MARK: Markdown → HTML
@@ -553,5 +562,59 @@ nonisolated enum Markdown {
         }
         // Adjacent runs with the same style ("**a****b**") read better merged.
         return result.replacingOccurrences(of: "****", with: "").replacingOccurrences(of: "**  **", with: " ")
+    }
+}
+
+/// Collects the math found while translating Markdown for Word, leaving a marker in its place.
+nonisolated final class MathCollector: @unchecked Sendable {
+    private(set) var items: [(tex: String, display: Bool)] = []
+    func add(_ tex: String, display: Bool) -> String {
+        items.append((tex, display))
+        return "ZZMATH\(items.count - 1)ZZ"
+    }
+}
+
+/// Swaps the math markers in a .docx for real Word equations.
+nonisolated enum WordMath {
+    static func insert(_ items: [(tex: String, display: Bool)], into docx: URL, workDir: URL) async throws {
+        let package = workDir.appending(path: "docx-math")
+        try await Tools.run("/usr/bin/unzip", ["-q", "-o", docx.path, "-d", package.path])
+        let documentURL = package.appending(path: "word/document.xml")
+        var xml = try String(contentsOf: documentURL, encoding: .utf8)
+        if !xml.contains("xmlns:m=\""), let root = xml.range(of: "<w:document ") {
+            xml.replaceSubrange(root, with: #"<w:document xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" "#)
+        }
+
+        // Each run (<w:r>) that holds a marker is split into text runs and equations.
+        let runPattern = try NSRegularExpression(pattern: #"<w:r(?:\s[^>]*)?>(?:(?!</w:r>).)*?ZZMATH\d+ZZ(?:(?!</w:r>).)*?</w:r>"#, options: .dotMatchesLineSeparators)
+        let markerPattern = try NSRegularExpression(pattern: #"ZZMATH(\d+)ZZ"#)
+        let string = xml as NSString
+        var result = ""
+        var last = 0
+        for match in runPattern.matches(in: xml, range: NSRange(location: 0, length: string.length)) {
+            result += string.substring(with: NSRange(location: last, length: match.range.location - last))
+            let run = string.substring(with: match.range)
+            let properties = run.firstMatch(of: /<w:rPr>.*?<\/w:rPr>/.dotMatchesNewlines()).map { String($0.output) } ?? ""
+            let text = run.matches(of: /<w:t(?:\s[^>]*)?>(.*?)<\/w:t>/.dotMatchesNewlines()).map { String($0.output.1) }.joined()
+            let textString = text as NSString
+            var position = 0
+            for marker in markerPattern.matches(in: text, range: NSRange(location: 0, length: textString.length)) {
+                let before = textString.substring(with: NSRange(location: position, length: marker.range.location - position))
+                if !before.isEmpty { result += #"<w:r>\#(properties)<w:t xml:space="preserve">\#(before)</w:t></w:r>"# }
+                if let index = Int(textString.substring(with: marker.range(at: 1))), index < items.count {
+                    let item = items[index]
+                    result += MathOMML.omml(fromMathML: TeXMath.mathML(item.tex, display: item.display), display: item.display)
+                }
+                position = marker.range.location + marker.range.length
+            }
+            let after = textString.substring(from: position)
+            if !after.isEmpty { result += #"<w:r>\#(properties)<w:t xml:space="preserve">\#(after)</w:t></w:r>"# }
+            last = match.range.location + match.range.length
+        }
+        result += string.substring(from: last)
+        try result.write(to: documentURL, atomically: true, encoding: .utf8)
+
+        try FileManager.default.removeItem(at: docx)
+        try await Tools.run("/usr/bin/zip", ["-q", "-X", "-r", docx.path, "."], currentDirectory: package)
     }
 }
