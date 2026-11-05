@@ -131,6 +131,9 @@ nonisolated enum IWork {
         configuration.activates = false
         configuration.hides = true
         configuration.addsToRecentItems = false
+        // Only for this launch: skip the "may look different" warnings window. While it's open the app
+        // stops answering AppleScript, so the export would never start. Your own setting isn't changed.
+        configuration.arguments = ["-TMADoNotShowDocumentWarnings", "YES"]
         _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         try? await Task.sleep(for: .seconds(2))
     }
