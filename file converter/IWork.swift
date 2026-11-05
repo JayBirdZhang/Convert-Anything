@@ -45,9 +45,22 @@ nonisolated enum IWork {
             set outputFile to POSIX file (item 2 of argv)
             set wasRunning to application id "\(id)" is running
             tell application id "\(id)"
-                open inputFile
-                -- Use the front document: some versions return an unusable reference from "open".
-                set theDocument to front document
+                set theDocument to missing value
+                try
+                    set theDocument to open inputFile
+                    get name of theDocument
+                on error
+                    -- Some versions return an unusable reference from "open": use the front document,
+                    -- once the import has finished.
+                    set theDocument to missing value
+                end try
+                if theDocument is missing value then
+                    repeat 100 times
+                        if (count of documents) > 0 then exit repeat
+                        delay 0.2
+                    end repeat
+                    set theDocument to front document
+                end if
                 try
                     export theDocument to outputFile as \(format.rawValue)
                 on error message number code
