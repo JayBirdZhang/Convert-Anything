@@ -103,3 +103,40 @@ nonisolated enum IWork {
         throw ConversionError.failed("\(app.rawValue) couldn't export this file.")
     }
 }
+
+/// PowerPoint → PDF without any app: macOS's Quick Look (the spacebar preview) can lay out every slide of a
+/// presentation as a web page. That page is printed with one slide per PDF page, at the slides' own size.
+enum QuickLookSlides {
+    static func renderPDF(_ input: URL, workDir: URL, output: URL) async throws {
+        let folder = workDir.appending(path: "quicklook")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try await Tools.run("/usr/bin/qlmanage", ["-p", "-o", folder.path, input.path])
+        let preview = folder.appending(path: input.lastPathComponent + ".qlpreview")
+        let page = preview.appending(path: "Preview.html")
+        guard var html = try? String(contentsOf: page, encoding: .utf8), html.contains("class=\"slide") else {
+            throw ConversionError.failed("Quick Look couldn't read this presentation.")
+        }
+
+        // The slide size, from Quick Look's own style sheet ("div.slide, div.loading-slide { width: 720; height: 405;}").
+        var size = CGSize(width: 720, height: 405)
+        if let match = html.firstMatch(of: /div\.slide, div\.loading-slide \{ width: ([\d.]+); height: ([\d.]+);/),
+           let width = Double(match.1), let height = Double(match.2), width > 0, height > 0 {
+            size = CGSize(width: width, height: height)
+        }
+        let printStyle = """
+        <style>
+        @page { margin: 0; }
+        html, body { margin: 0 !important; padding: 0 !important; background: white !important; }
+        /* Printing turns 96 web pixels into 72 points; scale up so a 720-pixel slide fills a 720-point page. */
+        body { zoom: 1.3333; }
+        div.slide { margin: 0 !important; -webkit-box-shadow: none !important; break-after: page; page-break-after: always; }
+        div.loading-slide { display: none !important; }
+        * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        </style>
+        """
+        if let head = html.range(of: "</head>") { html.replaceSubrange(head, with: printStyle + "</head>") } else { html = printStyle + html }
+        let printable = preview.appending(path: "Print.html")
+        try html.write(to: printable, atomically: true, encoding: .utf8)
+        try await WebPDF.render(html: "", baseURL: preview, output: output, page: size, margin: 0, file: printable)
+    }
+}

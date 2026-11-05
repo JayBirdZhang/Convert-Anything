@@ -4,8 +4,11 @@ import WebKit
 /// Lays out an HTML page with macOS's web engine (full CSS, MathML for math, images) and prints it to a
 /// paginated PDF, the way Safari's File → Export as PDF does. Runs in an invisible window.
 enum WebPDF {
-    static func render(html: String, baseURL: URL, output: URL) async throws {
-        let size = NSRect(x: 0, y: 0, width: 612, height: 792)
+    /// `page` is the paper size in points; `margin` the space around the content. With `file`, the page is
+    /// loaded from disk (so it can use images next to it) instead of from `html`.
+    static func render(html: String, baseURL: URL, output: URL, page: CGSize = CGSize(width: 612, height: 792),
+                       margin: CGFloat = 54, file: URL? = nil) async throws {
+        let size = NSRect(x: 0, y: 0, width: page.width, height: page.height)
         let webView = WKWebView(frame: size)
         let window = NSWindow(contentRect: size.offsetBy(dx: -20_000, dy: -20_000), styleMask: .borderless, backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -14,17 +17,21 @@ enum WebPDF {
 
         let loader = Loader()
         webView.navigationDelegate = loader
-        webView.loadHTMLString(html, baseURL: baseURL)
+        if let file {
+            webView.loadFileURL(file, allowingReadAccessTo: file.deletingLastPathComponent())
+        } else {
+            webView.loadHTMLString(html, baseURL: baseURL)
+        }
         try await loader.wait()
         // Give images and MathML a moment to lay out.
         try await Task.sleep(for: .milliseconds(300))
 
         let info = NSPrintInfo()
-        info.paperSize = NSSize(width: 612, height: 792)
-        info.topMargin = 54
-        info.bottomMargin = 54
-        info.leftMargin = 54
-        info.rightMargin = 54
+        info.paperSize = page
+        info.topMargin = margin
+        info.bottomMargin = margin
+        info.leftMargin = margin
+        info.rightMargin = margin
         info.horizontalPagination = .fit
         info.verticalPagination = .automatic
         info.isVerticallyCentered = false
