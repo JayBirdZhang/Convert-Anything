@@ -192,6 +192,9 @@ enum OriginalsMode: String, CaseIterable {
 
         UNUserNotificationCenter.current().delegate = notificationDelegate
         watcher.onRename = { [weak self] from, to in self?.handleRename(from: from, to: to) }
+        IWork.needsAttention = { [weak self] title, body in
+            Task { @MainActor in self?.notify(title, body: body, important: true) }
+        }
         restartWatcher()
     }
 
@@ -583,8 +586,9 @@ enum OriginalsMode: String, CaseIterable {
 
     // MARK: Notifications
 
-    private func notify(_ title: String, body: String, reveal: [URL] = []) {
-        guard showNotifications else { return }
+    /// `important` notifications (an app is waiting for you) are shown even with "Notify when conversions finish" off.
+    private func notify(_ title: String, body: String, reveal: [URL] = [], important: Bool = false) {
+        guard showNotifications || important else { return }
         let center = UNUserNotificationCenter.current()
         if !askedForNotifications {
             askedForNotifications = true

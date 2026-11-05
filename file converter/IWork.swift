@@ -33,6 +33,9 @@ nonisolated enum IWork {
 
     static func isInstalled(_ app: App) -> Bool { app.installedID != nil }
 
+    /// Set by the app: tells you when Keynote, Numbers or Pages is waiting for you (title, message).
+    nonisolated(unsafe) static var needsAttention: (@Sendable (String, String) -> Void)?
+
     /// Exports `input` to `output`. Numbers' CSV export of a file with several tables makes a folder
     /// of CSV files; the returned URL is whatever was written.
     ///
@@ -42,7 +45,7 @@ nonisolated enum IWork {
     /// so whatever was in the way can be seen.
     @discardableResult
     static func export(_ input: URL, with app: App, as format: ExportFormat, to output: URL,
-                       openTimeout: Int = 45, totalTimeout: Int = 300) async throws -> URL {
+                       openTimeout: Int = 180, totalTimeout: Int = 300) async throws -> URL {
         guard let id = app.installedID else { throw ConversionError.missingApp(app.rawValue) }
 
         // A uniquely named copy, so the script can find its own document by name (never one you have open).
@@ -61,9 +64,11 @@ nonisolated enum IWork {
             set outputFile to POSIX file (item 2 of argv)
             set baseName to item 3 of argv
             set fullName to item 4 of argv
-            with timeout of 30 seconds
-                tell application id "\(id)" to open inputFile
-            end timeout
+            try
+                with timeout of 30 seconds
+                    tell application id "\(id)" to open inputFile
+                end timeout
+            end try
             set theDocument to missing value
             repeat \(openTimeout * 4) times
                 try
@@ -94,8 +99,23 @@ nonisolated enum IWork {
             end timeout
         end run
         """
+        // If the app hasn't got the document ready after a while, it's usually showing a window that needs
+        // you (Keynote's "may look different" warnings, which stop it from answering). Bring it forward and ask.
+        let watcher = Task {
+            try await Task.sleep(for: .seconds(15))
+            await MainActor.run {
+                for running in NSRunningApplication.runningApplications(withBundleIdentifier: id) {
+                    running.unhide()
+                    running.activate()
+                }
+            }
+            IWork.needsAttention?("\(app.rawValue) is waiting for you",
+                                  "If \(app.rawValue) shows a window saying the file may look different, close it to finish converting.")
+        }
+        defer { watcher.cancel() }
+
         do {
-            try await withTimeout(seconds: totalTimeout + 30) {
+            try await withTimeout(seconds: openTimeout + totalTimeout + 60) {
                 try await Tools.run("/usr/bin/osascript", ["-e", script, copy.path, output.path, token, copy.lastPathComponent])
             }
         } catch ConversionError.failed(let message) where message.contains("-1743") {
@@ -108,7 +128,7 @@ nonisolated enum IWork {
             let windows = await windowNames(id)
             log.error("\(app.rawValue, privacy: .public) export failed: \(String(describing: error), privacy: .public); windows: \(windows, privacy: .public)")
             await cleanUp(id, token: token, quit: !wasRunning)
-            throw ConversionError.failed("\(app.rawValue) didn't finish the export\(windows.isEmpty ? "" : " (it was showing: \(windows))").")
+            throw ConversionError.failed("\(app.rawValue) didn't respond\(windows.isEmpty ? "" : " (it was showing: \(windows))"). If it shows a warning window, close it and try again.")
         }
         if !wasRunning { await cleanUp(id, token: token, quit: true) }
 

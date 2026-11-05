@@ -101,14 +101,11 @@ enum Converter {
             result = try await renderPages(of: request.input, request: request, output: output, progress: progress)
         case .fromSlides:
             let pdf = request.to == .pdf ? output : request.workDir.appending(path: "slides.pdf")
-            // Keynote matches PowerPoint's fonts and layout best. If it isn't installed or doesn't finish,
-            // Quick Look (built into macOS) renders the slides instead.
+            // Keynote matches PowerPoint's fonts and layout best. Quick Look (built into macOS, but rougher)
+            // is used only on Macs without Keynote.
             do {
                 try await IWork.export(request.input, with: .keynote, as: .pdf, to: pdf)
-            } catch ConversionError.cancelled {
-                throw ConversionError.cancelled
-            } catch where request.from != .key {
-                try? FileManager.default.removeItem(at: pdf)
+            } catch ConversionError.missingApp where request.from != .key {
                 try await QuickLookSlides.renderPDF(request.input, workDir: request.workDir, output: pdf)
             }
             if request.to != .pdf {
