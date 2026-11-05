@@ -28,6 +28,11 @@ nonisolated struct TextBlock {
 /// Reads a PDF page's text with its position and styling, using macOS's own PDF engine.
 nonisolated enum PDFText {
     static func blocks(on page: PDFPage) -> [TextBlock] {
+        group(lines(on: page))
+    }
+
+    /// Every line of text on the page, top to bottom, with its position and styling.
+    static func lines(on page: PDFPage) -> [TextLine] {
         let crop = page.bounds(for: .cropBox)
         guard let selection = page.selection(for: crop) else { return [] }
 
@@ -42,7 +47,7 @@ nonisolated enum PDFText {
                 runs: runs,
                 fontSize: runs.map(\.size).max() ?? 12))
         }
-        return group(lines)
+        return lines
     }
 
     private static func styledRuns(_ attributed: NSAttributedString, lineHeight: CGFloat) -> [TextRun] {
@@ -103,7 +108,7 @@ nonisolated enum PDFText {
 
     /// Joins consecutive lines into a block when they look like one paragraph:
     /// same text size, close together vertically, and aligned on the left or the center.
-    private static func group(_ lines: [TextLine]) -> [TextBlock] {
+    static func group(_ lines: [TextLine]) -> [TextBlock] {
         var blocks: [TextBlock] = []
         for line in lines {
             let size = line.fontSize

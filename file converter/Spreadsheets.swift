@@ -77,33 +77,33 @@ nonisolated enum Spreadsheets {
             try (header + xml).write(to: package.appending(path: path), atomically: true, encoding: .utf8)
         }
         try write("[Content_Types].xml", #"""
-            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\
-            <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\
-            <Default Extension="xml" ContentType="application/xml"/>\
-            <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>\
-            <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>\
-            <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>\
+            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\#
+            <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\#
+            <Default Extension="xml" ContentType="application/xml"/>\#
+            <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>\#
+            <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>\#
+            <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>\#
             </Types>
             """#)
         try write("_rels/.rels", #"""
-            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\
+            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\#
             <Relationship Id="rId1" Type="\#(rel)/officeDocument" Target="xl/workbook.xml"/></Relationships>
             """#)
         try write("xl/workbook.xml", #"""
-            <workbook xmlns="\#(main)" xmlns:r="\#(rel)"><sheets>\
+            <workbook xmlns="\#(main)" xmlns:r="\#(rel)"><sheets>\#
             <sheet name="\#(escape(sheetName.isEmpty ? "Sheet1" : sheetName))" sheetId="1" r:id="rId1"/></sheets></workbook>
             """#)
         try write("xl/_rels/workbook.xml.rels", #"""
-            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\
-            <Relationship Id="rId1" Type="\#(rel)/worksheet" Target="worksheets/sheet1.xml"/>\
+            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\#
+            <Relationship Id="rId1" Type="\#(rel)/worksheet" Target="worksheets/sheet1.xml"/>\#
             <Relationship Id="rId2" Type="\#(rel)/styles" Target="styles.xml"/></Relationships>
             """#)
         try write("xl/styles.xml", #"""
-            <styleSheet xmlns="\#(main)"><fonts count="1"><font><sz val="12"/><name val="Calibri"/></font></fonts>\
-            <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>\
-            <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>\
-            <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>\
-            <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>\
+            <styleSheet xmlns="\#(main)"><fonts count="1"><font><sz val="12"/><name val="Calibri"/></font></fonts>\#
+            <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>\#
+            <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>\#
+            <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>\#
+            <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>\#
             <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>
             """#)
 

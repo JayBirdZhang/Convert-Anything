@@ -124,19 +124,19 @@ nonisolated enum SlideBuilder {
                 textBox(block, id: offset + 3, scale: scale, origin: CGPoint(x: x, y: y))
             }.joined()
             try (header + #"""
-                <p:sld \#(ns)><p:cSld><p:spTree>\
-                <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>\
-                <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>\
-                <p:pic><p:nvPicPr><p:cNvPr id="2" name="Page \#(number)"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>\
-                <p:blipFill><a:blip r:embed="rId2"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>\
-                <p:spPr><a:xfrm><a:off x="\#(x)" y="\#(y)"/><a:ext cx="\#(width)" cy="\#(height)"/></a:xfrm>\
-                <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>\
-                \#(textBoxes)\
+                <p:sld \#(ns)><p:cSld><p:spTree>\#
+                <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>\#
+                <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>\#
+                <p:pic><p:nvPicPr><p:cNvPr id="2" name="Page \#(number)"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>\#
+                <p:blipFill><a:blip r:embed="rId2"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>\#
+                <p:spPr><a:xfrm><a:off x="\#(x)" y="\#(y)"/><a:ext cx="\#(width)" cy="\#(height)"/></a:xfrm>\#
+                <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>\#
+                \#(textBoxes)\#
                 </p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>
                 """#).write(to: package.appending(path: "ppt/slides/slide\(number).xml"), atomically: true, encoding: .utf8)
             try (header + #"""
-                <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\
-                <Relationship Id="rId1" Type="\#(relType)/slideLayout" Target="../slideLayouts/\#(blankLayout)"/>\
+                <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\#
+                <Relationship Id="rId1" Type="\#(relType)/slideLayout" Target="../slideLayouts/\#(blankLayout)"/>\#
                 <Relationship Id="rId2" Type="\#(relType)/image" Target="../media/image\#(number).png"/></Relationships>
                 """#).write(to: slideDir.appending(path: "slide\(number).xml.rels"), atomically: true, encoding: .utf8)
         }
