@@ -30,7 +30,7 @@ enum DocumentConversion {
                 return
             }
             let paragraphs = text.components(separatedBy: "\n\n").map { "<p>\(escapeHTML($0).replacingOccurrences(of: "\n", with: "<br>"))</p>" }
-            try write(html: paragraphs.joined(separator: "\n"), title: request.title, request: request, output: output)
+            try await write(html: paragraphs.joined(separator: "\n"), title: request.title, request: request, output: output)
             return
         }
 
@@ -38,14 +38,18 @@ enum DocumentConversion {
         switch from {
         case .md:
             let markdown = try readText(input)
+            let showsMath = request.to == .html || request.to == .pdf
+            let html = Markdown.$mathAsMathML.withValue(showsMath) { Markdown.html(from: markdown) }
             if request.to == .txt {
-                try plainText(fromHTML: Markdown.html(from: markdown), baseURL: request.originalDir).write(to: output, atomically: true, encoding: .utf8)
+                try plainText(fromHTML: html, baseURL: request.originalDir).write(to: output, atomically: true, encoding: .utf8)
             } else {
-                try write(html: Markdown.html(from: markdown), title: request.title, request: request, output: output)
+                try await write(html: html, title: request.title, request: request, output: output)
             }
         case .html:
             let html = try readText(input)
-            if request.to == .md {
+            if request.to == .pdf {
+                try await WebPDF.render(html: html, baseURL: request.originalDir, output: output)
+            } else if request.to == .md {
                 try Markdown.markdown(from: attributed(html: html, baseURL: request.originalDir)).write(to: output, atomically: true, encoding: .utf8)
             } else {
                 try write(text: attributed(html: html, baseURL: request.originalDir), request: request, output: output)
@@ -56,7 +60,7 @@ enum DocumentConversion {
                 try text.write(to: output, atomically: true, encoding: .utf8)
             } else {
                 let paragraphs = text.components(separatedBy: "\n\n").map { "<p>\(escapeHTML($0).replacingOccurrences(of: "\n", with: "<br>"))</p>" }
-                try write(html: paragraphs.joined(separator: "\n"), title: request.title, request: request, output: output)
+                try await write(html: paragraphs.joined(separator: "\n"), title: request.title, request: request, output: output)
             }
         default:
             let text = try NSAttributedString(url: input, options: [:], documentAttributes: nil)
@@ -67,12 +71,12 @@ enum DocumentConversion {
     // MARK: Writing
 
     /// Writes HTML content in the target format. HTML targets get a complete, styled page.
-    private static func write(html body: String, title: String, request: Converter.Request, output: URL) throws {
+    private static func write(html body: String, title: String, request: Converter.Request, output: URL) async throws {
         switch request.to {
         case .html:
             try htmlPage(body: body, title: title).write(to: output, atomically: true, encoding: .utf8)
         case .pdf:
-            try renderPDF(attributed(html: htmlPage(body: body, title: title), baseURL: request.originalDir), output: output)
+            try await WebPDF.render(html: htmlPage(body: body, title: title), baseURL: request.originalDir, output: output)
         default:
             try write(text: attributed(html: htmlPage(body: body, title: title), baseURL: request.originalDir), request: request, output: output)
         }
@@ -108,6 +112,12 @@ enum DocumentConversion {
         blockquote { color: #555; border-left: 3px solid #ddd; margin-left: 0; padding-left: 1em; }
         table { border-collapse: collapse; } td, th { border: 1px solid #ccc; padding: 3px 6px; }
         img { max-width: 100%; }
+        pre { white-space: pre-wrap; }
+        * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        p.math { text-align: center; margin: 0.8em 0; }
+        math { font-size: 1.1em; }
+        h1, h2, h3 { line-height: 1.2; }
+        @media print { body { margin: 0; max-width: none; padding: 0; } h1, h2, h3 { break-after: avoid; } pre, table, img { break-inside: avoid; } }
         </style></head>
         <body>
         \(body)
@@ -192,6 +202,14 @@ nonisolated func escapeHTML(_ text: String) -> String {
 /// A compact Markdown reader and writer covering what people actually use: headings, paragraphs,
 /// bold/italic/strikethrough, code, links, images, block quotes, nested lists, tables and rules.
 nonisolated enum Markdown {
+    /// Math ($…$, $$…$$, \(…\), \[…\]) becomes MathML for web pages and PDFs; other formats can't show
+    /// MathML, so there it stays as the LaTeX source.
+    @TaskLocal static var mathAsMathML = true
+
+    static func math(_ tex: String, display: Bool) -> String {
+        mathAsMathML ? TeXMath.mathML(tex, display: display) : escapeHTML(display ? "$$\(tex)$$" : "$\(tex)$")
+    }
+
     // MARK: Markdown → HTML
 
     static func html(from markdown: String) -> String {
@@ -207,6 +225,25 @@ nonisolated enum Markdown {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty { lines.removeFirst(); continue }
 
+            // Display math: $$ … $$ or \[ … \], on one line or several
+            if trimmed.hasPrefix("$$") || trimmed.hasPrefix("\\[") {
+                let close = trimmed.hasPrefix("$$") ? "$$" : "\\]"
+                var body = String(trimmed.dropFirst(2))
+                lines.removeFirst()
+                if let end = body.range(of: close) {
+                    body = String(body[..<end.lowerBound])
+                } else {
+                    var parts = [body]
+                    while let next = lines.first {
+                        lines.removeFirst()
+                        if let end = next.range(of: close) { parts.append(String(next[..<end.lowerBound])); break }
+                        parts.append(next)
+                    }
+                    body = parts.joined(separator: "\n")
+                }
+                out.append("<p class=\"math\">\(math(body, display: true))</p>")
+                continue
+            }
             // Fenced code
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
                 let fence = String(trimmed.prefix(3))
@@ -343,16 +380,28 @@ nonisolated enum Markdown {
         return html + "</tbody></table>"
     }
 
-    /// Inline formatting. Code spans are set aside first so nothing inside them is touched.
+    /// Inline formatting. Code spans and math are set aside first so nothing inside them is touched.
+    /// A lone "$" (a price) isn't math: math needs no space just inside the dollar signs.
     static func inline(_ text: String) -> String {
-        var result = ""
-        var rest = Substring(text)
-        while let match = rest.firstMatch(of: /(`+)(.+?)\1/) {
-            result += spans(String(rest[..<match.range.lowerBound]))
-            result += "<code>\(escapeHTML(String(match.2).trimmingCharacters(in: .whitespaces)))</code>"
-            rest = rest[match.range.upperBound...]
+        let regex = try! NSRegularExpression(pattern: #"(`+)(.+?)\1|\$\$(.+?)\$\$|\\\((.+?)\\\)|(?<![\\$\w])\$(?=\S)([^$\n]+?)(?<=\S)\$(?![\w$])"#)
+        let string = text as NSString
+        var result = "", last = 0
+        func group(_ match: NSTextCheckingResult, _ index: Int) -> String? {
+            let range = match.range(at: index)
+            return range.location == NSNotFound ? nil : string.substring(with: range)
         }
-        return result + spans(String(rest))
+        for match in regex.matches(in: text, range: NSRange(location: 0, length: string.length)) {
+            result += spans(string.substring(with: NSRange(location: last, length: match.range.location - last)))
+            if let code = group(match, 2) {
+                result += "<code>\(escapeHTML(code.trimmingCharacters(in: .whitespaces)))</code>"
+            } else if let display = group(match, 3) {
+                result += math(display, display: true)
+            } else if let tex = group(match, 4) ?? group(match, 5) {
+                result += math(tex, display: false)
+            }
+            last = match.range.location + match.range.length
+        }
+        return result + spans(string.substring(from: last))
     }
 
     private static func spans(_ text: String) -> String {

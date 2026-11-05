@@ -38,42 +38,52 @@ nonisolated enum IWork {
     static func export(_ input: URL, with app: App, as format: ExportFormat, to output: URL) async throws -> URL {
         guard let id = app.installedID else { throw ConversionError.missingApp(app.rawValue) }
 
-        // The app is quit afterwards only if it wasn't already open and no other documents are open in it.
+        // A uniquely named copy, so the script can find its own document by name (never one you have open),
+        // and wait for it: large files take a while to import, and "open" returns before they're ready.
+        // The app is quit afterwards only if it wasn't open before.
+        let token = "Convert Everything \(UUID().uuidString.prefix(8))"
+        let copy = input.deletingLastPathComponent().appending(path: "\(token).\(input.pathExtension)")
+        try? FileManager.default.removeItem(at: copy)
+        try FileManager.default.copyItem(at: input, to: copy)
+        defer { try? FileManager.default.removeItem(at: copy) }
+
         let script = """
         on run argv
             set inputFile to POSIX file (item 1 of argv)
             set outputFile to POSIX file (item 2 of argv)
+            set baseName to item 3 of argv
+            set fullName to item 4 of argv
             set wasRunning to application id "\(id)" is running
-            tell application id "\(id)"
-                set theDocument to missing value
+            tell application id "\(id)" to open inputFile
+            set theDocument to missing value
+            repeat 600 times
                 try
-                    set theDocument to open inputFile
-                    get name of theDocument
+                    tell application id "\(id)" to set theDocument to document baseName
+                    tell application id "\(id)" to get name of theDocument
+                    exit repeat
                 on error
-                    -- Some versions return an unusable reference from "open": use the front document,
-                    -- once the import has finished.
-                    set theDocument to missing value
+                    try
+                        tell application id "\(id)" to set theDocument to document fullName
+                        tell application id "\(id)" to get name of theDocument
+                        exit repeat
+                    on error
+                        set theDocument to missing value
+                        delay 0.25
+                    end try
                 end try
-                if theDocument is missing value then
-                    repeat 100 times
-                        if (count of documents) > 0 then exit repeat
-                        delay 0.2
-                    end repeat
-                    set theDocument to front document
-                end if
-                try
+            end repeat
+            if theDocument is missing value then error "The file didn't open in \(app.rawValue)."
+            with timeout of 900 seconds
+                tell application id "\(id)"
                     export theDocument to outputFile as \(format.rawValue)
-                on error message number code
                     close theDocument saving no
-                    error message number code
-                end try
-                close theDocument saving no
-                if not wasRunning and (count of documents) is 0 then quit
-            end tell
+                end tell
+            end timeout
+            if not wasRunning then tell application id "\(id)" to quit
         end run
         """
         do {
-            try await Tools.run("/usr/bin/osascript", ["-e", script, input.path, output.path])
+            try await Tools.run("/usr/bin/osascript", ["-e", script, copy.path, output.path, token, copy.lastPathComponent])
         } catch ConversionError.failed(let message) where message.contains("-1743") {
             throw ConversionError.failed("Convert Everything isn't allowed to use \(app.rawValue). Turn it on in System Settings → Privacy & Security → Automation.")
         } catch ConversionError.failed(let message) where message.contains("-1712") {
