@@ -2,7 +2,7 @@ import Foundation
 
 nonisolated enum ConversionError: LocalizedError {
     case unsupported(Format, Format)
-    case missingTool(String, brewPackage: String)
+    case missingApp(String)     // A free Apple app the conversion relies on (Keynote, Numbers, Pages)
     case failed(String)
     case cancelled
 
@@ -10,8 +10,8 @@ nonisolated enum ConversionError: LocalizedError {
         switch self {
         case .unsupported(let from, let to):
             "Can't convert \(from.displayName) to \(to.displayName)."
-        case .missingTool(let tool, let package):
-            "\(tool) isn't installed. Run “brew install \(package)” in Terminal."
+        case .missingApp(let app):
+            "This needs \(app), which is free on the App Store."
         case .failed(let message):
             message
         case .cancelled:
@@ -20,19 +20,13 @@ nonisolated enum ConversionError: LocalizedError {
     }
 }
 
-/// Finds and runs the command-line converters (sips/textutil ship with macOS;
-/// pandoc, ffmpeg and cwebp come from Homebrew).
+/// Runs command-line programs: macOS's own (zip, unzip, osascript) and Ghostscript, which ships
+/// inside the app in Contents/Helpers.
 nonisolated enum Tools {
-    /// Apps launched from Finder don't inherit the Terminal's PATH, so check Homebrew's folders explicitly.
-    static func path(for name: String) -> String? {
-        let envPath = ProcessInfo.processInfo.environment["PATH"]?.split(separator: ":").map(String.init) ?? []
-        let dirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] + envPath
-        return dirs.map { "\($0)/\(name)" }.first { FileManager.default.isExecutableFile(atPath: $0) }
-    }
-
-    static func require(_ name: String, brewPackage: String? = nil) throws -> String {
-        guard let path = path(for: name) else {
-            throw ConversionError.missingTool(name, brewPackage: brewPackage ?? name)
+    static func bundled(_ name: String) throws -> String {
+        let path = Bundle.main.bundleURL.appending(path: "Contents/Helpers/\(name)").path
+        guard FileManager.default.isExecutableFile(atPath: path) else {
+            throw ConversionError.failed("\(name) is missing from the app. Reinstall Convert Everything.")
         }
         return path
     }

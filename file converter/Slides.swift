@@ -1,35 +1,6 @@
 import Foundation
 import PDFKit
 
-/// Runs LibreOffice invisibly to convert Office files.
-nonisolated enum LibreOffice {
-    static var path: String? {
-        let apps = ["/Applications", "\(NSHomeDirectory())/Applications"].map { "\($0)/LibreOffice.app/Contents/MacOS/soffice" }
-        return Tools.path(for: "soffice") ?? apps.first { FileManager.default.isExecutableFile(atPath: $0) }
-    }
-
-    /// Uses its own settings profile, so it never collides with a LibreOffice window you have open.
-    /// `type` is an extension, optionally followed by ":<filter>:<options>" (e.g. for CSV encoding).
-    static func convert(_ input: URL, to type: String, workDir: URL, inputFilter: String? = nil) async throws -> URL {
-        guard let soffice = path else {
-            throw ConversionError.missingTool("LibreOffice", brewPackage: "--cask libreoffice")
-        }
-        let profile = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appending(path: "FileConverter/LibreOfficeProfile")
-        let outDir = workDir.appending(path: "libreoffice")
-        var args = ["-env:UserInstallation=\(profile.absoluteString)", "--headless", "--norestore", "--nolockcheck"]
-        if let inputFilter { args.append("--infilter=\(inputFilter)") }
-        try await Tools.run(soffice, args + ["--convert-to", type, "--outdir", outDir.path, input.path])
-        let ext = type.split(separator: ":").first.map(String.init) ?? type
-        let result = outDir.appending(path: input.deletingPathExtension().lastPathComponent + "." + ext)
-        // LibreOffice can exit successfully without writing anything when it can't read the file.
-        guard FileManager.default.fileExists(atPath: result.path) else {
-            throw ConversionError.failed("LibreOffice couldn't open this file.")
-        }
-        return result
-    }
-}
-
 /// Builds a PowerPoint file from a PDF (one slide per page) or an image (one slide). Two styles:
 /// - Pictures: each page as a full-slide picture. Looks exactly like the PDF; text isn't editable.
 /// - Editable: Ghostscript strips the text out of the PDF and what's left (photos, shapes, backgrounds)
@@ -59,7 +30,7 @@ nonisolated enum SlideBuilder {
 
         var textless: URL?
         if request.from == .pdf && request.editableSlides {
-            let gs = try Tools.require("gs", brewPackage: "ghostscript")
+            let gs = try Tools.bundled("gs")
             let url = request.workDir.appending(path: "textless.pdf")
             try await Tools.run(gs, ["-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite", "-dFILTERTEXT",
                                      "-o", url.path, request.input.path])

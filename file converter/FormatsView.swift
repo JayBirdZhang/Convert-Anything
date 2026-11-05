@@ -46,7 +46,7 @@ struct FormatsView: View {
                         tip("text.viewfinder", "Rename a photo or scanned PDF to .txt or .docx to get its text.")
                         tip("arrow.uturn.backward", "Rename a file back to undo, or press ⌘Z in Finder.")
                         tip("square.stack", "Many files: select them, right-click → Rename…, replace the extension.")
-                        tip("doc.on.doc", "Pages, Numbers and Keynote files can be converted from, not to.")
+                        tip("doc.on.doc", "PowerPoint, Excel and iWork files use Keynote, Numbers or Pages (free from Apple).")
                     }
                 }
                 .padding(.trailing, 4)

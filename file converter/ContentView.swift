@@ -205,7 +205,7 @@ private struct JobRow: View {
         switch job.state {
         case .waiting: return "Waiting · \(conversion)"
         case .converting: return conversion
-        case .done: return job.pageCount.map { "\(conversion) · \($0) images" } ?? conversion
+        case .done: return job.pageCount.map { "\(conversion) · \($0) \(job.to.kind == .image ? "images" : "files")" } ?? conversion
         case .failed(let message): return message
         case .cancelled: return "Cancelled · name restored"
         case .undone: return "Undone · original restored"

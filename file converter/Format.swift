@@ -4,13 +4,13 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     // Images
     case png, jpeg, heic, tiff, gif, bmp, webp, avif, ico
     // Documents (including presentations)
-    case pdf, md, txt, html, docx, doc, rtf, odt, epub, tex, pages, pptx, ppt, key
+    case pdf, md, txt, html, docx, doc, rtf, odt, pages, pptx, ppt, key
     // Spreadsheets
-    case xlsx, xls, ods, csv, numbers
+    case xlsx, xls, csv, numbers
     // Audio
     case mp3, wav, m4a, aac, flac, ogg, opus, aiff
     // Video
-    case mp4, mov, m4v, mkv, webm, avi
+    case mp4, mov, m4v
 
     enum Kind { case image, document, spreadsheet, audio, video }
 
@@ -23,7 +23,6 @@ nonisolated enum Format: String, CaseIterable, Sendable {
         case "markdown", "md": self = .md
         case "text", "txt": self = .txt
         case "aif", "aiff": self = .aiff
-        case "latex", "tex": self = .tex
         default:
             guard let format = Format(rawValue: ext.lowercased()) else { return nil }
             self = format
@@ -33,16 +32,16 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     var kind: Kind {
         switch self {
         case .png, .jpeg, .heic, .tiff, .gif, .bmp, .webp, .avif, .ico: .image
-        case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .epub, .tex, .pages, .pptx, .ppt, .key: .document
-        case .xlsx, .xls, .ods, .csv, .numbers: .spreadsheet
+        case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .pptx, .ppt, .key: .document
+        case .xlsx, .xls, .csv, .numbers: .spreadsheet
         case .mp3, .wav, .m4a, .aac, .flac, .ogg, .opus, .aiff: .audio
-        case .mp4, .mov, .m4v, .mkv, .webm, .avi: .video
+        case .mp4, .mov, .m4v: .video
         }
     }
 
     /// Plain-text formats can't be told apart by their bytes, so for these
     /// we trust the file's old extension instead.
-    var isPlainText: Bool { [.md, .txt, .html, .tex, .csv].contains(self) }
+    var isPlainText: Bool { [.md, .txt, .html, .csv].contains(self) }
 
     var isSlides: Bool { [.pptx, .ppt, .key].contains(self) }
 
@@ -104,12 +103,8 @@ nonisolated enum Sniffer {
         if at(0, "RIFF") {
             if at(8, "WEBP") { return .format(.webp) }
             if at(8, "WAVE") { return .format(.wav) }
-            if at(8, "AVI ") { return .format(.avi) }
         }
         if at(0, "OggS") { return .format(data.range(of: Data("OpusHead".utf8)) != nil ? .opus : .ogg) }
-        if b.starts(with: [0x1A, 0x45, 0xDF, 0xA3]) {
-            return .format(data.range(of: Data("webm".utf8)) != nil ? .webm : .mkv)
-        }
         if at(4, "ftyp") && b.count >= 12 {
             let brand = String(decoding: b[8..<12], as: UTF8.self)
             switch brand {
@@ -151,12 +146,10 @@ nonisolated enum Sniffer {
         return .unknown
     }
 
-    /// docx, pptx, odt and epub are all zip archives. epub and odt name themselves in their first entry;
+    /// docx, pptx, xlsx and odt are all zip archives. odt names itself in its first entry;
     /// Office files are told apart by the folder names listed in the zip's directory at the end of the file.
     private static func detectZip(_ url: URL, head: Data) -> Result {
-        if head.range(of: Data("application/epub+zip".utf8)) != nil { return .format(.epub) }
         if head.range(of: Data("application/vnd.oasis.opendocument.text".utf8)) != nil { return .format(.odt) }
-        if head.range(of: Data("application/vnd.oasis.opendocument.spreadsheet".utf8)) != nil { return .format(.ods) }
 
         guard let handle = try? FileHandle(forReadingFrom: url) else { return .unknown }
         defer { try? handle.close() }

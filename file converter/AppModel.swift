@@ -155,7 +155,7 @@ enum OriginalsMode: String, CaseIterable {
 
     private let defaults = UserDefaults.standard
     private let watcher = FolderWatcher()
-    // Video and LibreOffice jobs run one at a time; everything else a few at a time, so a big batch
+    // Video and Keynote/Numbers/Pages jobs run one at a time; everything else a few at a time, so a big batch
     // doesn't start dozens of converters at once.
     private let heavyLane = Lane(limit: 1)
     private let lightLane = Lane(limit: max(2, ProcessInfo.processInfo.activeProcessorCount / 2))
@@ -342,6 +342,7 @@ enum OriginalsMode: String, CaseIterable {
             revertRename(job)
             job.state = .cancelled
         } catch {
+            log.error("\(job.from.rawValue, privacy: .public) → \(job.to.rawValue, privacy: .public) failed: \(String(describing: error), privacy: .public)")
             revertRename(job)
             job.state = .failed(error.localizedDescription)
         }
@@ -413,7 +414,7 @@ enum OriginalsMode: String, CaseIterable {
 
         if batch.jobs.count == 1, let job = batch.jobs.first {
             if job.state == .done, let result = job.resultURL {
-                let detail = job.pageCount.map { " · \($0) images" } ?? ""
+                let detail = job.pageCount.map { " · \($0) \(job.to.kind == .image ? "images" : "files")" } ?? ""
                 notify("Converted \(result.lastPathComponent)", body: "\(job.from.displayName) → \(job.to.displayName)\(detail)",
                        reveal: [result])
             } else if let (job, message) = failed.first {
