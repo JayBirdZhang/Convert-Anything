@@ -45,7 +45,7 @@ nonisolated enum IWork {
     /// so whatever was in the way can be seen.
     @discardableResult
     static func export(_ input: URL, with app: App, as format: ExportFormat, to output: URL,
-                       openTimeout: Int = 180, totalTimeout: Int = 300) async throws -> URL {
+                       openTimeout: Int = 90, totalTimeout: Int = 300) async throws -> URL {
         guard let id = app.installedID else { throw ConversionError.missingApp(app.rawValue) }
 
         // A uniquely named copy, so the script can find its own document by name (never one you have open).
