@@ -8,11 +8,11 @@ nonisolated final class GIFEncoder {
     let width: Int, height: Int
     private let palette: [(r: Int, g: Int, b: Int)]
     private var data = Data()
-    private var lookup = [Int16](repeating: -1, count: 32 * 32 * 32)   // 5 bits per channel → palette index
+    private var lookup = [Int16](repeating: -1, count: 64 * 64 * 64)   // 6 bits per channel → palette index
     private var elapsed = 0.0          // seconds written so far
     private var elapsedCentiseconds = 0
     private var previousIndices: [UInt8]?   // What's on screen after the last frame
-    private var previousPixels: [UInt8]?    // The last frame's source pixels
+    private var reference: [UInt8]?         // The source color each pixel had when it was last drawn
     private static let transparent: UInt8 = 255
 
     /// `palette` should have at most 255 colors; index 255 is kept for "unchanged since the last frame".
@@ -63,8 +63,6 @@ nonisolated final class GIFEncoder {
         } else {
             previousIndices = indices
         }
-        previousPixels = rgba
-
         let frameWidth = right - left + 1, frameHeight = bottom - top + 1
         var cropped = [UInt8]()
         cropped.reserveCapacity(frameWidth * frameHeight)
@@ -87,53 +85,84 @@ nonisolated final class GIFEncoder {
 
     // MARK: Dithering
 
-    /// Floyd–Steinberg error diffusion at 75% strength: smooth gradients without the dither pattern
-    /// shimmering from frame to frame. A pixel that barely changed since the last frame keeps the color it
-    /// had (and is marked unchanged), so still backgrounds stay perfectly still.
+    /// Floyd–Steinberg error diffusion at 75% strength, scanning rows in alternating directions
+    /// (serpentine) so the dots don't line up into diagonal "worms".
+    ///
+    /// Still areas are kept exactly as they were, so they don't shimmer: the frame is checked in 8×8 blocks,
+    /// and a block whose pixels are all close to the colors they had when last drawn is left alone. Blocks
+    /// (not single pixels) keep moving textures from turning into a speckled mix of old and new dots, and
+    /// comparing with the last-drawn colors (not the previous frame) stops slow changes from leaving trails.
     private func dither(_ rgba: [UInt8]) -> (indices: [UInt8], changed: [Bool]) {
         var indices = [UInt8](repeating: 0, count: width * height)
         var changed = [Bool](repeating: true, count: width * height)
+        let previousIndices = self.previousIndices
+
+        // Which 8×8 blocks changed.
+        let block = 8
+        let blocksWide = (width + block - 1) / block, blocksHigh = (height + block - 1) / block
+        var blockChanged = [Bool](repeating: true, count: blocksWide * blocksHigh)
+        if let reference, previousIndices != nil {
+            for by in 0..<blocksHigh {
+                for bx in 0..<blocksWide {
+                    var moved = false
+                    outer: for y in (by * block)..<min(height, (by + 1) * block) {
+                        for x in (bx * block)..<min(width, (bx + 1) * block) {
+                            let p = (y * width + x) * 4
+                            let difference = abs(Int(rgba[p]) - Int(reference[p])) + abs(Int(rgba[p + 1]) - Int(reference[p + 1]))
+                                + abs(Int(rgba[p + 2]) - Int(reference[p + 2]))
+                            if difference > 24 { moved = true; break outer }
+                        }
+                    }
+                    blockChanged[by * blocksWide + bx] = moved
+                }
+            }
+        }
+
         var current = [Int32](repeating: 0, count: (width + 2) * 3)
         var next = [Int32](repeating: 0, count: (width + 2) * 3)
-        let previousPixels = self.previousPixels, previousIndices = self.previousIndices
+        var newReference = reference ?? rgba
         for y in 0..<height {
-            for x in 0..<width {
+            let forward = y % 2 == 0
+            let step = forward ? 3 : -3          // Toward the next pixel in this row's direction
+            for column in 0..<width {
+                let x = forward ? column : width - 1 - column
                 let i = y * width + x, p = i * 4
                 let e = (x + 1) * 3
                 let r = clamp(Int(rgba[p]) + Int(current[e]) / 16)
                 let g = clamp(Int(rgba[p + 1]) + Int(current[e + 1]) / 16)
                 let b = clamp(Int(rgba[p + 2]) + Int(current[e + 2]) / 16)
-                var index: Int
-                if let previousPixels, let previousIndices,
-                   abs(Int(rgba[p]) - Int(previousPixels[p])) + abs(Int(rgba[p + 1]) - Int(previousPixels[p + 1]))
-                    + abs(Int(rgba[p + 2]) - Int(previousPixels[p + 2])) < 18 {
+                let index: Int
+                if let previousIndices, !blockChanged[(y / block) * blocksWide + x / block] {
                     index = Int(previousIndices[i])
                     changed[i] = false
                 } else {
                     index = nearest(r, g, b)
+                    newReference[p] = rgba[p]; newReference[p + 1] = rgba[p + 1]; newReference[p + 2] = rgba[p + 2]
                 }
                 indices[i] = UInt8(index)
                 let chosen = palette[index]
-                // 16ths, scaled by 3/4: right 7, below-left 3, below 5, below-right 1.
+                // 16ths, scaled by 3/4: ahead 7, behind-below 3, below 5, ahead-below 1.
                 let er = Int32((r - chosen.r) * 3 / 4), eg = Int32((g - chosen.g) * 3 / 4), eb = Int32((b - chosen.b) * 3 / 4)
-                current[e + 3] += er * 7; current[e + 4] += eg * 7; current[e + 5] += eb * 7
-                next[e - 3] += er * 3; next[e - 2] += eg * 3; next[e - 1] += eb * 3
+                let ahead = e + step, behind = e - step
+                current[ahead] += er * 7; current[ahead + 1] += eg * 7; current[ahead + 2] += eb * 7
+                next[behind] += er * 3; next[behind + 1] += eg * 3; next[behind + 2] += eb * 3
                 next[e] += er * 5; next[e + 1] += eg * 5; next[e + 2] += eb * 5
-                next[e + 3] += er; next[e + 4] += eg; next[e + 5] += eb
+                next[ahead] += er; next[ahead + 1] += eg; next[ahead + 2] += eb
             }
             swap(&current, &next)
             next.withUnsafeMutableBufferPointer { $0.update(repeating: 0) }
         }
+        reference = newReference
         return (indices, changed)
     }
 
     private func clamp(_ value: Int) -> Int { min(255, max(0, value)) }
 
     private func nearest(_ r: Int, _ g: Int, _ b: Int) -> Int {
-        let key = (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3)
+        let key = (r >> 2) << 12 | (g >> 2) << 6 | (b >> 2)
         if lookup[key] >= 0 { return Int(lookup[key]) }
-        // Center of the 5-bit cell, then the closest palette color (weighted for how eyes see color).
-        let cr = (r >> 3) << 3 | 4, cg = (g >> 3) << 3 | 4, cb = (b >> 3) << 3 | 4
+        // Center of the 6-bit cell, then the closest palette color (weighted for how eyes see color).
+        let cr = (r >> 2) << 2 | 2, cg = (g >> 2) << 2 | 2, cb = (b >> 2) << 2 | 2
         var best = 0, bestDistance = Int.max
         for (i, color) in palette.enumerated() where i < Int(Self.transparent) {
             let dr = cr - color.r, dg = cg - color.g, db = cb - color.b

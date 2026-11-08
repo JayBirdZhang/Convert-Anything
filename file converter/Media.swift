@@ -34,6 +34,7 @@ nonisolated enum MediaConversion {
     private static func firstFrame(_ request: Converter.Request, output: URL) async throws {
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: request.input))
         generator.appliesPreferredTrackTransform = true
+        if #available(macOS 15, *) { generator.dynamicRangePolicy = .forceSDR }   // HDR video → normal colors
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = CMTime(value: 1, timescale: 10)
         let image: CGImage
@@ -150,6 +151,8 @@ nonisolated enum GIFVideo {
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: maxWidth, height: maxWidth)   // Longest side; never enlarges
+        // iPhone videos are often HDR; tone-map them so the GIF's colors aren't washed out.
+        if #available(macOS 15, *) { generator.dynamicRangePolicy = .forceSDR }
         let tolerance = CMTime(seconds: 0.5 / Double(fps), preferredTimescale: 600)
         generator.requestedTimeToleranceBefore = tolerance
         generator.requestedTimeToleranceAfter = tolerance

@@ -200,8 +200,8 @@ nonisolated enum Quality: String, CaseIterable, Sendable {
     /// PDF and slide pages: 2.5x = 180 dpi, 2x = 144 dpi, 1.5x = 108 dpi.
     var pageScale: CGFloat { switch self { case .best: 2.5; case .balanced: 2; case .small: 1.5 } }
 
-    /// GIF frame rate and longest side in pixels (GIFs grow fast, so these stay modest).
-    var gifSettings: (fps: Int, width: Int) { switch self { case .best: (20, 720); case .balanced: (15, 540); case .small: (10, 360) } }
+    /// GIF frame rate and longest side in pixels ("Best" keeps the video's own size up to 1920).
+    var gifSettings: (fps: Int, width: Int) { switch self { case .best: (20, 1920); case .balanced: (15, 1080); case .small: (10, 540) } }
 
     var mp3VBR: Int { switch self { case .best: 0; case .balanced: 2; case .small: 5 } }
     var aacBitrate: Int { switch self { case .best: 256_000; case .balanced: 192_000; case .small: 128_000 } }
