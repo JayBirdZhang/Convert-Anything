@@ -137,35 +137,52 @@ extension ConversionError {
 // MARK: - GIF
 
 nonisolated enum GIFVideo {
-    /// Samples the video at a few frames per second and writes a looping GIF (ImageIO picks the colors).
+    /// Samples the video at the quality's frame rate and writes a looping GIF. One palette is picked for
+    /// the whole video from a spread of its frames, and every frame is dithered against it (see GIFEncoder).
     static func makeGIF(from input: URL, output: URL, quality: Quality, progress: @escaping @Sendable (Double) -> Void) async throws {
         let asset = AVURLAsset(url: input)
         let duration = (try? await asset.load(.duration).seconds) ?? 0
         guard duration > 0 else { throw ConversionError.failed("Couldn't read this video.") }
-        let (fps, width) = quality.gifSettings
+        let (fps, maxWidth) = quality.gifSettings   // maxWidth: the longest side
         let count = max(1, Int(duration * Double(fps)))
         let times = (0..<count).map { CMTime(seconds: Double($0) / Double(fps), preferredTimescale: 600) }
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: width, height: width * 4)
+        generator.maximumSize = CGSize(width: maxWidth, height: maxWidth)   // Longest side; never enlarges
         let tolerance = CMTime(seconds: 0.5 / Double(fps), preferredTimescale: 600)
         generator.requestedTimeToleranceBefore = tolerance
         generator.requestedTimeToleranceAfter = tolerance
 
-        guard let destination = CGImageDestinationCreateWithURL(output as CFURL, UTType.gif.identifier as CFString, count, nil) else {
-            throw ConversionError.failed("Couldn't write the GIF.")
+        // Pass 1: the palette, from up to 24 frames spread over the video.
+        let sampleTimes = stride(from: 0, to: count, by: max(1, count / 24)).map { times[$0] }
+        var samples: [(UInt8, UInt8, UInt8)] = []
+        var size: (width: Int, height: Int)?
+        for await result in generator.images(for: sampleTimes) {
+            try Task.checkCancellation()
+            guard let image = try? result.image else { continue }
+            if size == nil { size = (image.width, image.height) }
+            guard let (width, height) = size else { continue }
+            let pixels = GIFEncoder.rgba(image, width: width, height: height)
+            let step = max(1, (width * height) / 6_000) * 4
+            for i in stride(from: 0, to: pixels.count, by: step) { samples.append((pixels[i], pixels[i + 1], pixels[i + 2])) }
         }
-        CGImageDestinationSetProperties(destination, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
-        let frameProperties = [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: 1.0 / Double(fps)]] as CFDictionary
+        guard let (width, height) = size, width > 0, height > 0 else { throw ConversionError.failed("Couldn't read frames from this video.") }
+        let encoder = GIFEncoder(width: width, height: height, palette: GIFEncoder.palette(from: samples))
+        progress(0.1)
+
+        // Pass 2: every frame, dithered and compressed.
         var done = 0
         for await result in generator.images(for: times) {
             try Task.checkCancellation()
-            if let image = try? result.image { CGImageDestinationAddImage(destination, image, frameProperties) }
+            if let image = try? result.image {
+                encoder.addFrame(rgba: GIFEncoder.rgba(image, width: width, height: height), duration: 1.0 / Double(fps))
+            }
             done += 1
-            progress(Double(done) / Double(count))
+            progress(0.1 + 0.9 * Double(done) / Double(count))
         }
-        guard done > 0, CGImageDestinationFinalize(destination) else { throw ConversionError.failed("Couldn't write the GIF.") }
+        guard done > 0 else { throw ConversionError.failed("Couldn't read frames from this video.") }
+        try encoder.finish().write(to: output)
     }
 
     /// An animated GIF becomes an H.264 video, each frame shown for its own delay.
