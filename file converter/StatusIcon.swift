@@ -47,9 +47,22 @@ enum IdleIcon {
 /// Menu-bar icon while converting: a ring that fills with progress (just the track when progress
 /// isn't known) around a dot that breathes to show work is happening.
 enum StatusIcon {
+    /// Frames already drawn. The pulse ticks about 12 times a second, so rather than drawing a new image
+    /// each tick, progress and breath are rounded to steps too small to see and each frame is drawn once.
+    private static var frames: [Int: NSImage] = [:]
+
     /// `pulse` is a phase in radians; one full cycle is one breath.
     static func ring(progress: Double?, pulse: Double) -> NSImage {
-        let breath = 0.5 - 0.5 * cos(pulse)   // 0 → 1 → 0
+        let progressStep = progress.map { Int(($0 * 60).rounded()) } ?? -1   // 1/60 of the ring is well under a point
+        let breathStep = Int(((0.5 - 0.5 * cos(pulse)) * 12).rounded())     // 0 → 12 → 0
+        let key = (progressStep + 1) * 16 + breathStep
+        if let frame = frames[key] { return frame }
+        let frame = draw(progress: progress == nil ? nil : Double(progressStep) / 60, breath: Double(breathStep) / 12)
+        frames[key] = frame
+        return frame
+    }
+
+    private static func draw(progress: Double?, breath: Double) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: false) { rect in
             let center = NSPoint(x: rect.midX, y: rect.midY)
