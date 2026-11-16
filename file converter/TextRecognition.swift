@@ -7,7 +7,7 @@ import Vision
 nonisolated enum TextRecognition {
     /// Image → txt writes the recognized text as-is; other document formats go through HTML paragraphs.
     static func convertImage(_ request: Converter.Request, output: URL) async throws {
-        let paragraphs = try await Task.detached(priority: .utility) { () throws -> [String] in
+        let paragraphs = try await background { () throws -> [String] in
             guard let source = CGImageSourceCreateWithURL(request.input as CFURL, nil),
                   let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                       kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -17,7 +17,7 @@ nonisolated enum TextRecognition {
                 throw ConversionError.failed("Couldn't read this image.")
             }
             return try paragraphs(in: image)
-        }.value
+        }
         guard !paragraphs.isEmpty else { throw ConversionError.failed("No text was found in this image.") }
 
         if request.to == .txt || request.to == .md {
@@ -34,14 +34,13 @@ nonisolated enum TextRecognition {
     }
 
     /// All the text in a scanned PDF, page by page.
-    static func text(inPDF url: URL) throws -> String {
-        guard let document = PDFDocument(url: url) else { return "" }
-        var pages: [String] = []
-        for index in 0..<document.pageCount {
-            guard let page = document.page(at: index) else { continue }
-            pages.append(try paragraphs(in: ImageConversion.render(page, scale: 2.5)).joined(separator: "\n\n"))
+    static func text(inPDF url: URL) async throws -> String {
+        let count = PDFDocument(url: url)?.pageCount ?? 0
+        // Vision already uses the Neural Engine/GPU for each page, so a few workers is all that helps.
+        let pages = try await PageWorkers.map(url, pageCount: count, maxWorkers: 3) { page, _ in
+            try paragraphs(in: ImageConversion.render(page, scale: 2.5)).joined(separator: "\n\n")
         }
-        return pages.joined(separator: "\n\n")
+        return pages.compactMap { $0 }.joined(separator: "\n\n")
     }
 
     /// Recognized lines, top to bottom, joined into paragraphs wherever lines sit close together.

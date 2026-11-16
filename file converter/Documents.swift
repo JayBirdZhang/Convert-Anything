@@ -40,7 +40,8 @@ enum DocumentConversion {
             let markdown = try readText(input)
             let collector = MathCollector()
             let mode: Markdown.MathOutput = [.html, .pdf].contains(request.to) ? .mathML : request.to == .docx ? .placeholders(collector) : .tex
-            let html = Markdown.$mathOutput.withValue(mode) { Markdown.html(from: markdown) }
+            // A long document takes a moment to translate; keep it off the main thread.
+            let html = await Task.detached(priority: .utility) { Markdown.$mathOutput.withValue(mode) { Markdown.html(from: markdown) } }.value
             if request.to == .txt {
                 try plainText(fromHTML: html, baseURL: request.originalDir).write(to: output, atomically: true, encoding: .utf8)
             } else {
@@ -157,7 +158,7 @@ enum DocumentConversion {
         }.value
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // A scan: read the text off the page images instead.
-            text = try await Task.detached(priority: .utility) { try TextRecognition.text(inPDF: input) }.value
+            text = try await background { try await TextRecognition.text(inPDF: input) }
         }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ConversionError.failed("No text could be found in this PDF.")
@@ -266,13 +267,13 @@ nonisolated enum Markdown {
                 continue
             }
             // Heading
-            if let match = trimmed.wholeMatch(of: /(#{1,6})\s+(.*?)\s*#*/) {
+            if let match = trimmed.wholeMatch(of: headingRegex) {
                 let level = match.1.count
                 out.append("<h\(level)>\(inline(String(match.2)))</h\(level)>")
                 lines.removeFirst(); continue
             }
             // Horizontal rule
-            if trimmed.wholeMatch(of: /([-*_])(\s*\1){2,}/) != nil {
+            if trimmed.wholeMatch(of: ruleRegex) != nil {
                 out.append("<hr>"); lines.removeFirst(); continue
             }
             // Block quote
@@ -301,7 +302,7 @@ nonisolated enum Markdown {
             while let next = lines.first {
                 let t = next.trimmingCharacters(in: .whitespaces)
                 if t.isEmpty || t.hasPrefix("#") || t.hasPrefix(">") || t.hasPrefix("```") || (listMarker(next) != nil && !paragraph.isEmpty) { break }
-                if !paragraph.isEmpty, t.wholeMatch(of: /=+/) != nil || t.wholeMatch(of: /-+/) != nil {
+                if !paragraph.isEmpty, t.wholeMatch(of: equalsRegex) != nil || t.wholeMatch(of: dashesRegex) != nil {
                     let level = t.hasPrefix("=") ? 1 : 2
                     out.append("<h\(level)>\(inline(paragraph.joined(separator: " ")))</h\(level)>")
                     paragraph = []
@@ -324,7 +325,7 @@ nonisolated enum Markdown {
 
     /// The indent, whether it's numbered, and where the item's text starts.
     private static func listMarker(_ line: String) -> (indent: Int, ordered: Bool, contentStart: Int)? {
-        guard let match = line.prefixMatch(of: /( *)([-*+]|\d{1,9}[.)])( +|$)/) else { return nil }
+        guard let match = line.prefixMatch(of: listMarkerRegex) else { return nil }
         let indent = match.1.count
         let ordered = match.2.first?.isNumber == true
         return (indent, ordered, line.distance(from: line.startIndex, to: match.range.upperBound))
@@ -358,7 +359,7 @@ nonisolated enum Markdown {
             }
             var text = content.joined(separator: " ")
             var checkbox = ""
-            if let task = text.prefixMatch(of: #/\[([ xX])\] /#) {
+            if let task = text.prefixMatch(of: taskRegex) {
                 checkbox = task.1 == " " ? "☐ " : "☑ "
                 text = String(text[task.range.upperBound...])
             }
@@ -368,7 +369,7 @@ nonisolated enum Markdown {
     }
 
     private static func isTableSeparator(_ line: String) -> Bool {
-        line.trimmingCharacters(in: .whitespaces).wholeMatch(of: /\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?/) != nil
+        line.trimmingCharacters(in: .whitespaces).wholeMatch(of: tableSeparatorRegex) != nil
     }
 
     private static func cells(_ line: String) -> [String] {
@@ -389,17 +390,38 @@ nonisolated enum Markdown {
         return html + "</tbody></table>"
     }
 
+    // Compiled once: Swift builds a regex literal from its pattern each time the code runs, which dominated big files.
+    private static let headingRegex = /(#{1,6})\s+(.*?)\s*#*/
+    private static let ruleRegex = /([-*_])(\s*\1){2,}/
+    private static let equalsRegex = /=+/
+    private static let dashesRegex = /-+/
+    private static let listMarkerRegex = /( *)([-*+]|\d{1,9}[.)])( +|$)/
+    private static let taskRegex = #/\[([ xX])\] /#
+    private static let tableSeparatorRegex = /\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?/
+    private static let imageRegex = /!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)/
+    private static let linkRegex = /\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)/
+    private static let autolinkRegex = /&lt;(https?:\/\/[^\s&]+)&gt;/
+    private static let exportListMarker = /\t?([•◦▪▫‣⁃–*-]|\d{1,3}[.)]?|[a-zA-Z][.)]|[ivxIVX]{1,4}[.)])\t/
+    private static let markerPrefix = /\t?[^\t]{0,8}\t/
+    private static let markdownSpecials = /([\\`*_\[\]])/
+    private static let inlineRegex = try! NSRegularExpression(pattern: #"(`+)(.+?)\1|\$\$(.+?)\$\$|\\\((.+?)\\\)|(?<![\\$\w])\$(?=\S)([^$\n]+?)(?<=\S)\$(?![\w$])"#)
+    private static let emphasis: [(regex: NSRegularExpression, template: String)] = [
+        (#"(\*\*|__)(?=\S)(.+?)(?<=\S)\1"#, "<strong>$2</strong>"),
+        (#"\*(?=\S)(.+?)(?<=\S)\*"#, "<em>$1</em>"),
+        (#"(?<![\w])_(?=\S)(.+?)(?<=\S)_(?![\w])"#, "<em>$1</em>"),
+        (#"~~(?=\S)(.+?)(?<=\S)~~"#, "<del>$1</del>"),
+    ].map { (try! NSRegularExpression(pattern: $0.0), $0.1) }
+
     /// Inline formatting. Code spans and math are set aside first so nothing inside them is touched.
     /// A lone "$" (a price) isn't math: math needs no space just inside the dollar signs.
     static func inline(_ text: String) -> String {
-        let regex = try! NSRegularExpression(pattern: #"(`+)(.+?)\1|\$\$(.+?)\$\$|\\\((.+?)\\\)|(?<![\\$\w])\$(?=\S)([^$\n]+?)(?<=\S)\$(?![\w$])"#)
         let string = text as NSString
         var result = "", last = 0
         func group(_ match: NSTextCheckingResult, _ index: Int) -> String? {
             let range = match.range(at: index)
             return range.location == NSNotFound ? nil : string.substring(with: range)
         }
-        for match in regex.matches(in: text, range: NSRange(location: 0, length: string.length)) {
+        for match in inlineRegex.matches(in: text, range: NSRange(location: 0, length: string.length)) {
             result += spans(string.substring(with: NSRange(location: last, length: match.range.location - last)))
             if let code = group(match, 2) {
                 result += "<code>\(escapeHTML(code.trimmingCharacters(in: .whitespaces)))</code>"
@@ -413,22 +435,16 @@ nonisolated enum Markdown {
         return result + spans(string.substring(from: last))
     }
 
+    /// Swift's own regexes can't look behind, so emphasis uses Foundation's.
     private static func spans(_ text: String) -> String {
         var s = escapeHTML(text)
-        s = s.replacing(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)/) { "<img src=\"\($0.2)\" alt=\"\($0.1)\">" }
-        s = s.replacing(/\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)/) { "<a href=\"\($0.2)\">\($0.1)</a>" }
-        s = s.replacing(/&lt;(https?:\/\/[^\s&]+)&gt;/) { "<a href=\"\($0.1)\">\($0.1)</a>" }
-        s = replace(s, #"(\*\*|__)(?=\S)(.+?)(?<=\S)\1"#, "<strong>$2</strong>")
-        s = replace(s, #"\*(?=\S)(.+?)(?<=\S)\*"#, "<em>$1</em>")
-        s = replace(s, #"(?<![\w])_(?=\S)(.+?)(?<=\S)_(?![\w])"#, "<em>$1</em>")
-        s = replace(s, #"~~(?=\S)(.+?)(?<=\S)~~"#, "<del>$1</del>")
+        s = s.replacing(imageRegex) { "<img src=\"\($0.2)\" alt=\"\($0.1)\">" }
+        s = s.replacing(linkRegex) { "<a href=\"\($0.2)\">\($0.1)</a>" }
+        s = s.replacing(autolinkRegex) { "<a href=\"\($0.1)\">\($0.1)</a>" }
+        for (regex, template) in emphasis {
+            s = regex.stringByReplacingMatches(in: s, range: NSRange(location: 0, length: (s as NSString).length), withTemplate: template)
+        }
         return s
-    }
-
-    /// Swift's own regexes can't look behind, so emphasis uses Foundation's.
-    private static func replace(_ text: String, _ pattern: String, _ template: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
-        return regex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: template)
     }
 
     // MARK: Formatted text → Markdown
@@ -488,7 +504,7 @@ nonisolated enum Markdown {
                 return
             }
             // Word files read by macOS lose their list structure but keep the marker: "\t1\tOne", "\t•\tOne".
-            if let marker = raw.prefixMatch(of: /\t?([•◦▪▫‣⁃–*-]|\d{1,3}[.)]?|[a-zA-Z][.)]|[ivxIVX]{1,4}[.)])\t/) {
+            if let marker = raw.prefixMatch(of: exportListMarker) {
                 let ordered = marker.1.first.map { $0.isNumber || $0.isLetter } ?? false
                 let level = max(0, Int(((style?.headIndent ?? 36) / 36).rounded()) - 1)
                 let content = inlineMarkdown(text, range: afterMarker(raw, range))
@@ -511,7 +527,7 @@ nonisolated enum Markdown {
 
     /// The part of a list paragraph after its "\t•\t" or "\t1.\t" marker.
     private static func afterMarker(_ raw: String, _ range: NSRange) -> NSRange {
-        guard let marker = raw.prefixMatch(of: /\t?[^\t]{0,8}\t/) else { return range }
+        guard let marker = raw.prefixMatch(of: markerPrefix) else { return range }
         let length = (String(raw[marker.range]) as NSString).length
         return NSRange(location: range.location + length, length: max(0, range.length - length))
     }
@@ -541,7 +557,7 @@ nonisolated enum Markdown {
             var piece = (text.string as NSString).substring(with: subrange)
             piece = piece.replacingOccurrences(of: "\n", with: "").replacingOccurrences(of: "\u{2028}", with: "  \n")
             guard !piece.trimmingCharacters(in: .whitespaces).isEmpty else { result += piece; return }
-            piece = piece.replacing(/([\\`*_\[\]])/) { "\\" + $0.1 }
+            piece = piece.replacing(markdownSpecials) { "\\" + $0.1 }
 
             let leading = String(piece.prefix { $0 == " " }), trailing = String(piece.reversed().prefix { $0 == " " })
             var core = piece.trimmingCharacters(in: .whitespaces)

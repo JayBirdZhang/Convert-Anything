@@ -4,8 +4,8 @@ import PDFKit
 import UniformTypeIdentifiers
 
 /// Turns a file of one format into another, choosing the right engine for the pair. Everything runs on
-/// macOS's own frameworks, the libraries built into the app (LAME, libwebp), the bundled Ghostscript,
-/// or, for Office and iWork files, Keynote, Numbers and Pages.
+/// macOS's own frameworks, the libraries built into the app (LAME, libwebp), or, for Office and iWork
+/// files, Keynote, Numbers and Pages.
 enum Converter {
     enum Route {
         case image          // ImageIO (+ libwebp for WebP)
@@ -86,17 +86,17 @@ enum Converter {
         var result = output
         switch route {
         case .image:
-            try await Task.detached(priority: .utility) {
+            try await background {
                 if request.to == .webp {
                     try WebP.write(imageAt: request.input, to: output, quality: request.quality)
                 } else {
                     try ImageConversion.convert(request.input, to: request.to, output: output, quality: request.quality)
                 }
-            }.value
+            }
         case .imageToPDF:
-            try await Task.detached(priority: .utility) {
+            try await background {
                 try ImageConversion.imageToPDF(request.input, output: output)
-            }.value
+            }
         case .pdfToImage:
             result = try await renderPages(of: request.input, request: request, output: output, progress: progress)
         case .fromSlides:
@@ -145,18 +145,14 @@ enum Converter {
     /// into a folder of images named "<title> 01", "<title> 02"…
     private static func renderPages(of pdf: URL, request: Request, output: URL,
                                     progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
-        let pageCount = PDFDocument(url: pdf)?.pageCount ?? 0
-        let allPages = request.allPages && pageCount > 1
         let folder = request.workDir.appending(path: "pages")
-        let digits = max(2, String(pageCount).count)
         let typedExtension = request.outputExtension ?? request.to.rawValue
 
-        try await Task.detached(priority: .utility) {
-            guard let document = PDFDocument(url: pdf), document.pageCount > 0 else {
+        let allPages = try await background { () throws -> Bool in
+            guard let document = PDFDocument(url: pdf), document.pageCount > 0, let first = document.page(at: 0) else {
                 throw ConversionError.failed("Couldn't read this PDF.")
             }
-            func save(_ index: Int, to url: URL) throws {
-                guard let page = document.page(at: index) else { return }
+            @Sendable func save(_ page: PDFPage, to url: URL) throws {
                 let image = try ImageConversion.render(page, scale: request.quality.pageScale)
                 if request.to == .webp {
                     try WebP.write(image, to: url, quality: request.quality)
@@ -165,16 +161,61 @@ enum Converter {
                                               properties: [kCGImageDestinationLossyCompressionQuality: request.quality.imageQuality])
                 }
             }
-            guard allPages else { return try save(0, to: output) }
+            let pageCount = document.pageCount
+            guard request.allPages && pageCount > 1 else { try save(first, to: output); return false }
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            for index in 0..<document.pageCount {
-                try Task.checkCancellation()
+            let digits = max(2, String(pageCount).count)
+            // Pages are independent, so they render side by side; each lands in its own numbered file.
+            _ = try await PageWorkers.map(pdf, pageCount: pageCount, progress: progress) { page, index in
                 let name = "\(request.title) \(String(format: "%0\(digits)d", index + 1)).\(typedExtension)"
-                try save(index, to: folder.appending(path: name))
-                progress(Double(index + 1) / Double(document.pageCount))
+                try save(page, to: folder.appending(path: name))
             }
-        }.value
+            return true
+        }
         return allPages ? folder : output
+    }
+}
+
+// MARK: - Parallel pages
+
+/// Runs per-page work for a PDF on several cores. PDFKit documents aren't meant to be shared between threads,
+/// so each worker opens its own copy and takes the next unclaimed page. Pages render at ~10 MB each, so the
+/// worker count stays small.
+nonisolated enum PageWorkers {
+    private final class State<Value>: @unchecked Sendable {
+        let lock = NSLock()
+        var value: Value
+        init(_ value: Value) { self.value = value }
+    }
+
+    /// Calls `body(page, index)` for every page and returns the results in page order (nil where the page
+    /// couldn't be read). `progress` is called with the finished fraction, never going backwards.
+    static func map<T: Sendable>(_ url: URL, pageCount: Int, maxWorkers: Int = 8,
+                                 progress: (@Sendable (Double) -> Void)? = nil,
+                                 _ body: @escaping @Sendable (PDFPage, Int) throws -> T) async throws -> [T?] {
+        let state = State((next: 0, done: 0, results: [T?](repeating: nil, count: pageCount)))
+        let workers = max(1, min(pageCount, ProcessInfo.processInfo.activeProcessorCount, maxWorkers))
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<workers {
+                group.addTask {
+                    guard let document = PDFDocument(url: url) else { throw ConversionError.failed("Couldn't read this PDF.") }
+                    while true {
+                        try Task.checkCancellation()
+                        let index = state.lock.withLock { () -> Int in state.value.next += 1; return state.value.next - 1 }
+                        guard index < pageCount else { return }
+                        guard let page = document.page(at: index) else { continue }
+                        let result = try body(page, index)
+                        state.lock.withLock {
+                            state.value.results[index] = result
+                            state.value.done += 1
+                            progress?(Double(state.value.done) / Double(pageCount))
+                        }
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+        return state.value.results
     }
 }
 
@@ -200,8 +241,15 @@ nonisolated enum Quality: String, CaseIterable, Sendable {
     /// PDF and slide pages: 2.5x = 180 dpi, 2x = 144 dpi, 1.5x = 108 dpi.
     var pageScale: CGFloat { switch self { case .best: 2.5; case .balanced: 2; case .small: 1.5 } }
 
-    /// GIF frame rate and longest side in pixels ("Best" keeps the video's own size up to 1920).
-    var gifSettings: (fps: Int, width: Int) { switch self { case .best: (20, 1920); case .balanced: (15, 1080); case .small: (10, 540) } }
+    /// GIF frame rate, longest side in pixels ("Best" keeps the video's own size up to 1920), and how much a
+    /// pixel's color may change (|Δr|+|Δg|+|Δb|) before it's redrawn, so video noise doesn't cost file size.
+    var gifSettings: (fps: Int, width: Int, noise: Int) {
+        switch self {
+        case .best: (20, 1920, 6)
+        case .balanced: (15, 1080, 7)
+        case .small: (10, 540, 12)
+        }
+    }
 
     var mp3VBR: Int { switch self { case .best: 0; case .balanced: 2; case .small: 5 } }
     var aacBitrate: Int { switch self { case .best: 256_000; case .balanced: 192_000; case .small: 128_000 } }
@@ -216,6 +264,8 @@ nonisolated enum ImageConversion {
     }
 
     static func convert(_ input: URL, to format: Format, output: URL, quality: Quality = .balanced) throws {
+        // macOS's GIF writer keeps only the first frame and has no dithering; ours keeps animations.
+        if format == .gif { return try GIFEncoder.write(imageAt: input, to: output, quality: quality) }
         var (image, properties) = try decode(input, quality: quality, maxSide: format == .ico ? 256 : nil)
         if [.jpeg, .bmp].contains(format), image.hasAlpha {
             image = try image.flattenedOnWhite()
@@ -321,15 +371,20 @@ nonisolated extension Format {
     }
 }
 
-nonisolated private extension CGImage {
+nonisolated extension CGImage {
     var hasAlpha: Bool {
         ![.none, .noneSkipFirst, .noneSkipLast].contains(alphaInfo)
     }
 
-    func flattenedOnWhite() throws -> CGImage {
-        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
-                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
+    fileprivate func flattenedOnWhite() throws -> CGImage {
+        // Flatten in the image's own RGB space so wide-gamut (Display P3) colors aren't clipped to sRGB.
+        let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
+        let own = colorSpace.flatMap { $0.model == .rgb ? $0 : nil }
+        func makeContext(_ space: CGColorSpace) -> CGContext? {
+            CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                      space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+        }
+        guard let context = own.flatMap(makeContext) ?? makeContext(sRGB) else {
             throw ConversionError.failed("Couldn't process this image.")
         }
         let rect = CGRect(x: 0, y: 0, width: width, height: height)

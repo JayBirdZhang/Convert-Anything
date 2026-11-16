@@ -138,54 +138,50 @@ extension ConversionError {
 // MARK: - GIF
 
 nonisolated enum GIFVideo {
-    /// Samples the video at the quality's frame rate and writes a looping GIF. One palette is picked for
-    /// the whole video from a spread of its frames, and every frame is dithered against it (see GIFEncoder).
+    /// Samples the video at the quality's frame rate (or its own, if lower) and writes a looping GIF,
+    /// encoding each frame as it arrives (see GIFEncoder). Runs off the main thread: it's heavy work.
+    @concurrent
     static func makeGIF(from input: URL, output: URL, quality: Quality, progress: @escaping @Sendable (Double) -> Void) async throws {
         let asset = AVURLAsset(url: input)
         let duration = (try? await asset.load(.duration).seconds) ?? 0
-        guard duration > 0 else { throw ConversionError.failed("Couldn't read this video.") }
-        let (fps, maxWidth) = quality.gifSettings   // maxWidth: the longest side
-        let count = max(1, Int(duration * Double(fps)))
-        let times = (0..<count).map { CMTime(seconds: Double($0) / Double(fps), preferredTimescale: 600) }
+        guard duration > 0, let track = try? await asset.loadTracks(withMediaType: .video).first else {
+            throw ConversionError.failed("Couldn't read this video.")
+        }
+        let settings = quality.gifSettings
+        let videoRate = Double((try? await track.load(.nominalFrameRate)) ?? 0)
+        let fps = videoRate > 0 ? min(Double(settings.fps), videoRate) : Double(settings.fps)
+        let count = max(1, Int((duration * fps).rounded()))
+        let times = (0..<count).map { CMTime(seconds: Double($0) / fps, preferredTimescale: 600) }
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: maxWidth, height: maxWidth)   // Longest side; never enlarges
+        generator.maximumSize = CGSize(width: settings.width, height: settings.width)   // Longest side; never enlarges
         // iPhone videos are often HDR; tone-map them so the GIF's colors aren't washed out.
         if #available(macOS 15, *) { generator.dynamicRangePolicy = .forceSDR }
-        let tolerance = CMTime(seconds: 0.5 / Double(fps), preferredTimescale: 600)
+        let tolerance = CMTime(seconds: 0.5 / fps, preferredTimescale: 600)
         generator.requestedTimeToleranceBefore = tolerance
         generator.requestedTimeToleranceAfter = tolerance
 
-        // Pass 1: the palette, from up to 24 frames spread over the video.
-        let sampleTimes = stride(from: 0, to: count, by: max(1, count / 24)).map { times[$0] }
-        var samples: [(UInt8, UInt8, UInt8)] = []
-        var size: (width: Int, height: Int)?
-        for await result in generator.images(for: sampleTimes) {
-            try Task.checkCancellation()
-            guard let image = try? result.image else { continue }
-            if size == nil { size = (image.width, image.height) }
-            guard let (width, height) = size else { continue }
-            let pixels = GIFEncoder.rgba(image, width: width, height: height)
-            let step = max(1, (width * height) / 6_000) * 4
-            for i in stride(from: 0, to: pixels.count, by: step) { samples.append((pixels[i], pixels[i + 1], pixels[i + 2])) }
-        }
-        guard let (width, height) = size, width > 0, height > 0 else { throw ConversionError.failed("Couldn't read frames from this video.") }
-        let encoder = GIFEncoder(width: width, height: height, palette: GIFEncoder.palette(from: samples))
-        progress(0.1)
-
-        // Pass 2: every frame, dithered and compressed.
+        var encoder: GIFEncoder?
         var done = 0
         for await result in generator.images(for: times) {
             try Task.checkCancellation()
-            if let image = try? result.image {
-                encoder.addFrame(rgba: GIFEncoder.rgba(image, width: width, height: height), duration: 1.0 / Double(fps))
-            }
+            // Each frame lasts until the next one is due, and the last one until the video ends.
+            let end = done + 1 < count ? Double(done + 1) / fps : duration
+            let frameDuration = end - Double(done) / fps
             done += 1
-            progress(0.1 + 0.9 * Double(done) / Double(count))
+            if let image = try? result.image {
+                if encoder == nil {
+                    encoder = try GIFEncoder(url: output, width: image.width, height: image.height, noise: settings.noise)
+                }
+                try encoder?.addFrame(image, duration: frameDuration)
+            } else {
+                encoder?.extend(by: frameDuration)
+            }
+            progress(Double(done) / Double(count))
         }
-        guard done > 0 else { throw ConversionError.failed("Couldn't read frames from this video.") }
-        try encoder.finish().write(to: output)
+        guard let encoder else { throw ConversionError.failed("Couldn't read frames from this video.") }
+        try encoder.finish()
     }
 
     /// An animated GIF becomes an H.264 video, each frame shown for its own delay.
@@ -222,20 +218,13 @@ nonisolated enum GIFVideo {
             guard let buffer else { continue }
             draw(image, into: buffer, width: width, height: height)
             adaptor.append(buffer, withPresentationTime: time)
-            time = time + CMTime(seconds: delay(source, index), preferredTimescale: 600)
+            time = time + CMTime(seconds: GIFEncoder.frameDelay(source, index) ?? 0.1, preferredTimescale: 600)
             progress(Double(index + 1) / Double(count))
         }
         input.markAsFinished()
         writer.endSession(atSourceTime: time)
         await writer.finishWriting()
         if writer.status != .completed { throw writer.error ?? ConversionError.failed("Couldn't write the video.") }
-    }
-
-    private static func delay(_ source: CGImageSource, _ index: Int) -> Double {
-        let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
-        let gif = properties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
-        let value = (gif?[kCGImagePropertyGIFUnclampedDelayTime] as? Double) ?? (gif?[kCGImagePropertyGIFDelayTime] as? Double) ?? 0.1
-        return value < 0.02 ? 0.1 : value   // Browsers treat tiny delays as 0.1 s too
     }
 
     private static func draw(_ image: CGImage, into buffer: CVPixelBuffer, width: Int, height: Int) {
@@ -254,7 +243,7 @@ nonisolated enum GIFVideo {
 
 nonisolated enum AudioConversion {
     static func convert(_ request: Converter.Request, output: URL, progress: @escaping @Sendable (Double) -> Void) async throws {
-        try await Task.detached(priority: .utility) {
+        try await background {
             let source = try await openPCMSource(request.input, isVideo: request.from.kind == .video)
             let sink: PCMSink = request.to == .mp3
                 ? try MP3Sink(url: output, format: source.format, quality: request.quality)
@@ -268,7 +257,7 @@ nonisolated enum AudioConversion {
             }
             guard written > 0 else { throw ConversionError.failed("This file has no audio.") }
             try sink.finish()
-        }.value
+        }
     }
 }
 

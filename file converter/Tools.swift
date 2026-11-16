@@ -20,17 +20,15 @@ nonisolated enum ConversionError: LocalizedError {
     }
 }
 
-/// Runs command-line programs: macOS's own (zip, unzip, osascript) and Ghostscript, which ships
-/// inside the app in Contents/Helpers.
-nonisolated enum Tools {
-    static func bundled(_ name: String) throws -> String {
-        let path = Bundle.main.bundleURL.appending(path: "Contents/Helpers/\(name)").path
-        guard FileManager.default.isExecutableFile(atPath: path) else {
-            throw ConversionError.failed("\(name) is missing from the app. Reinstall Convert Everything.")
-        }
-        return path
-    }
+/// Runs heavy work off the main thread. Cancelling the caller cancels the work too, which a plain
+/// detached task wouldn't notice.
+nonisolated func background<T: Sendable>(_ work: @escaping @concurrent @Sendable () async throws -> T) async throws -> T {
+    let task = Task.detached(priority: .utility) { try await work() }
+    return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+}
 
+/// Runs macOS's own command-line programs (zip, unzip, osascript).
+nonisolated enum Tools {
     /// Runs a tool at low priority and returns its stdout. Cancelling the calling task terminates the process.
     @discardableResult
     static func run(_ tool: String, _ arguments: [String], currentDirectory: URL? = nil, onLine: (@Sendable (String) -> Void)? = nil) async throws -> String {

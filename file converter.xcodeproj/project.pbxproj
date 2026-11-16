@@ -53,7 +53,6 @@
 				000000000000000120000000 /* Sources */,
 				000000000000000130000000 /* Frameworks */,
 				000000000000000140000000 /* Resources */,
-				000000000000000150000000 /* Bundle Ghostscript */,
 			);
 			buildRules = (
 			);
@@ -106,23 +105,6 @@
 			);
 		};
 /* End PBXResourcesBuildPhase section */
-
-/* Begin PBXShellScriptBuildPhase section */
-		000000000000000150000000 /* Bundle Ghostscript */ = {
-			isa = PBXShellScriptBuildPhase;
-			files = (
-			);
-			inputPaths = (
-				"$(PROJECT_DIR)/ThirdParty/bin/gs",
-			);
-			name = "Bundle Ghostscript";
-			outputPaths = (
-				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/gs",
-			);
-			shellPath = /bin/sh;
-			shellScript = "# Ghostscript is built by Scripts/build-dependencies.sh and signed here so the app's signature covers it.\nset -e\nSRC=\"$SCRIPT_INPUT_FILE_0\"\nDST=\"$SCRIPT_OUTPUT_FILE_0\"\nif [ ! -f \"$SRC\" ]; then echo \"error: Run Scripts/build-dependencies.sh first\"; exit 1; fi\nmkdir -p \"$(dirname \"$DST\")\"\ncp -f \"$SRC\" \"$DST\"\ncodesign --force --sign \"${EXPANDED_CODE_SIGN_IDENTITY:--}\" \"$DST\"\n";
-		};
-/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		000000000000000120000000 /* Sources */ = {

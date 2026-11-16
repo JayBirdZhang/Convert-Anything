@@ -1,12 +1,11 @@
 #!/bin/bash
-# Builds the three tools the app bundles, as self-contained universal (Apple Silicon + Intel) files
+# Builds the two libraries the app links, as self-contained universal (Apple Silicon + Intel) files
 # that run on macOS 14 and later without Homebrew:
 #   ThirdParty/lib/libmp3lame.a, libwebp.a, libsharpyuv.a   (linked into the app)
 #   ThirdParty/include/lame/lame.h, webp/*.h
-#   ThirdParty/bin/gs                                       (copied into the app)
 #
 # Sources come from Homebrew's checksum-verified download cache (Homebrew is only needed to build,
-# not to run the app). Takes a few minutes, mostly Ghostscript. Run once; Xcode uses the results.
+# not to run the app). Takes a minute. Run once; Xcode uses the results.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -37,7 +36,7 @@ for_arch() {
     if [ "$arch" = x86_64 ]; then arch -x86_64 "$@"; else arch -arm64 "$@"; fi
 }
 
-mkdir -p "$WORK" "$OUT/lib" "$OUT/include" "$OUT/bin"
+mkdir -p "$WORK" "$OUT/lib" "$OUT/include"
 
 # A stand-in pkg-config that finds no packages: configure scripts insist on having one.
 mkdir -p "$WORK/stub"
@@ -71,24 +70,5 @@ lipo -create "$WORK"/webp-*/sharpyuv/libsharpyuv.a -output "$OUT/lib/libsharpyuv
 mkdir -p "$OUT/include/webp" && cp "$WORK"/webp-arm64/src/webp/{encode,types}.h "$OUT/include/webp/"
 echo "WebP: done"
 
-# --- Ghostscript (strips text out of PDFs for editable slides) -------------------------------------
-GS_SRC=$(source_tarball ghostscript)
-for arch in "${ARCHS[@]}"; do
-    dir="$WORK/gs-$arch"
-    unpack "$GS_SRC" "$dir"
-    # Uses the copies of zlib, libpng, libjpeg, freetype, lcms2 and openjpeg in the source tree, linked
-    # in statically. Its fonts and startup files are compiled into the program itself.
-    (cd "$dir" && for_arch "$arch" env CC=cc CFLAGS="-arch $arch -mmacosx-version-min=$MIN_MACOS -O2" \
-            LDFLAGS="-arch $arch -mmacosx-version-min=$MIN_MACOS" \
-        ./configure --quiet --without-x --disable-cups --disable-dbus --disable-gtk --disable-fontconfig \
-            --without-libidn --without-libpaper --without-tesseract --without-ijs --without-urf \
-            --without-pdftoraster --without-libtiff --with-drivers=FILES \
-        && for_arch "$arch" make -j"$JOBS" gs >/dev/null 2>&1)
-    strip -x "$dir/bin/gs"
-done
-lipo -create "$WORK"/gs-*/bin/gs -output "$OUT/bin/gs"
-echo "Ghostscript: done"
-
-ls -lh "$OUT/lib" "$OUT/bin"
-for f in "$OUT/bin/gs" "$OUT/lib/"*.a; do lipo -info "$f"; done
-otool -L "$OUT/bin/gs"
+ls -lh "$OUT/lib"
+for f in "$OUT/lib/"*.a; do lipo -info "$f"; done

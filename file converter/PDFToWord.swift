@@ -32,19 +32,27 @@ nonisolated enum PDFToWord {
         try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
 
         let scale = request.quality.pageScale
-        let pages = try await Task.detached(priority: .utility) { () throws -> [Page] in
+        let pages = try await background { () throws -> [Page] in
             guard let document = PDFDocument(url: request.input), document.pageCount > 0 else {
                 throw ConversionError.failed("Couldn't read this PDF.")
             }
-            var pages: [Page] = []
+            // Pages are independent, so they're analyzed side by side. Their pictures are saved under
+            // per-page names, then numbered in page order so the result doesn't depend on timing.
+            var pages = try await PageWorkers.map(request.input, pageCount: document.pageCount, maxWorkers: 4) { page, index in   // PDFKit's text engine stops scaling past ~4
+                try analyze(page, media: media, scale: scale, imagePrefix: "page\(index)-")
+            }.compactMap { $0 }
             var imageCount = 0
-            for index in 0..<document.pageCount {
-                try Task.checkCancellation()
-                guard let page = document.page(at: index) else { continue }
-                pages.append(try analyze(page, media: media, scale: scale, imageCount: &imageCount))
+            for p in pages.indices {
+                for i in pages[p].items.indices {
+                    guard case .image(let file, let size) = pages[p].items[i].item else { continue }
+                    imageCount += 1
+                    let name = "image\(imageCount).png"
+                    try FileManager.default.moveItem(at: media.appending(path: file), to: media.appending(path: name))
+                    pages[p].items[i].item = .image(file: name, size: size)
+                }
             }
             return pages
-        }.value
+        }
 
         let items = readingOrder(pages)
         guard !items.isEmpty else { throw ConversionError.failed("No text or pictures could be found in this PDF.") }
@@ -56,15 +64,16 @@ nonisolated enum PDFToWord {
 
     // MARK: Reading a page
 
-    private static func analyze(_ page: PDFPage, media: URL, scale: CGFloat, imageCount: inout Int) throws -> Page {
+    private static func analyze(_ page: PDFPage, media: URL, scale: CGFloat, imagePrefix: String) throws -> Page {
         let crop = page.bounds(for: .cropBox)
         let rotated = abs(page.rotation) % 180 == 90
         let size = rotated ? CGSize(width: crop.height, height: crop.width) : crop.size
         let rendered = try ImageConversion.render(page, scale: scale)
 
+        var imageCount = 0
         func save(_ image: CGImage) throws -> String {
             imageCount += 1
-            let name = "image\(imageCount).png"
+            let name = "\(imagePrefix)\(imageCount).png"
             try ImageConversion.write(image, to: media.appending(path: name), format: .png)
             return name
         }

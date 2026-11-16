@@ -14,20 +14,23 @@ nonisolated enum Spreadsheets {
     static func xlsxToCSV(_ request: Converter.Request, output: URL) async throws -> URL {
         let package = request.workDir.appending(path: "xlsx")
         try await Tools.run("/usr/bin/unzip", ["-q", "-o", request.input.path, "-d", package.path])
-        let sheets = try read(package).filter { !$0.rows.isEmpty }
-        guard !sheets.isEmpty else { throw ConversionError.failed("This spreadsheet is empty.") }
+        // Parsing a big workbook takes a while; keep it off the main thread.
+        return try await background {
+            let sheets = try read(package).filter { !$0.rows.isEmpty }
+            guard !sheets.isEmpty else { throw ConversionError.failed("This spreadsheet is empty.") }
 
-        if sheets.count == 1 {
-            try csv(sheets[0].rows).write(to: output, atomically: true, encoding: .utf8)
-            return output
+            if sheets.count == 1 {
+                try csv(sheets[0].rows).write(to: output, atomically: true, encoding: .utf8)
+                return output
+            }
+            let folder = request.workDir.appending(path: "sheets")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            for sheet in sheets {
+                let name = "\(request.title) - \(sheet.name.replacingOccurrences(of: "/", with: "-")).csv"
+                try csv(sheet.rows).write(to: folder.appending(path: name), atomically: true, encoding: .utf8)
+            }
+            return folder
         }
-        let folder = request.workDir.appending(path: "sheets")
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        for sheet in sheets {
-            let name = "\(request.title) - \(sheet.name.replacingOccurrences(of: "/", with: "-")).csv"
-            try csv(sheet.rows).write(to: folder.appending(path: name), atomically: true, encoding: .utf8)
-        }
-        return folder
     }
 
     static func read(_ package: URL) throws -> [Sheet] {
@@ -61,8 +64,12 @@ nonisolated enum Spreadsheets {
     // MARK: csv → xlsx
 
     static func csvToXLSX(_ request: Converter.Request, output: URL) async throws {
-        let rows = try parseCSV(at: request.input)
-        guard !rows.isEmpty else { throw ConversionError.failed("This CSV file is empty.") }
+        // Parsing and writing a big sheet takes a while; keep it off the main thread.
+        let sheet = try await background { () throws -> Data in
+            let rows = try parseCSV(at: request.input)
+            guard !rows.isEmpty else { throw ConversionError.failed("This CSV file is empty.") }
+            return sheetXML(rows)
+        }
         let package = request.workDir.appending(path: "xlsx-out")
         let fileManager = FileManager.default
         for dir in ["_rels", "xl/_rels", "xl/worksheets"] {
@@ -107,29 +114,77 @@ nonisolated enum Spreadsheets {
             <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>
             """#)
 
-        var sheet = "<worksheet xmlns=\"\(main)\"><sheetData>"
-        for (r, row) in rows.enumerated() {
-            sheet += "<row r=\"\(r + 1)\">"
-            for (c, value) in row.enumerated() where !value.isEmpty {
-                let ref = columnName(c) + String(r + 1)
-                if isNumber(value) {
-                    sheet += "<c r=\"\(ref)\"><v>\(value)</v></c>"
-                } else {
-                    let space = value.first == " " || value.last == " " ? " xml:space=\"preserve\"" : ""
-                    sheet += "<c r=\"\(ref)\" t=\"inlineStr\"><is><t\(space)>\(escape(value))</t></is></c>"
-                }
-            }
-            sheet += "</row>"
-        }
-        try write("xl/worksheets/sheet1.xml", sheet + "</sheetData></worksheet>")
+        try (Data(header.utf8) + sheet).write(to: package.appending(path: "xl/worksheets/sheet1.xml"), options: .atomic)
 
         try await Tools.run("/usr/bin/zip", ["-q", "-X", "-D", "-nw", "-r", output.path, "[Content_Types].xml", "_rels", "xl"],
                             currentDirectory: package)
     }
 
+    /// The worksheet part, built as UTF-8 bytes directly (a big sheet is tens of megabytes of XML).
+    private static func sheetXML(_ rows: [[String]]) -> Data {
+        var out: [UInt8] = []
+        out.reserveCapacity(rows.count * (rows[0].count * 40 + 16))
+        func add(_ text: StaticString) { text.withUTF8Buffer { out.append(contentsOf: $0) } }
+        func add(_ text: String) { out.append(contentsOf: text.utf8) }
+        func addEscaped(_ text: String) {
+            for byte in text.utf8 {
+                switch byte {
+                case 38: add("&amp;")
+                case 60: add("&lt;")
+                case 62: add("&gt;")
+                case 34: add("&quot;")
+                case 9, 10, 13: out.append(byte)
+                case ..<0x20: continue   // Control characters aren't allowed in XML
+                default: out.append(byte)
+                }
+            }
+        }
+        var columnNames: [String] = []
+        add("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>")
+        for (r, row) in rows.enumerated() {
+            let number = String(r + 1)
+            add("<row r=\""); add(number); add("\">")
+            for (c, value) in row.enumerated() where !value.isEmpty {
+                while columnNames.count <= c { columnNames.append(columnName(columnNames.count)) }
+                add("<c r=\""); add(columnNames[c]); add(number)
+                if isNumber(value) {
+                    add("\"><v>"); add(value); add("</v></c>")
+                } else {
+                    add("\" t=\"inlineStr\"><is><t")
+                    if value.first == " " || value.last == " " { add(" xml:space=\"preserve\"") }
+                    add(">"); addEscaped(value); add("</t></is></c>")
+                }
+            }
+            add("</row>")
+        }
+        add("</sheetData></worksheet>")
+        return Data(out)
+    }
+
     /// Plain numbers only: "007", "1,000" and "+5" stay text, as a spreadsheet would show them.
+    /// Matches -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)? in under 16 characters (a regex here was the slowest step).
     private static func isNumber(_ value: String) -> Bool {
-        value.wholeMatch(of: /-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?/) != nil && value.count < 16
+        var value = value
+        return value.withUTF8 { b in
+            let n = b.count
+            guard n > 0, n < 16 else { return false }
+            var i = 0
+            func digits() -> Int {
+                let start = i
+                while i < n, b[i] >= 48, b[i] <= 57 { i += 1 }
+                return i - start
+            }
+            if b[i] == 45 { i += 1 }
+            guard i < n else { return false }
+            if b[i] == 48 { i += 1 } else if digits() == 0 { return false }
+            if i < n, b[i] == 46 { i += 1; if digits() == 0 { return false } }
+            if i < n, b[i] == 69 || b[i] == 101 {
+                i += 1
+                if i < n, b[i] == 43 || b[i] == 45 { i += 1 }
+                if digits() == 0 { return false }
+            }
+            return i == n
+        }
     }
 
     static func columnName(_ index: Int) -> String {
@@ -177,37 +232,58 @@ nonisolated enum Spreadsheets {
                 ?? String(data: data, encoding: .macOSRoman) else {
             throw ConversionError.failed("Couldn't read this CSV file.")
         }
-        let body = text.hasPrefix("\u{FEFF}") ? String(text.dropFirst()) : text
-        let firstLine = body.prefix { $0 != "\n" }
-        let separator: Character = [",", ";", "\t"].max { a, b in
-            firstLine.filter { $0 == a }.count < firstLine.filter { $0 == b }.count
-        } ?? ","
+        var body = text
+        return body.withUTF8 { bytes in
+            var start = 0
+            if bytes.starts(with: [0xEF, 0xBB, 0xBF]) { start = 3 }   // Byte order mark
 
-        var rows: [[String]] = [], row: [String] = [], field = ""
-        var inQuotes = false
-        var iterator = body.makeIterator()
-        var pending: Character? = nil
-        while let char = pending ?? iterator.next() {
-            pending = nil
-            if inQuotes {
-                if char == "\"" {
-                    if let next = iterator.next() {
-                        if next == "\"" { field.append("\"") } else { inQuotes = false; pending = next }
-                    } else { inQuotes = false }
-                } else { field.append(char) }
-            } else if char == "\"" && field.isEmpty {
-                inQuotes = true
-            } else if char == separator {
-                row.append(field); field = ""
-            } else if char == "\n" || char == "\r\n" || char == "\r" {
-                row.append(field); field = ""
-                rows.append(row); row = []
-            } else {
-                field.append(char)
+            // The first line (up to a bare "\n"; "\r\n" doesn't end it) decides the separator.
+            var commas = 0, semicolons = 0, tabs = 0
+            var index = start
+            while index < bytes.count, !(bytes[index] == 10 && (index == 0 || bytes[index - 1] != 13)) {
+                switch bytes[index] {
+                case 44: commas += 1
+                case 59: semicolons += 1
+                case 9: tabs += 1
+                default: break
+                }
+                index += 1
             }
+            // On a tie the earlier of comma, semicolon, tab wins.
+            var separator = UInt8(ascii: ","), best = commas
+            if semicolons > best { separator = UInt8(ascii: ";"); best = semicolons }
+            if tabs > best { separator = UInt8(ascii: "\t") }
+
+            var rows: [[String]] = [], row: [String] = [], field: [UInt8] = []
+            var inQuotes = false
+            var i = start
+            while i < bytes.count {
+                let byte = bytes[i]
+                i += 1
+                if inQuotes {
+                    if byte != 34 {
+                        field.append(byte)
+                    } else if i < bytes.count, bytes[i] == 34 {
+                        field.append(34)
+                        i += 1
+                    } else {
+                        inQuotes = false
+                    }
+                } else if byte == 34 && field.isEmpty {
+                    inQuotes = true
+                } else if byte == separator {
+                    row.append(String(decoding: field, as: UTF8.self)); field.removeAll(keepingCapacity: true)
+                } else if byte == 10 || byte == 13 {
+                    if byte == 13, i < bytes.count, bytes[i] == 10 { i += 1 }
+                    row.append(String(decoding: field, as: UTF8.self)); field.removeAll(keepingCapacity: true)
+                    rows.append(row); row = []
+                } else {
+                    field.append(byte)
+                }
+            }
+            if !field.isEmpty || !row.isEmpty { row.append(String(decoding: field, as: UTF8.self)); rows.append(row) }
+            return rows
         }
-        if !field.isEmpty || !row.isEmpty { row.append(field); rows.append(row) }
-        return rows
     }
 }
 
@@ -344,6 +420,7 @@ nonisolated private final class SheetParser: NSObject, XMLParserDelegate {
     private let strings: [String]
     private let dateStyles: [StylesParser.Kind?]
     private let epoch: Date
+    private let epochOffset: Int      // Seconds from 1970-01-01 to the workbook's day zero
     private var row: [Int: String] = [:]
     private var rowIndex = 0
     private var cellColumn = 0, cellType = "", cellStyle = 0
@@ -355,6 +432,7 @@ nonisolated private final class SheetParser: NSObject, XMLParserDelegate {
         var components = DateComponents(year: date1904 ? 1904 : 1899, month: date1904 ? 1 : 12, day: date1904 ? 1 : 30)
         components.timeZone = TimeZone(identifier: "UTC")
         epoch = Calendar(identifier: .gregorian).date(from: components)!
+        epochOffset = Int(epoch.timeIntervalSince1970)
         super.init()
         let parser = XMLParser(data: data)
         parser.delegate = self
@@ -407,15 +485,56 @@ nonisolated private final class SheetParser: NSObject, XMLParserDelegate {
     }
 
     private func format(serial: Double, _ kind: StylesParser.Kind) -> String {
-        let date = epoch.addingTimeInterval((serial * 86_400).rounded())
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
+        let seconds = (serial * 86_400).rounded()
+        // Real workbooks are full of dates; plain arithmetic (UTC, Gregorian) is far faster than a DateFormatter.
+        // Dates before the Gregorian calendar's start (or absurdly far out) take the slow path.
+        if abs(seconds) < 1e13 {
+            let total = Int(seconds) + epochOffset
+            let days = total >= 0 ? total / 86_400 : -((-total + 86_399) / 86_400)
+            if days >= -100_000 && days <= 2_900_000 {
+                let secondsOfDay = total - days * 86_400
+                let (year, month, day) = Self.civil(daysSince1970: days)
+                let date = Self.pad(year, 4) + "-" + Self.pad(month, 2) + "-" + Self.pad(day, 2)
+                let time = Self.pad(secondsOfDay / 3600, 2) + ":" + Self.pad(secondsOfDay / 60 % 60, 2) + ":" + Self.pad(secondsOfDay % 60, 2)
+                switch kind {
+                case .date: return date
+                case .time: return time
+                case .dateTime: return serial == serial.rounded() ? date : date + " " + time
+                }
+            }
+        }
+        let formatter = Self.formatter
+        let date = epoch.addingTimeInterval(seconds)
         switch kind {
         case .date: formatter.dateFormat = "yyyy-MM-dd"
         case .time: formatter.dateFormat = "HH:mm:ss"
         case .dateTime: formatter.dateFormat = serial == serial.rounded() ? "yyyy-MM-dd" : "yyyy-MM-dd HH:mm:ss"
         }
         return formatter.string(from: date)
+    }
+
+    private static let formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter
+    }()
+
+    private static func pad(_ value: Int, _ width: Int) -> String {
+        let text = String(value)
+        return text.count >= width ? text : String(repeating: "0", count: width - text.count) + text
+    }
+
+    /// Year, month and day for a count of days since 1970-01-01 (proleptic Gregorian calendar).
+    private static func civil(daysSince1970 days: Int) -> (Int, Int, Int) {
+        let z = days + 719_468
+        let era = (z >= 0 ? z : z - 146_096) / 146_097
+        let dayOfEra = z - era * 146_097
+        let yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36_524 - dayOfEra / 146_096) / 365
+        let dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+        let mp = (5 * dayOfYear + 2) / 153
+        let day = dayOfYear - (153 * mp + 2) / 5 + 1
+        let month = mp < 10 ? mp + 3 : mp - 9
+        return (yearOfEra + era * 400 + (month <= 2 ? 1 : 0), month, day)
     }
 }

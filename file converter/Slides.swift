@@ -1,11 +1,13 @@
 import Foundation
+import OSLog
 import PDFKit
 
 /// Builds a PowerPoint file from a PDF (one slide per page) or an image (one slide). Two styles:
 /// - Pictures: each page as a full-slide picture. Looks exactly like the PDF; text isn't editable.
-/// - Editable: Ghostscript strips the text out of the PDF and what's left (photos, shapes, backgrounds)
-///   becomes each slide's background picture. The text, read with its position, size, font and color,
-///   goes back on top as real text boxes. Rotated pages fall back to a picture.
+/// - Editable: each page is copied without its text (TextlessPDF) and what's left (photos, shapes,
+///   backgrounds) becomes the slide's background picture. The text, read with its position, size, font
+///   and color, goes back on top as real text boxes. Rotated pages, and any page that can't be copied,
+///   fall back to a picture.
 ///
 /// The slides are added to SlideTemplate.pptx, a complete empty deck (master, layouts, theme and settings
 /// from pandoc's standard template). Apple's importer, used by Keynote and Quick Look, rejects decks
@@ -16,6 +18,7 @@ nonisolated enum SlideBuilder {
 
     private struct Slide {
         var size: CGSize                // Page points (or image pixels); only the proportions matter
+        var image: Int                  // Its picture is ppt/media/image<n>.png
         var text: [TextBlock] = []      // In the same units as `size`
     }
 
@@ -28,16 +31,7 @@ nonisolated enum SlideBuilder {
         let media = package.appending(path: "ppt/media")
         try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
 
-        var textless: URL?
-        if request.from == .pdf && request.editableSlides {
-            let gs = try Tools.bundled("gs")
-            let url = request.workDir.appending(path: "textless.pdf")
-            try await Tools.run(gs, ["-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite", "-dFILTERTEXT",
-                                     "-o", url.path, request.input.path])
-            textless = url
-        }
-
-        let slides = try await Task.detached(priority: .utility) { [textless] () throws -> [Slide] in
+        let slides = try await background { () throws -> [Slide] in
             guard request.from == .pdf else {
                 let png = media.appending(path: "image1.png")
                 try ImageConversion.convert(request.input, to: .png, output: png)
@@ -45,28 +39,29 @@ nonisolated enum SlideBuilder {
                       let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                     throw ConversionError.failed("Couldn't read this image.")
                 }
-                return [Slide(size: CGSize(width: image.width, height: image.height))]
+                return [Slide(size: CGSize(width: image.width, height: image.height), image: 1)]
             }
             guard let document = PDFDocument(url: request.input), document.pageCount > 0 else {
                 throw ConversionError.failed("Couldn't read this PDF.")
             }
-            let background = textless.flatMap { PDFDocument(url: $0) }
-            var slides: [Slide] = []
-            for index in 0..<document.pageCount {
-                guard let page = document.page(at: index) else { continue }
+            // Pages are independent: each one renders (and has its text read) on its own worker.
+            let scale = request.quality.pageScale
+            let slides = try await PageWorkers.map(request.input, pageCount: document.pageCount, maxWorkers: 4,
+                                                   progress: { progress($0 * 0.9) }) { page, index in
                 let crop = page.bounds(for: .cropBox)
-                var slide = Slide(size: abs(page.rotation) % 180 == 90 ? CGSize(width: crop.height, height: crop.width) : crop.size)
+                var slide = Slide(size: abs(page.rotation) % 180 == 90 ? CGSize(width: crop.height, height: crop.width) : crop.size,
+                                  image: index + 1)
                 var picture = page
-                if page.rotation == 0, let textlessPage = background?.page(at: index) {
+                let textless = request.editableSlides && page.rotation == 0 ? textlessCopy(of: page) : nil
+                if let textlessPage = textless?.page(at: 0) {
                     picture = textlessPage
                     slide.text = PDFText.blocks(on: page)
                 }
-                try ImageConversion.write(ImageConversion.render(picture, scale: request.quality.pageScale), to: media.appending(path: "image\(slides.count + 1).png"), format: .png)
-                slides.append(slide)
-                progress(Double(index + 1) / Double(document.pageCount) * 0.9)
+                try ImageConversion.write(ImageConversion.render(picture, scale: scale), to: media.appending(path: "image\(index + 1).png"), format: .png)
+                return slide
             }
-            return slides
-        }.value
+            return slides.compactMap { $0 }
+        }
 
         try addSlides(to: package, slides: slides)
 
@@ -74,6 +69,17 @@ nonisolated enum SlideBuilder {
         try await Tools.run("/usr/bin/zip", ["-q", "-X", "-D", "-nw", "-r", output.path, "[Content_Types].xml", "_rels", "ppt", "docProps"],
                             currentDirectory: package)
         progress(1)
+    }
+
+    /// The page without its text, as a one-page document (kept alive while its page is drawn).
+    private static func textlessCopy(of page: PDFPage) -> PDFDocument? {
+        do {
+            return try TextlessPDF.document(for: page)
+        } catch {
+            Logger(subsystem: Bundle.main.bundleIdentifier ?? "Convert Everything", category: "Slides")
+                .notice("Page kept as a picture: \(String(describing: error), privacy: .public)")
+            return nil
+        }
     }
 
     private static func addSlides(to package: URL, slides: [Slide]) throws {
@@ -137,7 +143,7 @@ nonisolated enum SlideBuilder {
             try (header + #"""
                 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\#
                 <Relationship Id="rId1" Type="\#(relType)/slideLayout" Target="../slideLayouts/\#(blankLayout)"/>\#
-                <Relationship Id="rId2" Type="\#(relType)/image" Target="../media/image\#(number).png"/></Relationships>
+                <Relationship Id="rId2" Type="\#(relType)/image" Target="../media/image\#(slide.image).png"/></Relationships>
                 """#).write(to: slideDir.appending(path: "slide\(number).xml.rels"), atomically: true, encoding: .utf8)
         }
     }

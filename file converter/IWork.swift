@@ -39,10 +39,9 @@ nonisolated enum IWork {
     /// Exports `input` to `output`. Numbers' CSV export of a file with several tables makes a folder
     /// of CSV files; the returned URL is whatever was written.
     ///
-    /// The app is started hidden in the background (when it isn't already open) so it never becomes the
-    /// active app: the subscription versions show prompts when they come to the front, and those can stop
-    /// the export. Every step has a time limit, and on a timeout the names of the app's windows are logged
-    /// so whatever was in the way can be seen.
+    /// When the app isn't open it's started hidden, so it never comes to the front, and it's kept for
+    /// half a minute afterwards so a batch of files doesn't start it again for each one. An app you
+    /// already have open is used as it is and left open.
     @discardableResult
     static func export(_ input: URL, with app: App, as format: ExportFormat, to output: URL,
                        openTimeout: Int = 90, totalTimeout: Int = 300) async throws -> URL {
@@ -55,41 +54,62 @@ nonisolated enum IWork {
         try FileManager.default.copyItem(at: input, to: copy)
         defer { try? FileManager.default.removeItem(at: copy) }
 
-        let wasRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: id).isEmpty
-        if !wasRunning { await launchHidden(id) }
+        let ours = await HiddenApps.shared.acquire(id)
 
+        // The first question ("how many documents?") is only answered once the app has finished starting.
+        // Asking it to open a file before that leaves it holding a document nothing can reach, so the
+        // script waits for that answer first. `open` normally hands back the document; when it doesn't,
+        // the document is looked up by name.
         let script = """
         on run argv
             set inputFile to POSIX file (item 1 of argv)
             set outputFile to POSIX file (item 2 of argv)
             set baseName to item 3 of argv
             set fullName to item 4 of argv
-            try
-                with timeout of 30 seconds
-                    tell application id "\(id)" to open inputFile
-                end timeout
-            end try
-            set theDocument to missing value
+            set ready to false
             repeat \(openTimeout * 4) times
                 try
-                    with timeout of 5 seconds
-                        tell application id "\(id)" to set theDocument to document baseName
-                        tell application id "\(id)" to get name of theDocument
+                    with timeout of 10 seconds
+                        tell application id "\(id)" to count documents
                     end timeout
+                    set ready to true
                     exit repeat
-                on error
-                    try
-                        with timeout of 5 seconds
-                            tell application id "\(id)" to set theDocument to document fullName
-                            tell application id "\(id)" to get name of theDocument
-                        end timeout
-                        exit repeat
-                    on error
-                        set theDocument to missing value
-                        delay 0.25
-                    end try
+                on error message number code
+                    if code is -1743 then error message number code
+                    delay 0.25
                 end try
             end repeat
+            if not ready then error "NOT_READY"
+            set theDocument to missing value
+            try
+                with timeout of \(openTimeout) seconds
+                    tell application id "\(id)"
+                        set theDocument to open inputFile
+                        get name of theDocument
+                    end tell
+                end timeout
+            on error
+                set theDocument to missing value
+            end try
+            if theDocument is missing value then
+                repeat 120 times
+                    repeat with candidate in {baseName, fullName}
+                        try
+                            with timeout of 5 seconds
+                                tell application id "\(id)"
+                                    set theDocument to document (candidate as text)
+                                    get name of theDocument
+                                end tell
+                            end timeout
+                            exit repeat
+                        on error
+                            set theDocument to missing value
+                        end try
+                    end repeat
+                    if theDocument is not missing value then exit repeat
+                    delay 0.25
+                end repeat
+            end if
             if theDocument is missing value then error "OPEN_TIMEOUT"
             with timeout of \(totalTimeout) seconds
                 tell application id "\(id)"
@@ -99,10 +119,11 @@ nonisolated enum IWork {
             end timeout
         end run
         """
-        // If the app hasn't got the document ready after a while, it's usually showing a window that needs
-        // you (Keynote's "may look different" warnings, which stop it from answering). Bring it forward and ask.
+        // Still nothing after half a minute: the app is probably showing a window that needs you.
+        // Bring it forward and say so.
         let watcher = Task {
-            try await Task.sleep(for: .seconds(15))
+            try await Task.sleep(for: .seconds(30))
+            HiddenApps.shared.forget(id)
             await MainActor.run {
                 for running in NSRunningApplication.runningApplications(withBundleIdentifier: id) {
                     running.unhide()
@@ -110,27 +131,34 @@ nonisolated enum IWork {
                 }
             }
             IWork.needsAttention?("\(app.rawValue) is waiting for you",
-                                  "If \(app.rawValue) shows a window saying the file may look different, close it to finish converting.")
+                                  "If \(app.rawValue) is showing a message about this file, close it to finish converting.")
         }
         defer { watcher.cancel() }
 
         do {
-            try await withTimeout(seconds: openTimeout + totalTimeout + 60) {
+            _ = try await withTimeout(seconds: openTimeout * 2 + totalTimeout + 60) {
                 try await Tools.run("/usr/bin/osascript", ["-e", script, copy.path, output.path, token, copy.lastPathComponent])
             }
-        } catch ConversionError.failed(let message) where message.contains("-1743") {
-            await cleanUp(id, token: token, quit: !wasRunning)
-            throw ConversionError.failed("Convert Everything isn't allowed to use \(app.rawValue). Turn it on in System Settings → Privacy & Security → Automation.")
-        } catch ConversionError.cancelled {
-            await cleanUp(id, token: token, quit: !wasRunning)
-            throw ConversionError.cancelled
         } catch {
-            let windows = await windowNames(id)
-            log.error("\(app.rawValue, privacy: .public) export failed: \(String(describing: error), privacy: .public); windows: \(windows, privacy: .public)")
-            await cleanUp(id, token: token, quit: !wasRunning)
-            throw ConversionError.failed("\(app.rawValue) didn't respond\(windows.isEmpty ? "" : " (it was showing: \(windows))"). If it shows a warning window, close it and try again.")
+            // Cleaning up must still happen when the conversion was cancelled, so it runs in its own task.
+            let cancelled = (error as? ConversionError)?.isCancellation == true
+            let windows = await Task.detached { () -> String in
+                let windows = cancelled ? "" : await windowNames(id)
+                await closeDocuments(id, token: token)
+                if ours { await HiddenApps.shared.discard(id) }
+                return windows
+            }.value
+            switch error {
+            case ConversionError.cancelled:
+                throw error
+            case ConversionError.failed(let message) where message.contains("-1743"):
+                throw ConversionError.failed("Convert Everything isn't allowed to use \(app.rawValue). Turn it on in System Settings → Privacy & Security → Automation.")
+            default:
+                log.error("\(app.rawValue, privacy: .public) export failed: \(String(describing: error), privacy: .public); windows: \(windows, privacy: .public)")
+                throw ConversionError.failed("\(app.rawValue) didn't respond\(windows.isEmpty ? "" : " (it was showing: \(windows))"). If it shows a message, close it and try again.")
+            }
         }
-        if !wasRunning { await cleanUp(id, token: token, quit: true) }
+        if ours { HiddenApps.shared.release(id) }
 
         let fileManager = FileManager.default
         if fileManager.fileExists(atPath: output.path) { return output }
@@ -142,42 +170,37 @@ nonisolated enum IWork {
         throw ConversionError.failed("\(app.rawValue) couldn't export this file.")
     }
 
-    private static let log = Logger(subsystem: "io.github.jaybirdzhang.ConvertEverything", category: "iwork")
+    private static let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ConvertEverything", category: "iwork")
 
-    /// Starts the app without bringing it to the front, and waits until it's ready for AppleScript.
-    private static func launchHidden(_ id: String) async {
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return }
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = false
-        configuration.hides = true
-        configuration.addsToRecentItems = false
-        // Only for this launch: skip the "may look different" warnings window. While it's open the app
-        // stops answering AppleScript, so the export would never start. Your own setting isn't changed.
-        configuration.arguments = ["-TMADoNotShowDocumentWarnings", "YES"]
-        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
-        try? await Task.sleep(for: .seconds(2))
+    /// Closes our document if it's still open.
+    private static func closeDocuments(_ id: String, token: String) async {
+        await runBriefly("""
+        with timeout of 10 seconds
+            tell application id "\(id)" to close (every document whose name starts with "\(token)") saving no
+        end timeout
+        """)
     }
 
-    /// Closes our document if it's still open, and quits the app when we started it.
-    private static func cleanUp(_ id: String, token: String, quit: Bool) async {
-        let script = """
+    /// Quits the app unless it has a document open (then somebody is using it).
+    fileprivate static func quitIfEmpty(_ id: String) async {
+        await runBriefly("""
         with timeout of 10 seconds
             tell application id "\(id)"
-                try
-                    close (every document whose name starts with "\(token)") saving no
-                end try
-                \(quit ? "quit saving no" : "")
+                if (count documents) is 0 then quit
             end tell
         end timeout
-        """
-        _ = try? await withTimeout(seconds: 20) { try await Tools.run("/usr/bin/osascript", ["-e", script]) }
+        """)
     }
 
     /// The titles of the app's windows (a sheet or prompt shows up here), for diagnosing a stuck export.
     private static func windowNames(_ id: String) async -> String {
-        let script = #"with timeout of 5 seconds\#ntell application id "\#(id)" to get name of every window\#nend timeout"#
-        return ((try? await withTimeout(seconds: 10) { try await Tools.run("/usr/bin/osascript", ["-e", script]) }) ?? "")
+        await runBriefly(#"with timeout of 5 seconds\#ntell application id "\#(id)" to get name of every window\#nend timeout"#)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @discardableResult
+    private static func runBriefly(_ script: String) async -> String {
+        (try? await withTimeout(seconds: 20) { try await Tools.run("/usr/bin/osascript", ["-e", script]) }) ?? ""
     }
 
     /// Runs `work`, cancelling it (which stops its process) if it takes longer than `seconds`.
@@ -190,6 +213,111 @@ nonisolated enum IWork {
             guard let value = first else { throw ConversionError.failed("Timed out.") }
             return value
         }
+    }
+}
+
+/// Keynote, Numbers and Pages when this app started them itself, in the background. Opening a document
+/// makes an app show its windows, so while we have one it's hidden again the moment it un-hides. They
+/// stay open for a little while after an export, then quit. Once you bring one forward it's yours: it's
+/// no longer hidden or quit from here.
+nonisolated private final class HiddenApps: @unchecked Sendable {
+    static let shared = HiddenApps()
+    private static let idleTime: Duration = .seconds(30)
+
+    private struct Entry {
+        let app: NSRunningApplication
+        let keeper: Task<Void, Never>
+    }
+
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+    private var idleQuits: [String: Task<Void, Never>] = [:]
+
+    private init() {
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil) { [self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let id = app.bundleIdentifier else { return }
+            forget(id, pid: app.processIdentifier)
+        }
+        // Don't leave hidden apps behind when Convert Everything quits.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { [self] _ in
+            for entry in lock.withLock({ Array(entries.values) }) { entry.app.terminate() }
+        }
+    }
+
+    /// Makes sure the app is running, starting it hidden when it isn't. True when it's one we started
+    /// (now or for an earlier file) that you haven't brought forward since.
+    func acquire(_ id: String) async -> Bool {
+        // An idle quit that has already begun is allowed to finish, so the app isn't caught half closed.
+        let pending = lock.withLock { idleQuits.removeValue(forKey: id) }
+        pending?.cancel()
+        await pending?.value
+
+        if let known = lock.withLock({ entries[id] }) {
+            if !known.app.isTerminated { return true }
+            forget(id)
+        }
+        guard NSRunningApplication.runningApplications(withBundleIdentifier: id).isEmpty,
+              let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return false }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        configuration.hides = true
+        configuration.addsToRecentItems = false
+        // Only for this launch: don't reopen the windows from last time, and skip the "may look different"
+        // warnings, which nobody would see while the app is hidden. Your own settings aren't changed.
+        configuration.arguments = ["-TMADoNotShowDocumentWarnings", "YES", "-ApplePersistenceIgnoreState", "YES"]
+        guard let app = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration) else { return false }
+        let keeper = Task.detached(priority: .userInitiated) {
+            while !Task.isCancelled, !app.isTerminated {
+                if !app.isHidden, !app.isActive { app.hide() }
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        lock.withLock { entries[id] = Entry(app: app, keeper: keeper) }
+        return true
+    }
+
+    /// The app is yours from now on (you brought it forward, or it needs you to look at it).
+    func forget(_ id: String, pid: pid_t? = nil) {
+        let entry = lock.withLock { () -> Entry? in
+            guard let entry = entries[id], pid == nil || entry.app.processIdentifier == pid else { return nil }
+            entries[id] = nil
+            return entry
+        }
+        entry?.keeper.cancel()
+    }
+
+    /// After a successful export: quit the app if nothing else has needed it for a while.
+    func release(_ id: String) {
+        let task = Task.detached(priority: .utility) { [self] in
+            try? await Task.sleep(for: Self.idleTime)
+            guard !Task.isCancelled, let entry = take(id) else { return }
+            await quit(entry.app, id: id, force: false)
+        }
+        lock.withLock { idleQuits[id] = task }
+    }
+
+    /// After a failed export: quit the app now, by force if it's stuck in the background, so it can't
+    /// hold up the next file. One you've brought forward is only quit if it has nothing open.
+    func discard(_ id: String) async {
+        if let entry = take(id) {
+            await quit(entry.app, id: id, force: true)
+        } else {
+            await IWork.quitIfEmpty(id)
+        }
+    }
+
+    private func take(_ id: String) -> Entry? {
+        let entry = lock.withLock { entries.removeValue(forKey: id) }
+        entry?.keeper.cancel()
+        return entry
+    }
+
+    private func quit(_ app: NSRunningApplication, id: String, force: Bool) async {
+        await IWork.quitIfEmpty(id)
+        for _ in 0..<30 where !app.isTerminated { try? await Task.sleep(for: .milliseconds(100)) }
+        if force, !app.isTerminated, !app.isActive { app.forceTerminate() }
     }
 }
 

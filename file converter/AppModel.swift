@@ -193,7 +193,7 @@ enum OriginalsMode: String, CaseIterable {
         UNUserNotificationCenter.current().delegate = notificationDelegate
         watcher.onRename = { [weak self] from, to in self?.handleRename(from: from, to: to) }
         IWork.needsAttention = { [weak self] title, body in
-            Task { @MainActor in self?.notify(title, body: body, important: true) }
+            Task { @MainActor [weak self] in self?.notify(title, body: body, important: true) }
         }
         restartWatcher()
     }
@@ -523,6 +523,13 @@ enum OriginalsMode: String, CaseIterable {
         batches.removeAll { !$0.isActive }
     }
 
+    #if DEBUG
+    /// Fills the history with made-up conversions, for previews and UI snapshots. Pause watching first.
+    func showSamples(_ samples: [Batch]) {
+        batches = samples
+    }
+    #endif
+
     func addFolder() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -550,7 +557,6 @@ enum OriginalsMode: String, CaseIterable {
         return candidate
     }
 
-    /// Keeps the 20 most recent finished batches (a batch counts once, however many files it has).
     /// "notes.md", then "notes 2.md", "notes 3.md"… if that name is taken.
     private func uniqueFileURL(_ url: URL) -> URL {
         let folder = url.deletingLastPathComponent(), ext = url.pathExtension
@@ -575,6 +581,7 @@ enum OriginalsMode: String, CaseIterable {
         }
     }
 
+    /// Keeps the 20 most recent finished batches (a batch counts once, however many files it has).
     private func trimHistory() {
         var finished = 0
         batches.removeAll { batch in

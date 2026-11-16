@@ -1,3 +1,4 @@
+import Accelerate
 import CoreGraphics
 import Foundation
 
@@ -15,11 +16,14 @@ nonisolated enum WebP {
         }
         guard drawn else { throw ConversionError.failed("Couldn't process this image.") }
 
-        // Core Graphics premultiplies by alpha; WebP expects plain colors.
-        for i in stride(from: 0, to: pixels.count, by: 4) {
-            let alpha = Int(pixels[i + 3])
-            guard alpha > 0, alpha < 255 else { continue }
-            for c in 0..<3 { pixels[i + c] = UInt8(min(255, Int(pixels[i + c]) * 255 / alpha)) }
+        // Core Graphics premultiplies by alpha; WebP expects plain colors. Opaque images need no conversion.
+        if image.hasAlpha {
+            let converted = pixels.withUnsafeMutableBytes { buffer -> Bool in
+                var vector = vImage_Buffer(data: buffer.baseAddress, height: vImagePixelCount(height),
+                                           width: vImagePixelCount(width), rowBytes: width * 4)
+                return vImageUnpremultiplyData_RGBA8888(&vector, &vector, vImage_Flags(kvImageNoFlags)) == kvImageNoError
+            }
+            guard converted else { throw ConversionError.failed("Couldn't process this image.") }
         }
 
         var output: UnsafeMutablePointer<UInt8>?
