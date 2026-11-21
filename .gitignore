@@ -1,1 +1,8 @@
 ThirdParty/
+
+# Per-user Xcode state and macOS clutter
+xcuserdata/
+*.xcuserstate
+.DS_Store
+build/
+DerivedData/
