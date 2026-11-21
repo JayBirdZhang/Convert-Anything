@@ -22,9 +22,17 @@ struct ContentView: View {
             }
         }
         .frame(width: 340)
-        // Closing the panel takes it back to the first page, like Control Center.
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in page = .main }
+        .background(WindowReader { panelWindow = $0 })
+        // Closing the panel takes it back to the first page, like Control Center. Only the panel itself
+        // closing counts: a picker's menu or the folder chooser also take focus, and must leave the page be.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
+            guard let window = note.object as? NSWindow, window === panelWindow,
+                  !window.occlusionState.contains(.visible) else { return }
+            page = .main
+        }
     }
+
+    @State private var panelWindow: NSWindow?
 
     private var main: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -360,5 +368,26 @@ struct ExtensionChange: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(from.uppercased()) to \(to.uppercased())")
+    }
+}
+
+/// Hands back the window a view is in, once it's in one.
+private struct WindowReader: NSViewRepresentable {
+    let found: (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> NSView { WindowView(found: found) }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private final class WindowView: NSView {
+        let found: (NSWindow) -> Void
+        init(found: @escaping (NSWindow) -> Void) {
+            self.found = found
+            super.init(frame: .zero)
+        }
+        required init?(coder: NSCoder) { fatalError() }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let window { found(window) }
+        }
     }
 }
