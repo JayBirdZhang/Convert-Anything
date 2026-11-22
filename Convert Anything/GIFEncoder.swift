@@ -24,12 +24,14 @@ nonisolated final class GIFEncoder {
     private let screen: UnsafeMutableBufferPointer<UInt32>     // The color currently shown at each pixel
     private let indices: UnsafeMutableBufferPointer<UInt8>     // The frame being encoded
     private var hasDrawn = false
+    private var repairing = false           // A new palette just came: redraw still pixels the old one got badly wrong
 
     // The palette: r, g, b and the three packed into one number, for each color.
     private let palette = UnsafeMutableBufferPointer<Int>.allocate(capacity: 256 * 4)
     private var paletteCount = 0
     private var palettesBuilt = 0
     private var paletteFit = 0.0            // The palette's error on the frame it was made from
+    private var paletteMisses = 0           // How many pixels of that frame it had no close color for
     private var neighbors: [[Int]] = []     // For each color, the nearby colors it can be mixed with
     // For each color (6 bits per channel), the two palette colors to dither between, worked out when first needed.
     private let pairs = UnsafeMutableBufferPointer<UInt16>.allocate(capacity: 1 << 18)
@@ -104,13 +106,20 @@ nonisolated final class GIFEncoder {
         context.draw(image, in: rect)
         if keepsTransparency { separateTransparency() }
 
-        // A new palette when this frame's colors have drifted well away from the ones it was made for.
+        // A new palette when this frame's colors have drifted well away from the ones it was made for, or when
+        // something small but colorful appears that it has nothing close to (a green icon would turn gray).
         countColors()
-        if paletteCount == 0 || paletteError() > 1.6 * paletteFit + 8 { buildPalette() }
+        if paletteCount == 0 {
+            buildPalette()
+        } else {
+            let fit = paletteError()
+            if fit.error > 1.6 * paletteFit + 8 || fit.misses > 2 * paletteMisses + Self.minimumMisses { buildPalette() }
+        }
 
         // A frame where nothing changed isn't stored; the previous one just stays up longer. Transparent
         // pictures can't do that, since each frame is cleared away before the next.
         let changed = drawChanges()
+        repairing = false
         if changed == nil && !pending.isEmpty && !keepsTransparency { return }
         try flush(until: start)
         encode(changed ?? (0, 0, 0, 0))
@@ -163,7 +172,9 @@ nonisolated final class GIFEncoder {
                         if pixels[p + 3] == 0 { continue }
                     } else if !everything {
                         let change = abs(r - Int(reference[p])) + abs(g - Int(reference[p + 1])) + abs(b - Int(reference[p + 2]))
-                        if change <= noise { continue }
+                        // Still pixels keep what's on screen, unless a new palette came because the old one
+                        // drew them in a color far from their own (a green icon left gray).
+                        if change <= noise && !(repairing && isMiss(shown: screen[i], p)) { continue }
                     }
                     reference[p] = pixels[p]; reference[p + 1] = pixels[p + 1]; reference[p + 2] = pixels[p + 2]
 
@@ -194,6 +205,15 @@ nonisolated final class GIFEncoder {
             }
         }
         return right >= 0 ? (left, top, right, bottom) : nil
+    }
+
+    /// Whether the color shown at a pixel is a miss for the color it should be. Dithered pixels show one of
+    /// two neighbors at most about 40 levels apart, so they don't count.
+    private func isMiss(shown: UInt32, _ p: Int) -> Bool {
+        guard shown != .max else { return false }
+        let dr = Int(shown >> 16 & 0xFF) - Int(reference[p]), dg = Int(shown >> 8 & 0xFF) - Int(reference[p + 1])
+        let db = Int(shown & 0xFF) - Int(reference[p + 2])
+        return 2 * dr * dr + 4 * dg * dg + 3 * db * db > Self.missDistance
     }
 
     /// The palette colors to dither a color between: the nearest one, and the neighbor of it that mixes best
@@ -329,16 +349,24 @@ nonisolated final class GIFEncoder {
         counted = occupied.reduce(0) { $0 + histogram[$1 * 4] }
     }
 
-    /// How far the frame's colors are from the palette, on average.
-    private func paletteError() -> Double {
-        guard counted > 0 else { return 0 }
-        var total = 0
+    /// Colors further than this from every palette color (about 40 levels per channel, so a green icon drawn
+    /// in gray) count as misses. Video noise and gradients stay well within it.
+    private static let missDistance = 9 * 40 * 40
+    /// Misses on this many pixels (smooth ones count 8 times) make a new palette worthwhile: a small icon's worth.
+    private static let minimumMisses = 150
+
+    /// How far the frame's colors are from the palette, on average, and how many pixels have no close color.
+    private func paletteError() -> (error: Double, misses: Int) {
+        guard counted > 0 else { return (0, 0) }
+        var total = 0, misses = 0
         for bin in occupied {
             let n = histogram[bin * 4]
             let r = histogram[bin * 4 + 1] / n, g = histogram[bin * 4 + 2] / n, b = histogram[bin * 4 + 3] / n
-            total += n * distance(r, g, b, pair(r, g, b) & 0xFF)
+            let d = distance(r, g, b, pair(r, g, b) & 0xFF)
+            total += n * d
+            if d > Self.missDistance { misses += n }
         }
-        return Double(total) / Double(counted)
+        return (Double(total) / Double(counted), misses)
     }
 
     /// Up to 255 colors for the frame: median cut (splitting the box with the most error, along its most varied
@@ -411,7 +439,8 @@ nonisolated final class GIFEncoder {
         }
         pairs.initialize(repeating: Self.unknownPair)
         palettesBuilt += 1
-        paletteFit = paletteError()
+        repairing = hasDrawn
+        (paletteFit, paletteMisses) = paletteError()
     }
 
     // MARK: File

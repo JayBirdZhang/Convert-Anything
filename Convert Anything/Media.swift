@@ -158,6 +158,7 @@ nonisolated enum GIFVideo {
         generator.maximumSize = CGSize(width: settings.width, height: settings.width)   // Longest side; never enlarges
         // iPhone videos are often HDR; tone-map them so the GIF's colors aren't washed out.
         if #available(macOS 15, *) { generator.dynamicRangePolicy = .forceSDR }
+        let display = await displaySpace(of: track)
         let tolerance = CMTime(seconds: 0.5 / fps, preferredTimescale: 600)
         generator.requestedTimeToleranceBefore = tolerance
         generator.requestedTimeToleranceAfter = tolerance
@@ -170,7 +171,10 @@ nonisolated enum GIFVideo {
             let end = done + 1 < count ? Double(done + 1) / fps : duration
             let frameDuration = end - Double(done) / fps
             done += 1
-            if let image = try? result.image {
+            if var image = try? result.image {
+                if let space = image.colorSpace, !CGColorSpaceUsesITUR_2100TF(space), let shown = image.copy(colorSpace: display) {
+                    image = shown
+                }
                 if encoder == nil {
                     encoder = try GIFEncoder(url: output, width: image.width, height: image.height, noise: settings.noise)
                 }
@@ -182,6 +186,24 @@ nonisolated enum GIFVideo {
         }
         guard let encoder else { throw ConversionError.failed("Couldn't read frames from this video.") }
         try encoder.finish()
+    }
+
+    /// The space a video's frames are shown in. Video is tagged with the camera's curve (BT.709), but players show
+    /// the stored values almost as they are, as sRGB-like display values; converting through the camera curve
+    /// instead lifts the midtones and dulls every color. So the frames keep their primaries and get sRGB's curve.
+    /// For screen recordings that's exactly what was on screen.
+    private static func displaySpace(of track: AVAssetTrack) async -> CGColorSpace {
+        let description = (try? await track.load(.formatDescriptions))?.first
+        let primaries = description.flatMap {
+            CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_ColorPrimaries) as? String
+        }
+        if primaries == kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String {
+            return CGColorSpace(name: CGColorSpace.itur_2020_sRGBGamma)!
+        }
+        if primaries == kCMFormatDescriptionColorPrimaries_P3_D65 as String {
+            return CGColorSpace(name: CGColorSpace.displayP3)!
+        }
+        return CGColorSpace(name: CGColorSpace.sRGB)!   // BT.709 and SD video, whose primaries are about the same
     }
 
     /// An animated GIF becomes an H.264 video, each frame shown for its own delay.
