@@ -163,6 +163,8 @@ enum OriginalsMode: String, CaseIterable {
     private var askedForNotifications = false
     private let notificationDelegate = NotificationDelegate()
     private let undoStore = UndoStore()
+    /// Jobs whose undo is waiting for Finder to notice the rename (see `undo`).
+    private var undoing: Set<ObjectIdentifier> = []
 
     private enum Keys {
         static let watchedFolders = "watchedFolders"
@@ -473,27 +475,63 @@ enum OriginalsMode: String, CaseIterable {
         job.task?.cancel()
     }
 
-    /// Trashes the converted file and brings the original back from the Trash.
+    /// Trashes the converted file (or folder of images) and brings the original back from the Trash.
     func undo(_ job: Job) {
-        guard job.state == .done, job.originalInTrash != nil || job.keptOriginal != nil else { return }
+        guard job.state == .done, job.originalInTrash != nil || job.keptOriginal != nil,
+              !undoing.contains(ObjectIdentifier(job)) else { return }
         let fileManager = FileManager.default
+        let result = job.resultURL ?? job.fileURL
         do {
-            if let trashed = job.originalInTrash {
-                guard !fileManager.fileExists(atPath: job.originalURL.path) else {
-                    throw ConversionError.failed("A file named \(job.originalURL.lastPathComponent) already exists.")
+            guard let trashed = job.originalInTrash else {
+                // With "Keep both" the original is already there; undoing just removes the converted file.
+                if fileManager.fileExists(atPath: result.path) {
+                    try fileManager.trashItem(at: result, resultingItemURL: nil)
                 }
+                finishUndo(job)
+                return
+            }
+            guard !fileManager.fileExists(atPath: job.originalURL.path) else {
+                throw ConversionError.failed("A file named \(job.originalURL.lastPathComponent) already exists.")
+            }
+            guard fileManager.fileExists(atPath: trashed.path) else {
+                throw ConversionError.failed("The original is no longer in the Trash.")
+            }
+            guard fileManager.fileExists(atPath: result.path) else {
                 try fileManager.moveItem(at: trashed, to: job.originalURL)
+                finishUndo(job)
+                return
             }
-            // With "Keep both" the original is already there; undoing just removes the converted file.
-            let result = job.resultURL ?? job.fileURL
-            if fileManager.fileExists(atPath: result.path) {
-                try fileManager.trashItem(at: result, resultingItemURL: nil)
+            // Do what ⌘Z in Finder does: give the converted file (or folder) the original's name first, wait for
+            // Finder to notice, then swap the original in under that same name. Finder then keeps the icon where it
+            // was instead of placing the original as a new file. (The watcher ignores the app's own renames.)
+            try fileManager.moveItem(at: result, to: job.originalURL)
+            undoing.insert(ObjectIdentifier(job))
+            Task {
+                // Finder needs about half a second to pick up a rename; without it the icon still jumps.
+                try? await Task.sleep(for: .seconds(1))
+                defer { undoing.remove(ObjectIdentifier(job)) }
+                do {
+                    try fileManager.trashItem(at: job.originalURL, resultingItemURL: nil)
+                } catch {
+                    try? fileManager.moveItem(at: job.originalURL, to: result)
+                    notify("Couldn't undo", body: error.localizedDescription)
+                    return
+                }
+                do {
+                    try fileManager.moveItem(at: trashed, to: job.originalURL)
+                    finishUndo(job)
+                } catch {
+                    notify("Couldn't undo", body: "\(error.localizedDescription) Both files are in the Trash.")
+                }
             }
-            undoStore.remove(converted: job.fileURL.path)
-            job.state = .undone
         } catch {
             notify("Couldn't undo", body: error.localizedDescription)
         }
+    }
+
+    private func finishUndo(_ job: Job) {
+        undoStore.remove(converted: job.fileURL.path)
+        job.state = .undone
     }
 
     func reveal(_ job: Job) {
