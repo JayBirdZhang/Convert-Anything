@@ -8,7 +8,8 @@
 # notes.html is a short HTML fragment (e.g. a <ul>) shown in the update window. The version comes from
 # MARKETING_VERSION / CURRENT_PROJECT_VERSION in the Xcode project; bump both before running.
 # Signing uses the private key that `generate_keys --account convert-anything` saved in your keychain.
-# Output goes to build/release/: Convert-Anything.dmg, Convert-Anything.zip and appcast.xml.
+# Output goes to build/release/: Convert-Anything.dmg, Convert-Anything.zip and appcast.xml. It also
+# redraws the README badges in docs/ with the new version; commit those with the version bump.
 # Attach all three to a GitHub release tagged v<version>, e.g.  gh release create v1.3 build/release/* --notes-file notes.md
 set -euo pipefail
 
@@ -54,4 +55,9 @@ cat > "$OUT/appcast.xml" <<EOF
 </rss>
 EOF
 xmllint --noout "$OUT/appcast.xml"
+
+# README badges show the version and minimum macOS from the app just built.
+swift "$(dirname "$0")/make-badges.swift" "$VERSION" "$MIN_MACOS"
+
 echo "Convert Anything $VERSION ($BUILD) → $OUT"
+echo "Commit docs/badge-*.svg with the version bump so the README shows v$VERSION."
