@@ -18,6 +18,7 @@ enum Converter {
         case toSlides       // One slide per PDF page or image
         case spreadsheet    // Excel ↔ CSV directly; Numbers for the rest
         case textRecognition   // Vision reads the text in an image
+        case documentToImage   // A document or spreadsheet is laid out as a PDF, then its pages become images
     }
 
     static let documentSources: [Format] = [.md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .pdf]
@@ -34,14 +35,16 @@ enum Converter {
             return from == .pdf || from.kind == .image ? .toSlides : nil
         }
         if from.kind == .spreadsheet || to.kind == .spreadsheet {
-            guard from.kind == .spreadsheet, [.pdf, .csv, .xlsx].contains(to) else { return nil }
-            return .spreadsheet
+            guard from.kind == .spreadsheet else { return nil }
+            if to.kind == .image { return .documentToImage }
+            return [.pdf, .csv, .xlsx].contains(to) ? .spreadsheet : nil
         }
         switch (from.kind, to.kind) {
         case (.image, .image): return .image
         case (.image, .document) where to == .pdf: return .imageToPDF
         case (.image, .document) where [.txt, .md, .docx, .html, .rtf, .odt].contains(to): return .textRecognition
         case (.document, .image) where from == .pdf: return .pdfToImage
+        case (.document, .image) where documentSources.contains(from): return .documentToImage
         case (.document, .document) where documentSources.contains(from) && documentTargets.contains(to): return .document
         // macOS reads Ogg and Opus audio but can only write Opus inside Apple's own CAF files.
         case (.audio, .audio), (.video, .audio): return [.ogg, .opus].contains(to) ? nil : .media
@@ -59,6 +62,7 @@ enum Converter {
         case .fromSlides, .slidesExport: true
         case .spreadsheet: !(from == .xlsx && to == .csv) && !(from == .csv && to == .xlsx)
         case .document: from == .pages || (to == .pdf && [.docx, .doc, .rtf].contains(from))
+        case .documentToImage: isHeavy(from: from, to: .pdf)
         default: false
         }
     }
@@ -134,6 +138,13 @@ enum Converter {
             try await DocumentConversion.convert(request, output: output)
         case .media:
             try await MediaConversion.convert(request, output: output, progress: progress)
+        case .documentToImage:
+            // Same layout as converting to PDF (fonts, page size, margins), so the picture matches that PDF.
+            var pdfRequest = Request(input: request.input, from: request.from, to: .pdf, workDir: request.workDir,
+                                     title: request.title, originalDir: request.originalDir)
+            pdfRequest.quality = request.quality
+            let pdf = try await convert(pdfRequest) { _ in }
+            result = try await renderPages(of: pdf, request: request, output: output, progress: progress)
         }
         guard FileManager.default.fileExists(atPath: result.path) else {
             throw ConversionError.failed("The converter didn't produce a file.")
@@ -152,8 +163,13 @@ enum Converter {
             guard let document = PDFDocument(url: pdf), document.pageCount > 0, let first = document.page(at: 0) else {
                 throw ConversionError.failed("Couldn't read this PDF.")
             }
-            @Sendable func save(_ page: PDFPage, to url: URL) throws {
-                let image = try ImageConversion.render(page, scale: request.quality.pageScale)
+            let pageCount = document.pageCount
+            // Markdown, text and HTML have no pages of their own, so the last page loses the empty space
+            // below its last line instead of keeping the whole letter-size sheet the PDF step laid it out on.
+            let trimsLastPage = [.md, .txt, .html].contains(request.from)
+            @Sendable func save(_ page: PDFPage, to url: URL, isLast: Bool) throws {
+                var image = try ImageConversion.render(page, scale: request.quality.pageScale)
+                if trimsLastPage && isLast { image = ImageConversion.trimmingBottom(of: image) }
                 if request.to == .webp {
                     try WebP.write(image, to: url, quality: request.quality)
                 } else {
@@ -161,14 +177,13 @@ enum Converter {
                                               properties: [kCGImageDestinationLossyCompressionQuality: request.quality.imageQuality])
                 }
             }
-            let pageCount = document.pageCount
-            guard request.allPages && pageCount > 1 else { try save(first, to: output); return false }
+            guard request.allPages && pageCount > 1 else { try save(first, to: output, isLast: pageCount == 1); return false }
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let digits = max(2, String(pageCount).count)
             // Pages are independent, so they render side by side; each lands in its own numbered file.
             _ = try await PageWorkers.map(pdf, pageCount: pageCount, progress: progress) { page, index in
                 let name = "\(request.title) \(String(format: "%0\(digits)d", index + 1)).\(typedExtension)"
-                try save(page, to: folder.appending(path: name))
+                try save(page, to: folder.appending(path: name), isLast: index == pageCount - 1)
             }
             return true
         }
@@ -333,6 +348,32 @@ nonisolated enum ImageConversion {
         }
         try write(render(page, scale: quality.pageScale), to: output, format: format,
                   properties: [kCGImageDestinationLossyCompressionQuality: quality.imageQuality])
+    }
+
+    /// Cuts off the blank space below the content, leaving a bottom margin as deep as the top one.
+    /// Returns the image unchanged when the page is blank or already full.
+    static func trimmingBottom(of image: CGImage) -> CGImage {
+        let width = image.width, height = image.height
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+              let data = context.data else { return image }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let pixels = data.bindMemory(to: UInt8.self, capacity: width * height * 4)
+        // Row 0 of the buffer is the top of the image. Near-white counts as blank (anti-aliasing, off-white page fills).
+        func hasContent(_ row: Int) -> Bool {
+            let start = row * width * 4
+            for x in 0..<width {
+                let i = start + x * 4
+                if pixels[i] < 245 || pixels[i + 1] < 245 || pixels[i + 2] < 245 { return true }
+            }
+            return false
+        }
+        guard let top = (0..<height).first(where: hasContent),
+              let bottom = (0..<height).reversed().first(where: hasContent) else { return image }
+        let newHeight = min(height, bottom + 1 + top)
+        guard newHeight < height else { return image }
+        return image.cropping(to: CGRect(x: 0, y: 0, width: width, height: newHeight)) ?? image
     }
 
     static func render(_ page: PDFPage, scale: CGFloat = 2) throws -> CGImage {
