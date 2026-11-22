@@ -26,6 +26,10 @@
   <a href="LICENSE"><img src="docs/badge-license.svg" height="28" alt="License: GPL-3.0"></a>
 </p>
 
+<p align="center">
+  <img src="docs/demo.gif" width="760" alt="Renaming notes.md to notes.pdf on the desktop converts it in place">
+</p>
+
 ## Features
 
 - **Just rename it.** That's all you have to do to convert a file.
