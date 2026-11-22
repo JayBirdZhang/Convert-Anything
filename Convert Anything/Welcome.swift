@@ -201,7 +201,7 @@ private struct WelcomeView: View {
                     .resizable()
                     .frame(width: 44, height: 44)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Convert Everything is running").font(.headline)
+                    Text("Convert Anything is running").font(.headline)
                     Text(arrowX == nil
                          ? "It lives in the menu bar at the top of your screen. If the menu bar is full, its icon may be hidden behind others or the camera."
                          : "It lives up here in the menu bar. Click its icon anytime to see recent conversions or change settings.")

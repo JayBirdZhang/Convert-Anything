@@ -16,7 +16,7 @@ final class UndoStore {
 
     init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appending(path: "Convert Everything")
+            .appending(path: "Convert Anything")
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         url = support.appending(path: "undo.json")
         if let data = try? Data(contentsOf: url) {

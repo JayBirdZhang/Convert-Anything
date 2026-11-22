@@ -39,7 +39,7 @@ enum IdleIcon {
             return true
         }
         image.isTemplate = true
-        image.accessibilityDescription = "Convert Everything"
+        image.accessibilityDescription = "Convert Anything"
         return image
     }()
 }

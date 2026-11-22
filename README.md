@@ -1,10 +1,10 @@
-# Convert Everything
+# Convert Anything
 
 Convert any file on your Mac by renaming it. Change `notes.md` to `notes.pdf`, `photo.heic` to
 `photo.jpg` or `song.wav` to `song.mp3`, and the file is converted in place. The app lives in the
 menu bar and watches the folders you choose (Desktop, Documents and Downloads by default).
 
-<img src="docs/screenshot.png" alt="The Convert Everything menu: recent conversions grouped by day" width="340">
+<img src="docs/screenshot.png" alt="The Convert Anything menu: recent conversions grouped by day" width="340">
 
 - **Images:** PNG, JPEG, HEIC, TIFF, GIF, BMP, WebP, AVIF, ICO
 - **Documents:** PDF, Markdown (with LaTeX math), TXT, HTML, Word (.docx/.doc), RTF, ODT, Pages,
@@ -18,7 +18,7 @@ Everything runs on your Mac: no uploads, no accounts.
 
 ## Install
 
-Download the latest `Convert Everything.zip` from
+Download the latest `Convert Anything.zip` from
 [Releases](../../releases), unzip it and drag the app into Applications. It needs macOS 14 (Sonoma)
 or later and runs on Apple Silicon and Intel Macs.
 
@@ -31,10 +31,10 @@ Requirements: Xcode 26 or later, Homebrew on an Apple Silicon Mac, and Rosetta
 (`softwareupdate --install-rosetta`) to build the Intel half of the libraries.
 
 ```bash
-git clone https://github.com/JayBirdZhang/convert-everything.git
-cd convert-everything
+git clone https://github.com/JayBirdZhang/convert-anything.git
+cd convert-anything
 ./Scripts/build-dependencies.sh     # builds LAME and libwebp into ThirdParty/ (about a minute)
-open "file converter.xcodeproj"
+open "Convert Anything.xcodeproj"
 ```
 
 In Xcode, choose your own team under *Signing & Capabilities* (and, if you like, your own bundle
@@ -50,6 +50,17 @@ are scripted when they're installed and give a better result.
 
 ## License
 
-MIT; see [LICENSE](LICENSE). The bundled libraries keep their own licenses (LAME: LGPL 2;
-libwebp: BSD 3-Clause); see [ThirdPartyNotices.txt](file%20converter/ThirdPartyNotices.txt).
-The name "Convert Everything" and the app icon are not covered by the MIT License.
+Copyright (C) 2026 JayBirdZhang.
+
+Convert Anything is free software: you can redistribute it and/or modify it under the terms of the
+[GNU General Public License](LICENSE) as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version. It is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+In short: you may use, change and share it, even for money, but anything you distribute that is
+based on it must also be released under the GPL with its full source code.
+
+The bundled libraries keep their own licenses (LAME: LGPL 2; libwebp: BSD 3-Clause); see
+[ThirdPartyNotices.txt](Convert%20Anything/ThirdPartyNotices.txt). The name "Convert Anything" and
+the app icon are not covered by the license.

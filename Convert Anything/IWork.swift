@@ -3,7 +3,7 @@ import OSLog
 
 /// Uses Keynote, Numbers and Pages (free Apple apps) to convert Office and iWork files: the app asks
 /// them, through AppleScript, to open the file, export it and close it again without saving.
-/// macOS asks once for permission ("Convert Everything wants to control Keynote").
+/// macOS asks once for permission ("Convert Anything wants to control Keynote").
 nonisolated enum IWork {
     enum App: String {
         case keynote = "Keynote", numbers = "Numbers", pages = "Pages"
@@ -48,7 +48,7 @@ nonisolated enum IWork {
         guard let id = app.installedID else { throw ConversionError.missingApp(app.rawValue) }
 
         // A uniquely named copy, so the script can find its own document by name (never one you have open).
-        let token = "Convert Everything \(UUID().uuidString.prefix(8))"
+        let token = "Convert Anything \(UUID().uuidString.prefix(8))"
         let copy = input.deletingLastPathComponent().appending(path: "\(token).\(input.pathExtension)")
         try? FileManager.default.removeItem(at: copy)
         try FileManager.default.copyItem(at: input, to: copy)
@@ -152,7 +152,7 @@ nonisolated enum IWork {
             case ConversionError.cancelled:
                 throw error
             case ConversionError.failed(let message) where message.contains("-1743"):
-                throw ConversionError.failed("Convert Everything isn't allowed to use \(app.rawValue). Turn it on in System Settings → Privacy & Security → Automation.")
+                throw ConversionError.failed("Convert Anything isn't allowed to use \(app.rawValue). Turn it on in System Settings → Privacy & Security → Automation.")
             default:
                 log.error("\(app.rawValue, privacy: .public) export failed: \(String(describing: error), privacy: .public); windows: \(windows, privacy: .public)")
                 throw ConversionError.failed("\(app.rawValue) didn't respond\(windows.isEmpty ? "" : " (it was showing: \(windows))"). If it shows a message, close it and try again.")
@@ -170,7 +170,7 @@ nonisolated enum IWork {
         throw ConversionError.failed("\(app.rawValue) couldn't export this file.")
     }
 
-    private static let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ConvertEverything", category: "iwork")
+    private static let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ConvertAnything", category: "iwork")
 
     /// Closes our document if it's still open.
     private static func closeDocuments(_ id: String, token: String) async {
@@ -239,7 +239,7 @@ nonisolated private final class HiddenApps: @unchecked Sendable {
                   let id = app.bundleIdentifier else { return }
             forget(id, pid: app.processIdentifier)
         }
-        // Don't leave hidden apps behind when Convert Everything quits.
+        // Don't leave hidden apps behind when Convert Anything quits.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { [self] _ in
             for entry in lock.withLock({ Array(entries.values) }) { entry.app.terminate() }
         }

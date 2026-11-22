@@ -159,7 +159,7 @@ enum OriginalsMode: String, CaseIterable {
     // doesn't start dozens of converters at once.
     private let heavyLane = Lane(limit: 1)
     private let lightLane = Lane(limit: max(2, ProcessInfo.processInfo.activeProcessorCount / 2))
-    private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ConvertEverything", category: "conversion")
+    private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ConvertAnything", category: "conversion")
     private var askedForNotifications = false
     private let notificationDelegate = NotificationDelegate()
     private let undoStore = UndoStore()
@@ -270,7 +270,7 @@ enum OriginalsMode: String, CaseIterable {
         defer { lane.release() }
 
         let fileManager = FileManager.default
-        let workDir = fileManager.temporaryDirectory.appending(path: "FileConverter/\(job.id.uuidString)")
+        let workDir = fileManager.temporaryDirectory.appending(path: "ConvertAnything/\(job.id.uuidString)")
         defer { try? fileManager.removeItem(at: workDir) }
 
         do {

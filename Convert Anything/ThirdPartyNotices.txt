@@ -1,10 +1,13 @@
-Convert Everything — third-party software
+Convert Anything — license and third-party software
 
-Convert Everything includes the following open-source libraries, statically linked into the app.
-The app's own source code is at https://github.com/JayBirdZhang/convert-everything
-(MIT License). Because the full source and the build script (Scripts/build-dependencies.sh)
-are published there, you can rebuild the app against your own modified copy of LAME, as the
-GNU Library General Public License requires.
+Convert Anything is free software: copyright (C) 2026 JayBirdZhang, licensed under the GNU
+General Public License, version 3 or (at your option) any later version. Its source code is at
+https://github.com/JayBirdZhang/convert-anything
+
+It includes the following open-source libraries, statically linked into the app. Because the
+full source and the build script (Scripts/build-dependencies.sh) are published there, you can
+rebuild the app against your own modified copy of LAME, as the GNU Library General Public
+License requires.
 
 ================================================================================
 LAME 4.0 — MP3 encoder

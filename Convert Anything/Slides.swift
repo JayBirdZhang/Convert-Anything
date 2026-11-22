@@ -76,7 +76,7 @@ nonisolated enum SlideBuilder {
         do {
             return try TextlessPDF.document(for: page)
         } catch {
-            Logger(subsystem: Bundle.main.bundleIdentifier ?? "Convert Everything", category: "Slides")
+            Logger(subsystem: Bundle.main.bundleIdentifier ?? "Convert Anything", category: "Slides")
                 .notice("Page kept as a picture: \(String(describing: error), privacy: .public)")
             return nil
         }

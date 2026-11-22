@@ -10,7 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/ThirdParty"
-WORK="${TMPDIR:-/tmp}/convert-everything-deps"
+WORK="${TMPDIR:-/tmp}/convert-anything-deps"
 MIN_MACOS=14.0
 ARCHS=(arm64 x86_64)
 JOBS=$(sysctl -n hw.ncpu)

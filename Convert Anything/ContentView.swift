@@ -54,7 +54,7 @@ struct ContentView: View {
             FooterButton("Formats", symbol: "square.grid.2x2", help: "What can I convert?") { page = .formats }
             FooterButton("Settings", symbol: "gearshape") { page = .settings }
             Spacer(minLength: 0)
-            FooterButton("Quit", symbol: "power", help: "Quit Convert Everything", shortcut: "q") {
+            FooterButton("Quit", symbol: "power", help: "Quit Convert Anything", shortcut: "q") {
                 NSApplication.shared.terminate(nil)
             }
         }
