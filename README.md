@@ -59,8 +59,8 @@ Click **Formats** at the bottom of the menu to see every conversion.
 
 ## Install
 
-1. Download `Convert-Anything.zip` from the [latest release](../../releases/latest) and unzip it.
-2. Drag **Convert Anything** into your Applications folder.
+1. Download `Convert-Anything.dmg` from the [latest release](../../releases/latest) and open it.
+2. Drag **Convert Anything** onto the Applications folder in the window that opens.
 3. Open it. The first time, macOS blocks it because it isn't from the App Store:
    click **Done**, then open **System Settings → Privacy & Security**, scroll down and click
    **Open Anyway** next to "Convert Anything was blocked". You only do this once.
@@ -136,9 +136,9 @@ official source releases, fetched and checksum-verified by Homebrew.
 <summary>Making a release</summary>
 
 Bump `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`, then run `./Scripts/make-release.sh notes.html`.
-It builds the universal app and writes `build/release/Convert-Anything.zip` and a signed
-`appcast.xml`; attach both to a GitHub release tagged `v<version>`. Signing needs the Sparkle key in
-the maintainer's keychain (`generate_keys --account convert-anything`).
+It builds the universal app and writes `build/release/Convert-Anything.dmg` (the download),
+`Convert-Anything.zip` (what Sparkle installs) and a signed `appcast.xml`; attach all three to a
+GitHub release tagged `v<version>`. Signing needs the Sparkle key in the maintainer's keychain (`generate_keys --account convert-anything`).
 </details>
 
 ## License
