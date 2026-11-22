@@ -7,7 +7,7 @@
 <p align="center">
   <b>Convert any file on your Mac by renaming it.</b><br>
   Change <code>notes.md</code> to <code>notes.pdf</code>, <code>photo.heic</code> to <code>photo.jpg</code>
-  or <code>song.wav</code> to <code>song.mp3</code>, and it's converted in place.
+  or <code>presentation.pptx</code> to <code>presentation.txt</code>, and it's converted in place.
 </p>
 
 <p align="center">
