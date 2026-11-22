@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct SettingsView: View {
     @Bindable var model: AppModel
     let back: () -> Void
+    @Bindable private var updates = Updates.shared
 
     var body: some View {
         VStack(spacing: 0) {
@@ -20,6 +21,15 @@ struct SettingsView: View {
                         CardDivider()
                         SettingRow("Open at login") {
                             Toggle("Open at login", isOn: $model.launchAtLogin)
+                        }
+                    }
+                    Card(title: "Updates") {
+                        SettingRow("Check automatically", help: "Look for a new version about once a day and offer to install it.") {
+                            Toggle("Check automatically", isOn: $updates.checksAutomatically)
+                        }
+                        CardDivider()
+                        SettingRow("Version \(updates.version)") {
+                            Button("Check Now") { updates.checkNow() }
                         }
                     }
                 }

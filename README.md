@@ -18,9 +18,12 @@ Everything runs on your Mac: no uploads, no accounts.
 
 ## Install
 
-Download the latest `Convert Anything.zip` from
+Download the latest `Convert-Anything.zip` from
 [Releases](../../releases), unzip it and drag the app into Applications. It needs macOS 14 (Sonoma)
 or later and runs on Apple Silicon and Intel Macs.
+
+The app updates itself with [Sparkle](https://sparkle-project.org): about once a day it checks this
+repository's latest release and offers to install a new version (Settings → Updates).
 
 Keynote, Pages and Numbers (free from Apple) are optional: they give the best results for
 PowerPoint → PDF and Word → PDF, and Numbers is needed for Excel → PDF.
@@ -48,6 +51,13 @@ recognition) and Quick Look. Two small libraries are built into the app: LAME fo
 WebP. Word, PowerPoint and spreadsheet files are read and written directly; Keynote, Pages and Numbers
 are scripted when they're installed and give a better result.
 
+## Making a release
+
+Bump `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`, then run `./Scripts/make-release.sh notes.html`.
+It builds the universal app and writes `build/release/Convert-Anything.zip` and a signed
+`appcast.xml`; attach both to a GitHub release tagged `v<version>`. Signing needs the Sparkle key in
+the maintainer's keychain (`generate_keys --account convert-anything`).
+
 ## License
 
 Copyright (C) 2026 JayBirdZhang.
@@ -61,6 +71,6 @@ A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 In short: you may use, change and share it, even for money, but anything you distribute that is
 based on it must also be released under the GPL with its full source code.
 
-The bundled libraries keep their own licenses (LAME: LGPL 2; libwebp: BSD 3-Clause); see
+The bundled libraries keep their own licenses (LAME: LGPL 2; libwebp: BSD 3-Clause; Sparkle: MIT); see
 [ThirdPartyNotices.txt](Convert%20Anything/ThirdPartyNotices.txt). The name "Convert Anything" and
 the app icon are not covered by the license.
