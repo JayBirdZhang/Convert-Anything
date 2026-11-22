@@ -40,7 +40,7 @@ final class WelcomePanel {
         close(animated: false)
 
         let icon = Self.statusItemFrame()
-        guard let screen = icon.flatMap(Self.screen(containing:)) ?? NSScreen.main else { return }
+        guard let screen = icon.flatMap({ Self.screen(containing: $0) }) ?? NSScreen.main else { return }
         let visible = screen.visibleFrame
 
         // Where the panel goes: hanging from the icon when we can see it, else top centre of the screen.
