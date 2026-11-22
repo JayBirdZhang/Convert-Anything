@@ -20,10 +20,10 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/JayBirdZhang/convert-anything?style=for-the-badge&label=release&labelColor=1E2540&color=E8604C" alt="Latest release"></a>
-  <img src="https://img.shields.io/badge/macOS-14%2B-3B82F6?style=for-the-badge&logo=apple&logoColor=white&labelColor=1E2540" alt="macOS 14 or later">
-  <img src="https://img.shields.io/badge/chip-Apple%20silicon%20%2B%20Intel-1FA39A?style=for-the-badge&labelColor=1E2540" alt="Universal: Apple silicon and Intel">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/JayBirdZhang/convert-anything?style=for-the-badge&labelColor=1E2540&color=8B5CF6" alt="License: GPL-3.0"></a>
+  <a href="../../releases/latest"><img src="docs/badge-release.svg" height="28" alt="Release v1.2"></a>
+  <img src="docs/badge-macos.svg" height="28" alt="macOS 14 or later">
+  <img src="docs/badge-chip.svg" height="28" alt="Runs on Apple silicon and Intel">
+  <a href="LICENSE"><img src="docs/badge-license.svg" height="28" alt="License: GPL-3.0"></a>
 </p>
 
 <!-- HERO DEMO: replace docs/placeholders/demo.svg with docs/demo.gif (or paste a GitHub video URL on its own line). -->
