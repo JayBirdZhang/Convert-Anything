@@ -11,14 +11,19 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/JayBirdZhang/convert-anything?label=release" alt="Latest release"></a>
-  <img src="https://img.shields.io/badge/macOS-14%2B-blue" alt="macOS 14 or later">
-  <img src="https://img.shields.io/badge/Apple%20Silicon%20%2B%20Intel-universal-lightgrey" alt="Universal app">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/JayBirdZhang/convert-anything" alt="License: GPL-3.0"></a>
+  <a href="https://github.com/JayBirdZhang/convert-anything/releases/latest/download/Convert-Anything.dmg">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/download-dark.svg">
+      <img src="docs/download-light.svg" width="330" alt="Download Convert Anything for Mac">
+    </picture>
+  </a>
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><b>⬇&nbsp; Download for macOS</b></a>
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/JayBirdZhang/convert-anything?style=for-the-badge&label=release&labelColor=1E2540&color=E8604C" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/macOS-14%2B-3B82F6?style=for-the-badge&logo=apple&logoColor=white&labelColor=1E2540" alt="macOS 14 or later">
+  <img src="https://img.shields.io/badge/chip-Apple%20silicon%20%2B%20Intel-1FA39A?style=for-the-badge&labelColor=1E2540" alt="Universal: Apple silicon and Intel">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/JayBirdZhang/convert-anything?style=for-the-badge&labelColor=1E2540&color=8B5CF6" alt="License: GPL-3.0"></a>
 </p>
 
 <!-- HERO DEMO: replace docs/placeholders/demo.svg with docs/demo.gif (or paste a GitHub video URL on its own line). -->
