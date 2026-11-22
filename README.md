@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/icon.png" width="128" alt="Convert Anything app icon">
+  <img src="docs/icon.png" width="160" alt="Convert Anything app icon">
 </p>
 
 <h1 align="center">Convert Anything</h1>
