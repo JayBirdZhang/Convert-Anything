@@ -33,12 +33,12 @@
 
 ## Features
 
-- **Just rename.** No windows, no export dialogs. Change the extension in Finder and you're done.
-- **Lives in the menu bar.** Watches the folders you choose (Desktop, Documents and Downloads by default).
+- **Just rename it** No windows, no export dialogs. Change the extension in Finder and you're done.
+- **Lives in the menu bar** Watches the folders you choose (Desktop, Documents and Downloads by default).
 - **Private.** Everything runs on your Mac: no uploads, no accounts.
-- **Undo by renaming back.** Change the extension back to get the original.
-- **Many files at once.** Select them, right-click → Rename, and replace the extension.
-- **History by day.** Recent conversions in the menu, colour-coded by kind of file.
+- **Undo by renaming back.** Change the extension back or just ⌘ + Z to get the original.
+- **Many files at once.** Select them, right-click → Rename..., and replace the extension.
+- **History by day.** Recent conversions in the menu, color-coded by kind of file.
 - **Updates itself** with [Sparkle](https://sparkle-project.org).
 
 <p align="center">
@@ -50,12 +50,12 @@
 | Kind | Formats |
 |---|---|
 | **Images** | PNG, JPEG, HEIC, TIFF, GIF, BMP, WebP, AVIF, ICO |
-| **Documents** | PDF, Markdown (with LaTeX math), TXT, HTML, Word (.docx/.doc), RTF, ODT, Pages, PowerPoint (.pptx/.ppt), Keynote |
+| **Documents** | PDF, Markdown, TXT, HTML, Word (.docx/.doc), RTF, ODT, Pages, PowerPoint (.pptx/.ppt), Keynote |
 | **Spreadsheets** | Excel (.xlsx/.xls), CSV, Numbers |
 | **Audio** | MP3, WAV, M4A, AAC, FLAC, Ogg, Opus, AIFF |
 | **Video** | MP4, MOV, M4V, and video → GIF |
 
-Click **Formats** at the bottom of the menu to see every conversion.
+Click **Formats** at the bottom of the menu to see every conversion. (Pretty much anything you can think of is convertible)
 
 <!-- FORMATS SCREENSHOT: replace docs/placeholders/formats.svg with docs/formats.png -->
 <p align="center">
@@ -65,10 +65,10 @@ Click **Formats** at the bottom of the menu to see every conversion.
 ## Install
 
 1. Download `Convert-Anything.dmg` from the [latest release](../../releases/latest) and open it.
-2. Drag **Convert Anything** onto the Applications folder in the window that opens.
-3. Open it. The first time, macOS blocks it because it isn't from the App Store:
-   click **Done**, then open **System Settings → Privacy & Security**, scroll down and click
-   **Open Anyway** next to "Convert Anything was blocked". You only do this once.
+2. Drag **Convert Anything** into the Applications folder.
+3. Open the app. MacOS blocks it when you first open it because it isn't from the App Store.
+   Click **Done**, then open **System Settings → Privacy & Security**, scroll down and click
+   **Open Anyway** next to "Convert Anything was blocked". You only need to do this once.
 
 <details>
 <summary>No "Open Anyway" button?</summary>
@@ -95,13 +95,15 @@ Requires macOS 14 (Sonoma) or later, on Apple Silicon or Intel.
 
 Allow notifications when asked, and turn on **Open at login** if you want it always running.
 
+Hint: To convert multiple files at once, select them, right-click → Rename..., and replace the extension.
+
 ## FAQ
 
 **Do my files leave my Mac?**
-No. Conversions use macOS's own frameworks plus two small bundled libraries. Nothing is uploaded.
+No. Conversions use macOS's own frameworks plus two small bundled libraries and are all offline. Nothing is uploaded.
 
 **Do I need Microsoft Office?**
-No. Keynote, Pages and Numbers (free from Apple) are optional: they give the best results for
+No. Keynote, Pages and Numbers (free from Apple) are optional but give the best results for
 PowerPoint → PDF and Word → PDF, and Numbers is needed for Excel → PDF. The first time the app uses
 one, macOS asks for permission to control it: click **OK**.
 
@@ -113,38 +115,6 @@ Turn that off, or check now, under **Settings → Updates**.
 <p align="center">
   <img src="docs/placeholders/settings.svg" width="560" alt="Settings: watched folders, open at login and updates">
 </p>
-
-## How it works
-
-Most conversions use macOS's own frameworks: ImageIO, PDFKit, AVFoundation, WebKit, Vision (text
-recognition) and Quick Look. Two small libraries are built into the app: LAME for MP3 and libwebp for
-WebP. Word, PowerPoint and spreadsheet files are read and written directly; Keynote, Pages and Numbers
-are scripted when they're installed and give a better result.
-
-## Build from source
-
-Requirements: Xcode 26 or later, Homebrew on an Apple Silicon Mac, and Rosetta
-(`softwareupdate --install-rosetta`) to build the Intel half of the libraries.
-
-```bash
-git clone https://github.com/JayBirdZhang/convert-anything.git
-cd convert-anything
-./Scripts/build-dependencies.sh     # builds LAME and libwebp into ThirdParty/ (about a minute)
-open "Convert Anything.xcodeproj"
-```
-
-In Xcode, choose your own team under *Signing & Capabilities* (and, if you like, your own bundle
-identifier), then build and run. `ThirdParty/` is not checked in; the script makes it from the
-official source releases, fetched and checksum-verified by Homebrew.
-
-<details>
-<summary>Making a release</summary>
-
-Bump `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`, then run `./Scripts/make-release.sh notes.html`.
-It builds the universal app and writes `build/release/Convert-Anything.dmg` (the download),
-`Convert-Anything.zip` (what Sparkle installs) and a signed `appcast.xml`; attach all three to a
-GitHub release tagged `v<version>`. Signing needs the Sparkle key in the maintainer's keychain (`generate_keys --account convert-anything`).
-</details>
 
 ## License
 
