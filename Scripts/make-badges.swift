@@ -20,10 +20,10 @@ func width(_ s: String, bold: Bool) -> CGFloat {
 }
 
 let badges: [(file: String, label: String, value: String, color: String)] = [
-    ("release", "release", "v\(version)", "#E8604C"),
+    ("release", "Release", "v\(version)", "#E8604C"),
     ("macos", "macOS", minMacOS, "#3B82F6"),
-    ("chip", "runs on", "Apple silicon + Intel", "#1FA39A"),
-    ("license", "license", "GPL-3.0", "#8B5CF6"),
+    ("chip", "Runs On", "Apple Silicon + Intel", "#1FA39A"),
+    ("license", "License", "GPL-3.0", "#8B5CF6"),
 ]
 let pad: CGFloat = 11, height = 28
 let fontStack = "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif"

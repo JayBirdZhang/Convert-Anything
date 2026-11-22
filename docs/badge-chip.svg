@@ -1,12 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="215" height="28" viewBox="0 0 215 28">
-  <title>Runs on: Apple silicon + Intel</title>
-  <clipPath id="r"><rect width="215" height="28" rx="2"/></clipPath>
+<svg xmlns="http://www.w3.org/2000/svg" width="223" height="28" viewBox="0 0 223 28">
+  <title>Runs On: Apple Silicon + Intel</title>
+  <clipPath id="r"><rect width="223" height="28" rx="2"/></clipPath>
   <g clip-path="url(#r)">
-    <rect width="69" height="28" fill="#1E2540"/>
-    <rect x="69" width="146" height="28" fill="#1FA39A"/>
+    <rect width="75" height="28" fill="#1E2540"/>
+    <rect x="75" width="148" height="28" fill="#1FA39A"/>
   </g>
   <g font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#fff">
-    <text x="11" y="18.5" fill-opacity="0.82" textLength="47" lengthAdjust="spacingAndGlyphs">runs on</text>
-    <text x="80" y="18.5" font-weight="600" textLength="124" lengthAdjust="spacingAndGlyphs">Apple silicon + Intel</text>
+    <text x="11" y="18.5" fill-opacity="0.82" textLength="53" lengthAdjust="spacingAndGlyphs">Runs On</text>
+    <text x="86" y="18.5" font-weight="600" textLength="126" lengthAdjust="spacingAndGlyphs">Apple Silicon + Intel</text>
   </g>
 </svg>

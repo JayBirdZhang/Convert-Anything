@@ -22,7 +22,7 @@
 <p align="center">
   <a href="../../releases/latest"><img src="docs/badge-release.svg" height="28" alt="Release v1.2"></a>
   <img src="docs/badge-macos.svg" height="28" alt="macOS 14 or later">
-  <img src="docs/badge-chip.svg" height="28" alt="Runs on Apple silicon and Intel">
+  <img src="docs/badge-chip.svg" height="28" alt="Runs on Apple Silicon and Intel">
   <a href="LICENSE"><img src="docs/badge-license.svg" height="28" alt="License: GPL-3.0"></a>
 </p>
 
