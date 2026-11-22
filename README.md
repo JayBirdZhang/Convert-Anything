@@ -33,9 +33,9 @@
 
 ## Features
 
-- **Just rename it** No windows, no export dialogs. Change the extension in Finder and you're done.
+- **Just rename it.** That's all you have to do to convert a file.
 - **Lives in the menu bar** Watches the folders you choose (Desktop, Documents and Downloads by default).
-- **Private.** Everything runs on your Mac: no uploads, no accounts.
+- **Private.** Everything runs on your Mac: no uploads, no accounts, all offline.
 - **Undo by renaming back.** Change the extension back or just ⌘ + Z to get the original.
 - **Many files at once.** Select them, right-click → Rename..., and replace the extension.
 - **History by day.** Recent conversions in the menu, color-coded by kind of file.
