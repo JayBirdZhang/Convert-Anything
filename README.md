@@ -26,24 +26,15 @@
   <a href="LICENSE"><img src="docs/badge-license.svg" height="28" alt="License: GPL-3.0"></a>
 </p>
 
-<!-- HERO DEMO: replace docs/placeholders/demo.svg with docs/demo.gif (or paste a GitHub video URL on its own line). -->
-<p align="center">
-  <img src="docs/placeholders/demo.svg" width="720" alt="Renaming notes.md to notes.pdf in Finder converts the file">
-</p>
-
 ## Features
 
 - **Just rename it.** That's all you have to do to convert a file.
-- **Lives in the menu bar** Watches the folders you choose (Desktop, Documents and Downloads by default).
+- **Lives in the menu bar.** Watches the folders you choose (Desktop, Documents and Downloads by default).
 - **Private.** Everything runs on your Mac: no uploads, no accounts, all offline.
 - **Undo by renaming back.** Change the extension back or just ⌘ + Z to get the original.
 - **Many files at once.** Select them, right-click → Rename..., and replace the extension.
 - **History by day.** Recent conversions in the menu, color-coded by kind of file.
 - **Updates itself** with [Sparkle](https://sparkle-project.org).
-
-<p align="center">
-  <img src="docs/screenshot.png" width="340" alt="The Convert Anything menu: recent conversions grouped by day">
-</p>
 
 ## Supported formats
 
@@ -55,12 +46,7 @@
 | **Audio** | MP3, WAV, M4A, AAC, FLAC, Ogg, Opus, AIFF |
 | **Video** | MP4, MOV, M4V, and video → GIF |
 
-Click **Formats** at the bottom of the menu to see every conversion. (Pretty much anything you can think of is convertible)
-
-<!-- FORMATS SCREENSHOT: replace docs/placeholders/formats.svg with docs/formats.png -->
-<p align="center">
-  <img src="docs/placeholders/formats.svg" width="560" alt="The Formats window listing every conversion">
-</p>
+Click **Formats** at the bottom of the menu to see every conversion. (Pretty much anything you can think of is convertible.)
 
 ## Install
 
@@ -69,6 +55,18 @@ Click **Formats** at the bottom of the menu to see every conversion. (Pretty muc
 3. Open the app. MacOS blocks it when you first open it because it isn't from the App Store.
    Click **Done**, then open **System Settings → Privacy & Security**, scroll down and click
    **Open Anyway** next to "Convert Anything was blocked". You only need to do this once.
+
+   <p align="center">
+     <img src="docs/open-anyway.gif" width="680" alt="Opening Convert Anything the first time: System Settings → Privacy &amp; Security → Open Anyway">
+   </p>
+
+4. Turn off Finder's extension warning so renaming converts straight away. Otherwise Finder asks
+   "Are you sure you want to change the extension?" every time you rename a file.
+   Open **Finder → Settings → Advanced** and uncheck **Show warning before changing an extension**.
+
+   <p align="center">
+     <img src="docs/finder.gif" width="680" alt="Finder Settings → Advanced: unchecking Show warning before changing an extension">
+   </p>
 
 <details>
 <summary>No "Open Anyway" button?</summary>
@@ -88,11 +86,6 @@ Requires macOS 14 (Sonoma) or later, on Apple Silicon or Intel.
 2. In a watched folder, rename a file to the extension you want, for example `report.docx` → `report.pdf`.
 3. The converted file appears in place and shows up in the menu's history.
 
-<!-- BATCH DEMO: replace docs/placeholders/batch.svg with docs/batch.gif -->
-<p align="center">
-  <img src="docs/placeholders/batch.svg" width="720" alt="Renaming many files at once converts them all">
-</p>
-
 Allow notifications when asked, and turn on **Open at login** if you want it always running.
 
 Hint: To convert multiple files at once, select them, right-click → Rename..., and replace the extension.
@@ -110,11 +103,6 @@ one, macOS asks for permission to control it: click **OK**.
 **How do updates work?**
 About once a day the app checks this repository's latest release and offers to install it.
 Turn that off, or check now, under **Settings → Updates**.
-
-<!-- SETTINGS SCREENSHOT: replace docs/placeholders/settings.svg with docs/settings.png -->
-<p align="center">
-  <img src="docs/placeholders/settings.svg" width="560" alt="Settings: watched folders, open at login and updates">
-</p>
 
 ## License
 
