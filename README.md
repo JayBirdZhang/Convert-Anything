@@ -1,3 +1,5 @@
+
+
 <p align="center">
   <img src="docs/icon.png" width="160" alt="Convert Anything app icon">
 </p>
@@ -26,9 +28,7 @@
   <a href="LICENSE"><img src="docs/badge-license.svg" height="28" alt="License: GPL-3.0"></a>
 </p>
 
-<p align="center">
-  <img src="docs/demo.gif" width="760" alt="Renaming notes.md to notes.pdf on the desktop converts it in place">
-</p>
+https://github.com/user-attachments/assets/cd589974-3f86-4b3d-a146-ac4dc21ce3fd
 
 ## Features
 
