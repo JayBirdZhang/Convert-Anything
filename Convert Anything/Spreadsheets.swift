@@ -12,13 +12,8 @@ nonisolated enum Spreadsheets {
 
     /// One sheet becomes one CSV file; several become a folder with a CSV per sheet.
     static func xlsxToCSV(_ request: Converter.Request, output: URL) async throws -> URL {
-        let package = request.workDir.appending(path: "xlsx")
-        try await Tools.run("/usr/bin/unzip", ["-q", "-o", request.input.path, "-d", package.path])
-        // Parsing a big workbook takes a while; keep it off the main thread.
+        let sheets = try await sheets(of: request)
         return try await background {
-            let sheets = try read(package).filter { !$0.rows.isEmpty }
-            guard !sheets.isEmpty else { throw ConversionError.failed("This spreadsheet is empty.") }
-
             if sheets.count == 1 {
                 try csv(sheets[0].rows).write(to: output, atomically: true, encoding: .utf8)
                 return output
@@ -30,6 +25,26 @@ nonisolated enum Spreadsheets {
                 try csv(sheet.rows).write(to: folder.appending(path: name), atomically: true, encoding: .utf8)
             }
             return folder
+        }
+    }
+
+    /// Unpacks the workbook and reads its sheets, leaving out empty ones.
+    static func sheets(of request: Converter.Request) async throws -> [Sheet] {
+        let package = request.workDir.appending(path: "xlsx")
+        try await Tools.run("/usr/bin/unzip", ["-q", "-o", request.input.path, "-d", package.path])
+        // Parsing a big workbook takes a while; keep it off the main thread.
+        return try await background {
+            let sheets = try read(package).filter { !$0.rows.isEmpty }
+            guard !sheets.isEmpty else { throw ConversionError.failed("This spreadsheet is empty.") }
+            return sheets
+        }
+    }
+
+    /// Conversions that need no other app, so they can run alongside each other.
+    static func runsWithoutNumbers(from: Format, to: Format) -> Bool {
+        switch (from, to) {
+        case (.xlsx, .csv), (.csv, .xlsx), (.csv, .json), (.xlsx, .json), (.json, .csv), (.json, .xlsx): true
+        default: false
         }
     }
 
@@ -70,6 +85,11 @@ nonisolated enum Spreadsheets {
             guard !rows.isEmpty else { throw ConversionError.failed("This CSV file is empty.") }
             return sheetXML(rows)
         }
+        try await writeXLSX(sheetXML: sheet, request: request, output: output)
+    }
+
+    /// Wraps a worksheet in the rest of an .xlsx package and zips it.
+    static func writeXLSX(sheetXML sheet: Data, request: Converter.Request, output: URL) async throws {
         let package = request.workDir.appending(path: "xlsx-out")
         let fileManager = FileManager.default
         for dir in ["_rels", "xl/_rels", "xl/worksheets"] {
@@ -121,7 +141,7 @@ nonisolated enum Spreadsheets {
     }
 
     /// The worksheet part, built as UTF-8 bytes directly (a big sheet is tens of megabytes of XML).
-    private static func sheetXML(_ rows: [[String]]) -> Data {
+    static func sheetXML(_ rows: [[String]]) -> Data {
         var out: [UInt8] = []
         out.reserveCapacity(rows.count * (rows[0].count * 40 + 16))
         func add(_ text: StaticString) { text.withUTF8Buffer { out.append(contentsOf: $0) } }
@@ -162,12 +182,13 @@ nonisolated enum Spreadsheets {
     }
 
     /// Plain numbers only: "007", "1,000" and "+5" stay text, as a spreadsheet would show them.
-    /// Matches -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)? in under 16 characters (a regex here was the slowest step).
-    private static func isNumber(_ value: String) -> Bool {
+    /// Matches -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)? (a regex here was the slowest step). Whole numbers
+    /// stop at 15 digits, so long IDs keep every digit as text; decimals may be longer, as in 0.14285714285714285.
+    static func isNumber(_ value: String) -> Bool {
         var value = value
         return value.withUTF8 { b in
             let n = b.count
-            guard n > 0, n < 16 else { return false }
+            guard n > 0, n < 40 else { return false }
             var i = 0
             func digits() -> Int {
                 let start = i
@@ -177,13 +198,15 @@ nonisolated enum Spreadsheets {
             if b[i] == 45 { i += 1 }
             guard i < n else { return false }
             if b[i] == 48 { i += 1 } else if digits() == 0 { return false }
-            if i < n, b[i] == 46 { i += 1; if digits() == 0 { return false } }
+            var isWhole = true
+            if i < n, b[i] == 46 { i += 1; isWhole = false; if digits() == 0 { return false } }
             if i < n, b[i] == 69 || b[i] == 101 {
                 i += 1
+                isWhole = false
                 if i < n, b[i] == 43 || b[i] == 45 { i += 1 }
                 if digits() == 0 { return false }
             }
-            return i == n
+            return i == n && (n < 16 || !isWhole)
         }
     }
 

@@ -8,7 +8,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     // Documents (including presentations)
     case pdf, md, txt, html, docx, doc, rtf, odt, pages, pptx, ppt, key
     // Spreadsheets
-    case xlsx, xls, csv, numbers
+    case xlsx, xls, csv, numbers, json
     // Audio
     case mp3, wav, m4a, aac, flac, ogg, opus, aiff
     // Video
@@ -37,15 +37,16 @@ nonisolated enum Format: String, CaseIterable, Sendable {
         case .png, .jpeg, .heic, .tiff, .gif, .bmp, .webp, .avif, .ico,
              .cr2, .cr3, .nef, .arw, .dng, .raf, .orf, .rw2, .pef, .srw, .psd, .svg, .jxl, .tga, .icns: .image
         case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .pptx, .ppt, .key: .document
-        case .xlsx, .xls, .csv, .numbers: .spreadsheet
+        case .xlsx, .xls, .csv, .numbers, .json: .spreadsheet
         case .mp3, .wav, .m4a, .aac, .flac, .ogg, .opus, .aiff: .audio
         case .mp4, .mov, .m4v: .video
         }
     }
 
     /// Plain-text formats can't be told apart by their bytes, so for these
-    /// we trust the file's old extension instead.
-    var isPlainText: Bool { [.md, .txt, .html, .csv].contains(self) }
+    /// we trust the file's old extension instead. (JSON is deliberately not sniffed: a .txt or .md file that
+    /// happens to start with "[" must not turn into a JSON source.)
+    var isPlainText: Bool { [.md, .txt, .html, .csv, .json].contains(self) }
 
     /// Camera RAW files. Most share TIFF's first bytes, so their old extension says which one they are.
     var isRaw: Bool { [.cr2, .cr3, .nef, .arw, .dng, .raf, .orf, .rw2, .pef, .srw].contains(self) }
@@ -178,6 +179,16 @@ nonisolated enum Sniffer {
     private static func looksLikeTGA(_ b: [UInt8]) -> Bool {
         guard b.count >= 18, b[1] <= 1, [1, 2, 3, 9, 10, 11].contains(b[2]), [8, 15, 16, 24, 32].contains(b[16]) else { return false }
         return b[12] | b[13] != 0 && b[14] | b[15] != 0   // Width and height aren't zero
+    }
+
+    /// Whether a text file's first character is `{` or `[`. Used only to recognize JSON that was saved with a
+    /// different extension, never to decide a file's format on its own.
+    static func looksLikeJSON(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        let head = (try? handle.read(upToCount: 64)) ?? Data()
+        let first = head.drop { [0x20, 0x09, 0x0A, 0x0D].contains($0) }.first ?? 0
+        return first == UInt8(ascii: "{") || first == UInt8(ascii: "[")
     }
 
     /// Old Word, Excel and PowerPoint files share one container format; the name of the main stream

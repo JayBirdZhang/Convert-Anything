@@ -224,6 +224,8 @@ enum OriginalsMode: String, CaseIterable {
         }
         guard oldFormat != newFormat else { return }   // Includes harmless renames like .jpg → .jpeg
 
+        // A text file renamed to .json is only fixing its extension when it really holds JSON.
+        if newFormat == .json && oldFormat == .txt && Sniffer.looksLikeJSON(newURL) { return }
         guard let source = sourceFormat(of: newURL, oldFormat: oldFormat) else { return }
         // Already in the new format: the rename just fixed a wrong extension.
         guard source != newFormat else { return }
