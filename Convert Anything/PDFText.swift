@@ -15,6 +15,7 @@ nonisolated struct TextLine {
     var frame: CGRect       // Page points, origin at the top left of the visible page
     var runs: [TextRun]
     var fontSize: CGFloat
+    var isFormField = false     // What's typed into a form field, rather than the page's own text
 }
 
 /// Lines that belong together (a paragraph, a title), so they become one editable text box.
@@ -34,48 +35,111 @@ nonisolated enum PDFText {
     /// Every line of text on the page, top to bottom, with its position and styling.
     static func lines(on page: PDFPage) -> [TextLine] {
         let crop = page.bounds(for: .cropBox)
-        guard let selection = page.selection(for: crop) else { return [] }
-
         var lines: [TextLine] = []
-        for lineSelection in selection.selectionsByLine() {
+        for lineSelection in page.selection(for: crop)?.selectionsByLine() ?? [] {
             guard let attributed = lineSelection.attributedString else { continue }
             let bounds = lineSelection.bounds(for: page)
-            let runs = styledRuns(attributed, lineHeight: bounds.height)
+            let runs = styledRuns(attributed, lineHeight: bounds.height, page: page, selection: lineSelection)
             guard !runs.isEmpty else { continue }
             lines.append(TextLine(
                 frame: CGRect(x: bounds.minX - crop.minX, y: crop.maxY - bounds.maxY, width: bounds.width, height: bounds.height),
                 runs: runs,
                 fontSize: runs.map(\.size).max() ?? 12))
         }
+        return lines + formLines(on: page, crop: crop)
+    }
+
+    /// What's typed into the page's form fields, or onto it as text boxes (Preview's Text tool). It's drawn
+    /// by annotations, not the page, so it isn't in the page's text, and the copies of the page made
+    /// without text leave it out too (see TextlessPDF.skipped).
+    private static func formLines(on page: PDFPage, crop: CGRect) -> [TextLine] {
+        var lines: [TextLine] = []
+        for field in page.annotations where field.shouldDisplay {
+            let typed: String?
+            switch field.type {
+            case "Widget": typed = field.widgetFieldType == .text ? field.widgetStringValue : nil
+            case "FreeText": typed = field.contents
+            default: typed = nil
+            }
+            let value = typed?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !value.isEmpty else { continue }
+            let box = field.bounds
+            let rows = value.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            // A size of 0 means "fit the field".
+            let fitted = min(12, box.height * 0.7 / CGFloat(max(1, rows.count)))
+            let size = field.font.map { $0.pointSize > 0 ? $0.pointSize : fitted } ?? fitted
+            let font = NSFont(name: field.font?.fontName ?? "Helvetica", size: size) ?? NSFont.systemFont(ofSize: size)
+            let family = font.familyName ?? "Helvetica"
+            let traits = font.fontDescriptor.symbolicTraits
+            let height = size * 1.2
+            // Single-line fields center their text; a multiline one, and a text box, start at the top.
+            var top = rows.count == 1 && field.type == "Widget" ? crop.maxY - box.midY - height / 2 : crop.maxY - box.maxY + 2
+            for row in rows {
+                let width = min(box.width - 4, (row as NSString).size(withAttributes: [.font: font]).width)
+                var left = box.minX + 2
+                if field.alignment == .center { left = box.midX - width / 2 } else if field.alignment == .right { left = box.maxX - 2 - width }
+                lines.append(TextLine(
+                    frame: CGRect(x: left - crop.minX, y: top, width: max(1, width), height: height),
+                    runs: [TextRun(text: row, font: family, size: size, bold: traits.contains(.bold), italic: traits.contains(.italic),
+                                   color: field.fontColor.flatMap(hex))],
+                    fontSize: size, isFormField: true))
+                top += height
+            }
+        }
         return lines
     }
 
-    static func styledRuns(_ attributed: NSAttributedString, lineHeight: CGFloat) -> [TextRun] {
+    /// The line's text as styled runs. With its `page` and `selection`, fonts PDFKit doesn't know come from
+    /// the PDF itself (see PageFonts) and broken ligatures are repaired.
+    static func styledRuns(_ attributed: NSAttributedString, lineHeight: CGFloat,
+                           page: PDFPage? = nil, selection: PDFSelection? = nil) -> [TextRun] {
         var runs: [TextRun] = []
         let string = attributed.string as NSString
-        attributed.enumerateAttributes(in: NSRange(location: 0, length: attributed.length)) { attributes, range, _ in
-            let text = cleaned(string.substring(with: range))
-            guard !text.isEmpty else { return }
+        // Where this text is among the page's characters, to look up the PDF's own fonts.
+        var pageFonts: (fonts: PageFonts, start: Int)?
+        if let page, let selection, let fonts = PageFonts.of(page), selection.numberOfTextRanges(on: page) == 1 {
+            let range = selection.range(at: 0, on: page)
+            // The range may also hold the line break, which the text doesn't.
+            if range.length == attributed.length || range.length == attributed.length + 1 { pageFonts = (fonts, range.location) }
+        }
+        let document = page?.document
 
+        attributed.enumerateAttributes(in: NSRange(location: 0, length: attributed.length)) { attributes, range, _ in
             let font = attributes[.font] as? NSFont
             let name = (font?.fontName ?? "").lowercased()
             let traits = font.map { NSFontManager.shared.traits(of: $0) } ?? []
             var family = font?.familyName ?? "Helvetica"
             if let plus = family.firstIndex(of: "+") { family = String(family[family.index(after: plus)...]) }  // Embedded subsets: "ABCDEF+Calibri"
+            let bold = traits.contains(.boldFontMask) || ["bold", "black", "heavy", "semibold"].contains { name.contains($0) }
+            let italic = traits.contains(.italicFontMask) || name.contains("italic") || name.contains("oblique")
+            let color = (attributes[.foregroundColor] as? NSColor).flatMap(hex)
 
-            let run = TextRun(
-                text: text,
-                font: family,
-                size: font?.pointSize ?? lineHeight * 0.8,
-                bold: traits.contains(.boldFontMask) || ["bold", "black", "heavy", "semibold"].contains { name.contains($0) },
-                italic: traits.contains(.italicFontMask) || name.contains("italic") || name.contains("oblique"),
-                color: (attributes[.foregroundColor] as? NSColor).flatMap(hex))
-            if let last = runs.last, last.font == run.font, last.size == run.size, last.bold == run.bold,
-               last.italic == run.italic, last.color == run.color {
-                runs[runs.count - 1].text += text
-            } else {
-                runs.append(run)
+            let pieces = pageFonts?.fonts.pieces(in: NSRange(location: pageFonts!.start + range.location, length: range.length))
+                ?? [(0, nil)]
+            for (number, piece) in pieces.enumerated() {
+                let end = number + 1 < pieces.count ? pieces[number + 1].offset : range.length
+                let text = cleaned(string.substring(with: NSRange(location: range.location + piece.offset, length: end - piece.offset)))
+                guard !text.isEmpty else { continue }
+                let real = piece.font
+                let run = TextRun(
+                    text: text,
+                    font: real?.family ?? family,
+                    size: font?.pointSize ?? lineHeight * 0.8,
+                    bold: real?.bold ?? bold,
+                    italic: real?.italic ?? italic,
+                    color: color)
+                if let last = runs.last, last.font == run.font, last.size == run.size, last.bold == run.bold,
+                   last.italic == run.italic, last.color == run.color {
+                    runs[runs.count - 1].text += text
+                } else {
+                    runs.append(run)
+                }
             }
+        }
+        // After joining, so words split between PDF runs are whole.
+        for i in runs.indices {
+            let run = runs[i]
+            runs[i].text = Ligatures.repair(run.text, font: "\(run.font)\(run.bold ? "-b" : "")\(run.italic ? "-i" : "")", document: document)
         }
         // Drop lines that are only whitespace.
         return runs.contains { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty } ? runs : []

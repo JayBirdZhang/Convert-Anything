@@ -17,7 +17,10 @@ import PDFKit
 nonisolated enum SlideLayers {
     struct Picture {
         var frame: CGRect       // Page points, origin at the top left of the visible page
-        var image: CGImage
+        var image: CGImage?     // A picture of it, cut from the page's drawing (or the photo's own pixels)
+        var jpeg: Data? = nil   // Or, for a photo drawn plainly, its own JPEG file
+        var shape: TextlessPDF.Shape? = nil     // Or a simple shape, rebuilt as one (page points from the top left)
+        var hasImage = false    // Shows a photo (rather than only shapes: a chart, a diagram)
     }
 
     struct Layers {
@@ -34,7 +37,6 @@ nonisolated enum SlideLayers {
     static func split(_ page: PDFPage, scale: CGFloat) throws -> Layers? {
         guard let source = page.pageRef else { return nil }
         let crop = page.bounds(for: .cropBox)
-        let pageArea = crop.width * crop.height
         let steps = try TextlessPDF.paintedAreas(on: source)
         let areas = steps.map { step -> CGRect? in
             let visible = step.area.intersection(crop)
@@ -42,25 +44,7 @@ nonisolated enum SlideLayers {
             return CGRect(x: visible.minX - crop.minX, y: crop.maxY - visible.maxY, width: visible.width, height: visible.height)
         }
 
-        var foreground: [Int] = []
-        var bands: [Int] = []
-        for (index, area) in areas.enumerated() {
-            guard let area else { continue }
-            if area.width * area.height >= pageArea * 0.75 {
-                // Something covering the page goes behind everything drawn before it too, so nothing
-                // that was under it ends up on top.
-                foreground.removeAll()
-                bands.removeAll()
-            } else if foreground.isEmpty && (area.width >= crop.width * 0.9 || area.height >= crop.height * 0.9) {
-                bands.append(index)
-            } else {
-                foreground.append(index)
-            }
-        }
-        // Leading bands are a background only when together they fill most of the page (a gradient
-        // drawn as strips); a lone rule or a striped table's first rows stay things of their own.
-        let banded = bands.reduce(CGRect.null) { $0.union(areas[$1]!) }
-        if !bands.isEmpty && banded.width * banded.height < pageArea * 0.5 { foreground = bands + foreground }
+        let foreground = foregroundSteps(areas, crop: crop)
         guard !foreground.isEmpty, foreground.count <= maxSteps else { return nil }
 
         // Group nearby steps; when that leaves too many pieces (a map or a diagram drawn as many small
@@ -97,19 +81,101 @@ nonisolated enum SlideLayers {
         for index in foreground where seen.insert(groupOf[index]!).inserted { order.append(groupOf[index]!) }
         var withImages = Set<Int>()
         for (position, part) in parts.enumerated() where part.isImage { withImages.insert(groups.member[position]) }
+        // Groups that are a single drawing step: a photo drawn plainly is embedded at its own resolution.
+        var members = [Int](repeating: 0, count: groups.frames.count), only = [Int: Int]()
+        for (position, index) in foreground.enumerated() { members[groups.member[position]] += 1; only[groups.member[position]] = index }
         var layers = Layers(background: background.flatMap { isWhite($0) ? nil : $0 }, pictures: [])
         for id in order {
+            if members[id] == 1, let index = only[id], let name = steps[index].plainImage,
+               crop.insetBy(dx: -0.01, dy: -0.01).contains(steps[index].area),
+               let picture = nativePicture(name, placed: steps[index].area, on: source, crop: crop, scale: scale),
+               drawing.showsAnything(in: picture.frame) {
+                layers.pictures.append(picture)
+                continue
+            }
+            // A lone line, box or circle becomes a real shape.
+            if members[id] == 1, let index = only[id], var shape = steps[index].shape,
+               crop.insetBy(dx: -0.01, dy: -0.01).contains(steps[index].area) {
+                func flip(_ point: CGPoint) -> CGPoint { CGPoint(x: point.x - crop.minX, y: crop.maxY - point.y) }
+                shape.bounds = CGRect(x: shape.bounds.minX - crop.minX, y: crop.maxY - shape.bounds.maxY, width: shape.bounds.width, height: shape.bounds.height)
+                if case .line(let from, let to) = shape.kind { shape.kind = .line(flip(from), flip(to)) }
+                if isDrawn(shape, in: drawing) {
+                    layers.pictures.append(Picture(frame: groups.frames[id], image: nil, shape: shape))
+                    continue
+                }
+            }
             let box = groups.frames[id].insetBy(dx: -1, dy: -1)
             guard let pixels = drawing.shownPixels(in: box) else { continue }
             if !withImages.contains(id), let table = SlideTable.detect(in: pixels, of: drawing, page: page) {
                 layers.tables.append(table)
             } else if let image = drawing.image.cropping(to: pixels) {
                 layers.pictures.append(Picture(frame: CGRect(x: pixels.minX / scale, y: pixels.minY / scale,
-                                                             width: pixels.width / scale, height: pixels.height / scale), image: image))
+                                                             width: pixels.width / scale, height: pixels.height / scale),
+                                               image: image, hasImage: withImages.contains(id)))
             }
         }
         guard !layers.pictures.isEmpty || !layers.tables.isEmpty else { return nil }
         return layers
+    }
+
+    /// Whether the drawing shows the shape in its colors where it should be: its fill in the middle, its
+    /// outline at the middle of a line or of the top edge. Catches a shape in a hidden layer, and a color
+    /// space that isn't the standard RGB the colors were taken as.
+    private static func isDrawn(_ shape: TextlessPDF.Shape, in drawing: ClearDrawing) -> Bool {
+        func shows(_ color: UInt32, at point: CGPoint) -> Bool {
+            let (red, green, blue) = (Int(color >> 16), Int(color >> 8 & 255), Int(color & 255))
+            return drawing.pixel(near: point) { r, g, b, alpha in
+                alpha >= 48 && abs(r - red) <= 10 && abs(g - green) <= 10 && abs(b - blue) <= 10
+            }
+        }
+        let box = shape.bounds
+        if let fill = shape.fill, !shows(fill, at: CGPoint(x: box.midX, y: box.midY)) { return false }
+        if let stroke = shape.stroke {
+            let point: CGPoint
+            if case .line(let from, let to) = shape.kind { point = CGPoint(x: (from.x + to.x) / 2, y: (from.y + to.y) / 2) }
+            else { point = CGPoint(x: box.midX, y: box.minY) }
+            if !shows(stroke, at: point) { return false }
+        }
+        return true
+    }
+
+    /// A photo the page draws plainly (see `TextlessPDF.Step.plainImage`), taken from the PDF itself rather
+    /// than from a picture of the page: sharper when it has more pixels than the page picture would give it,
+    /// and when it's a JPEG, embedded as it is. Up to twice the page picture's sharpness, or 3000 pixels
+    /// (whichever is more, so it's never less sharp than the page picture).
+    private static func nativePicture(_ name: String, placed: CGRect, on page: CGPDFPage, crop: CGRect, scale: CGFloat) -> Picture? {
+        let rendered = Int((max(placed.width, placed.height) * scale).rounded(.up))
+        let maxPixels = max(min(3000, rendered * 2), rendered)
+        guard rendered > 0, let native = TextlessPDF.image(named: name, on: page, maxPixels: maxPixels, minPixels: rendered + rendered / 20) else { return nil }
+        let frame = CGRect(x: placed.minX - crop.minX, y: crop.maxY - placed.maxY, width: placed.width, height: placed.height)
+        switch native {
+        case .jpeg(let data): return Picture(frame: frame, image: nil, jpeg: data, hasImage: true)
+        case .image(let image): return Picture(frame: frame, image: image, hasImage: true)
+        }
+    }
+
+    /// The steps that aren't the page's background, in drawing order. Steps that cover most of the page
+    /// (a background color or full-page photo) are background, and so is everything drawn before one. So
+    /// are full-width or full-height bands drawn before anything else, when together they fill most of the
+    /// page (a gradient drawn as strips); a header bar, a lone rule or a striped table's first rows stay
+    /// things of their own.
+    private static func foregroundSteps(_ areas: [CGRect?], crop: CGRect) -> [Int] {
+        let pageArea = crop.width * crop.height
+        var foreground: [Int] = []
+        var bands: [Int] = []
+        for (index, area) in areas.enumerated() {
+            guard let area else { continue }
+            if area.width * area.height >= pageArea * 0.75 {
+                foreground.removeAll()
+                bands.removeAll()
+            } else if foreground.isEmpty && (area.width >= crop.width * 0.9 || area.height >= crop.height * 0.9) {
+                bands.append(index)
+            } else {
+                foreground.append(index)
+            }
+        }
+        let banded = bands.reduce(0) { $0 + areas[$1]!.width * areas[$1]!.height }
+        return !bands.isEmpty && banded < pageArea * 0.5 ? bands + foreground : foreground
     }
 
     /// Which group each area belongs to (an index into `frames`), and each group's box. Areas closer than
@@ -220,6 +286,32 @@ nonisolated final class ClearDrawing {
         pixels = UnsafePointer(data.bindMemory(to: UInt8.self, capacity: width * height * 4))
     }
 
+    /// Whether the drawing shows something at a few points spread over `box` (page points from the top
+    /// left): false for something that's drawn but hidden (in a layer that's off).
+    func showsAnything(in box: CGRect) -> Bool {
+        [(0.5, 0.5), (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)].contains { fx, fy in
+            pixel(near: CGPoint(x: box.minX + box.width * fx, y: box.minY + box.height * fy)) { _, _, _, alpha in alpha > 0 }
+        }
+    }
+
+    /// Whether a pixel within about a pixel of `point` (page points from the top left; a page with a
+    /// fractional height is drawn up to a pixel higher) passes `test`, given its color (not premultiplied)
+    /// and alpha.
+    func pixel(near point: CGPoint, _ test: (_ red: Int, _ green: Int, _ blue: Int, _ alpha: Int) -> Bool) -> Bool {
+        let x = Int(point.x * scale), y = Int(point.y * scale)
+        let top = max(0, y - 1), bottom = min(height - 1, y + 1), left = max(0, x - 1), right = min(width - 1, x + 1)
+        guard top <= bottom, left <= right else { return false }
+        for row in top...bottom {
+            for column in left...right {
+                let index = (row * width + column) * 4
+                let alpha = Int(pixels[index + 3])
+                func plain(_ value: UInt8) -> Int { alpha == 0 ? 0 : min(255, (Int(value) * 255 + alpha / 2) / alpha) }
+                if test(plain(pixels[index]), plain(pixels[index + 1]), plain(pixels[index + 2]), alpha) { return true }
+            }
+        }
+        return false
+    }
+
     /// The smallest pixel rectangle inside `box` (page points, from the top left) holding every pixel that
     /// shows something, or nil if none does.
     func shownPixels(in box: CGRect) -> CGRect? {
@@ -236,5 +328,79 @@ nonisolated final class ClearDrawing {
         }
         guard maxX >= minX else { return nil }
         return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+}
+
+// MARK: Documents
+
+/// The same grouping for a document page (PDF → Word), without rendering anything: which drawing steps
+/// make up the background and how the rest group into pictures, so the caller can decide what's worth
+/// drawing before it draws.
+nonisolated extension SlideLayers {
+    struct Plan {
+        struct Group {
+            var frame: CGRect       // Page points from the top left of the visible page
+            var steps: [Int]        // In drawing order
+            var hasImage: Bool
+        }
+        var steps: [TextlessPDF.Step]
+        var areas: [CGRect?]        // Each step's visible area, like `frame`; nil where nothing shows
+        var groups: [Group]         // In the order they first draw
+        var background: [Int]       // Steps that aren't in any group
+
+        /// The largest image among the background steps, if it covers at least half the page:
+        /// a full-page photo (or a scan) rather than a plain color or gradient.
+        func backgroundPhoto(pageArea: CGFloat) -> CGRect? {
+            background.compactMap { steps[$0].isImage ? areas[$0] : nil }
+                .max { $0.width * $0.height < $1.width * $1.height }
+                .flatMap { $0.width * $0.height >= pageArea * 0.5 ? $0 : nil }
+        }
+    }
+
+    /// The page's groups, or nil when it can't be read or splits into too many pieces. Groups narrower or
+    /// shorter than `minSide` points don't count toward the limit on pieces.
+    static func plan(_ page: PDFPage, minSide: CGFloat = 0) throws -> Plan? {
+        guard let source = page.pageRef else { return nil }
+        let crop = page.bounds(for: .cropBox)
+        let steps = try TextlessPDF.paintedAreas(on: source)
+        let areas = steps.map { step -> CGRect? in
+            let visible = step.area.intersection(crop)
+            guard !visible.isNull, visible.width > 0, visible.height > 0 else { return nil }
+            return CGRect(x: visible.minX - crop.minX, y: crop.maxY - visible.maxY, width: visible.width, height: visible.height)
+        }
+        let foreground = foregroundSteps(areas, crop: crop)
+        guard foreground.count <= maxSteps else { return nil }
+        let inForeground = Set(foreground)
+        let background = areas.indices.filter { areas[$0] != nil && !inForeground.contains($0) }
+        guard !foreground.isEmpty else { return Plan(steps: steps, areas: areas, groups: [], background: background) }
+
+        let longLine = max(crop.width, crop.height) * 0.1
+        let parts = foreground.map { index -> Part in
+            let area = areas[index]!
+            return Part(area: area, isImage: steps[index].isImage,
+                        isLine: min(area.width, area.height) <= 4 && max(area.width, area.height) >= longLine)
+        }
+        func pieces(_ frames: [CGRect]) -> Int { frames.count(where: { $0.width >= minSide && $0.height >= minSide }) }
+        var gap = max(4, max(crop.width, crop.height) * 0.012)
+        var grouped = group(parts, gap: gap)
+        for _ in 0..<3 where pieces(grouped.frames) > maxPictures {
+            gap *= 2
+            grouped = group(parts, gap: gap)
+        }
+        guard pieces(grouped.frames) <= maxPictures else { return nil }
+
+        var groups: [Plan.Group] = []
+        var slot: [Int: Int] = [:]
+        for (position, index) in foreground.enumerated() {
+            let id = grouped.member[position]
+            if let existing = slot[id] {
+                groups[existing].steps.append(index)
+                groups[existing].hasImage = groups[existing].hasImage || parts[position].isImage
+            } else {
+                slot[id] = groups.count
+                groups.append(Plan.Group(frame: grouped.frames[id], steps: [index], hasImage: parts[position].isImage))
+            }
+        }
+        return Plan(steps: steps, areas: areas, groups: groups, background: background)
     }
 }
