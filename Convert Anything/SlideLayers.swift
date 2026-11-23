@@ -19,6 +19,7 @@ nonisolated enum SlideLayers {
         var frame: CGRect       // Page points, origin at the top left of the visible page
         var image: CGImage?     // A picture of it, cut from the page's drawing (or the photo's own pixels)
         var jpeg: Data? = nil   // Or, for a photo drawn plainly, its own JPEG file
+        var shape: TextlessPDF.Shape? = nil     // Or a simple shape, rebuilt as one (page points from the top left)
         var hasImage = false    // Shows a photo (rather than only shapes: a chart, a diagram)
     }
 
@@ -112,6 +113,17 @@ nonisolated enum SlideLayers {
                 layers.pictures.append(picture)
                 continue
             }
+            // A lone line, box or circle becomes a real shape.
+            if members[id] == 1, let index = only[id], var shape = steps[index].shape,
+               crop.insetBy(dx: -0.01, dy: -0.01).contains(steps[index].area) {
+                func flip(_ point: CGPoint) -> CGPoint { CGPoint(x: point.x - crop.minX, y: crop.maxY - point.y) }
+                shape.bounds = CGRect(x: shape.bounds.minX - crop.minX, y: crop.maxY - shape.bounds.maxY, width: shape.bounds.width, height: shape.bounds.height)
+                if case .line(let from, let to) = shape.kind { shape.kind = .line(flip(from), flip(to)) }
+                if isDrawn(shape, in: drawing) {
+                    layers.pictures.append(Picture(frame: groups.frames[id], image: nil, shape: shape))
+                    continue
+                }
+            }
             let box = groups.frames[id].insetBy(dx: -1, dy: -1)
             guard let pixels = drawing.shownPixels(in: box) else { continue }
             if !withImages.contains(id), let table = SlideTable.detect(in: pixels, of: drawing, page: page) {
@@ -124,6 +136,27 @@ nonisolated enum SlideLayers {
         }
         guard !layers.pictures.isEmpty || !layers.tables.isEmpty else { return nil }
         return layers
+    }
+
+    /// Whether the drawing shows the shape in its colors where it should be: its fill in the middle, its
+    /// outline at the middle of a line or of the top edge. Catches a shape in a hidden layer, and a color
+    /// space that isn't the standard RGB the colors were taken as.
+    private static func isDrawn(_ shape: TextlessPDF.Shape, in drawing: ClearDrawing) -> Bool {
+        func shows(_ color: UInt32, at point: CGPoint) -> Bool {
+            let (red, green, blue) = (Int(color >> 16), Int(color >> 8 & 255), Int(color & 255))
+            return drawing.pixel(near: point) { r, g, b, alpha in
+                alpha >= 48 && abs(r - red) <= 10 && abs(g - green) <= 10 && abs(b - blue) <= 10
+            }
+        }
+        let box = shape.bounds
+        if let fill = shape.fill, !shows(fill, at: CGPoint(x: box.midX, y: box.midY)) { return false }
+        if let stroke = shape.stroke {
+            let point: CGPoint
+            if case .line(let from, let to) = shape.kind { point = CGPoint(x: (from.x + to.x) / 2, y: (from.y + to.y) / 2) }
+            else { point = CGPoint(x: box.midX, y: box.minY) }
+            if !shows(stroke, at: point) { return false }
+        }
+        return true
     }
 
     /// A photo the page draws plainly (see `TextlessPDF.Step.plainImage`), taken from the PDF itself rather

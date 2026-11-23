@@ -18,7 +18,8 @@ nonisolated enum SlideBuilder {
     private static let blankLayout = "slideLayout7.xml"
 
     private struct Picture {
-        var file: String                // In ppt/media
+        var file: String                // In ppt/media; empty for a shape
+        var shape: TextlessPDF.Shape?   // A line, box or circle drawn as a real shape instead
         var frame: CGRect               // In the same units as the slide's `size`, from the top left
         var text: [TextBlock] = []      // Its labels, grouped with it so they move together
     }
@@ -48,7 +49,7 @@ nonisolated enum SlideBuilder {
                     throw ConversionError.failed("Couldn't read this image.")
                 }
                 let size = CGSize(width: image.width, height: image.height)
-                return [Slide(size: size, pictures: [Picture(file: "image1.png", frame: CGRect(origin: .zero, size: size))])]
+                return [Slide(size: size, pictures: [Picture(file: "image1.png", shape: nil, frame: CGRect(origin: .zero, size: size))])]
             }
             guard let document = PDFDocument(url: request.input), document.pageCount > 0 else {
                 throw ConversionError.failed("Couldn't read this PDF.")
@@ -62,14 +63,16 @@ nonisolated enum SlideBuilder {
                 let full = CGRect(origin: .zero, size: slide.size)
                 func save(_ image: CGImage, _ file: String, _ frame: CGRect, text: [TextBlock] = []) throws {
                     try ImageConversion.write(image, to: media.appending(path: file), format: .png)
-                    slide.pictures.append(Picture(file: file, frame: frame, text: text))
+                    slide.pictures.append(Picture(file: file, shape: nil, frame: frame, text: text))
                 }
                 func save(_ picture: SlideLayers.Picture, _ name: String, text: [TextBlock]) throws {
                     if let jpeg = picture.jpeg {
                         try jpeg.write(to: media.appending(path: name + ".jpg"))
-                        slide.pictures.append(Picture(file: name + ".jpg", frame: picture.frame, text: text))
+                        slide.pictures.append(Picture(file: name + ".jpg", shape: nil, frame: picture.frame, text: text))
                     } else if let image = picture.image {
                         try save(image, name + ".png", picture.frame, text: text)
+                    } else if let shape = picture.shape {
+                        slide.pictures.append(Picture(file: "", shape: shape, frame: picture.frame, text: text))
                     }
                 }
                 if request.editableSlides && page.rotation == 0, let layers = splitLayers(of: page, scale: scale) {
@@ -250,14 +253,17 @@ nonisolated enum SlideBuilder {
                 textCount += 1
                 return textBox(block, id: takeID(), number: textCount, scale: scale, origin: origin)
             }
-            var groupCount = 0
+            var groupCount = 0, shapeCount = 0
             let pictures = slide.pictures.enumerated().map { offset, picture in
                 let name = picture.frame.size != slide.size ? "Picture \(offset + 1)" : slide.pictures.count == 1 ? "Page \(number)" : "Background"
                 let frame = (x: x + Int(picture.frame.minX * scale), y: y + Int(picture.frame.minY * scale),
                              width: max(1, Int(picture.frame.width * scale)), height: max(1, Int(picture.frame.height * scale)))
                 // A picture with labels goes in a group with them, so they move together.
                 let groupID = picture.text.isEmpty ? 0 : takeID()
-                let xml = #"<p:pic><p:nvPicPr><p:cNvPr id="\#(takeID())" name="\#(name)"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>"#
+                let xml = picture.shape.map { shape -> String in
+                    shapeCount += 1
+                    return shapeXML(shape, id: takeID(), number: shapeCount, scale: scale, origin: origin)
+                } ?? #"<p:pic><p:nvPicPr><p:cNvPr id="\#(takeID())" name="\#(name)"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>"#
                     + #"<p:blipFill><a:blip r:embed="rId\#(offset + 2)"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>"#
                     + #"<p:spPr><a:xfrm><a:off x="\#(frame.x)" y="\#(frame.y)"/><a:ext cx="\#(frame.width)" cy="\#(frame.height)"/></a:xfrm>"#
                     + #"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>"#
@@ -278,7 +284,7 @@ nonisolated enum SlideBuilder {
                 tableFrame(table, id: takeID(), scale: scale, origin: origin)
             }.joined()
             let textBoxes = slide.text.map(text).joined()
-            let pictureLinks = slide.pictures.enumerated().map { offset, picture in
+            let pictureLinks = slide.pictures.enumerated().filter { $0.element.shape == nil }.map { offset, picture in
                 #"<Relationship Id="rId\#(offset + 2)" Type="\#(relType)/image" Target="../media/\#(picture.file)"/>"#
             }.joined()
             try (header + #"""
@@ -313,6 +319,44 @@ nonisolated enum SlideBuilder {
         return #"<p:sp><p:nvSpPr><p:cNvPr id="\#(id)" name="Text \#(number)"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>"#
             + #"<p:spPr><a:xfrm><a:off x="\#(x)" y="\#(y)"/><a:ext cx="\#(width)" cy="\#(height)"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>"#
             + #"<p:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" rtlCol="0" anchor="t"><a:noAutofit/></a:bodyPr><a:lstStyle/>\#(paragraphs)</p:txBody></p:sp>"#
+    }
+
+    /// A line, rectangle, ellipse or rounded rectangle with the PDF's colors and line settings.
+    private static func shapeXML(_ shape: TextlessPDF.Shape, id: Int, number: Int, scale: Double, origin: CGPoint) -> String {
+        func emu(_ value: CGFloat) -> Int { Int((Double(value) * scale).rounded()) }
+        func hex(_ color: UInt32) -> String { String(format: "%06X", color) }
+        let fill = shape.fill.map { #"<a:solidFill><a:srgbClr val="\#(hex($0))"/></a:solidFill>"# } ?? "<a:noFill/>"
+        var line = "<a:ln><a:noFill/></a:ln>"
+        if let stroke = shape.stroke {
+            let width = max(1, emu(shape.lineWidth))
+            let cap = ["flat", "rnd", "sq"][shape.cap]
+            let join = [#"<a:miter lim="1000000"/>"#, "<a:round/>", "<a:bevel/>"][shape.join]
+            line = #"<a:ln w="\#(width)" cap="\#(cap)"><a:solidFill><a:srgbClr val="\#(hex(stroke))"/></a:solidFill><a:prstDash val="solid"/>\#(join)</a:ln>"#
+        }
+        let x = Int(origin.x) + emu(shape.bounds.minX), y = Int(origin.y) + emu(shape.bounds.minY)
+        let size = #"<a:ext cx="\#(emu(shape.bounds.width))" cy="\#(emu(shape.bounds.height))"/>"#
+        switch shape.kind {
+        case .line(let from, let to):
+            // Drawn from the top left to the bottom right of its box unless flipped.
+            let flip = (to.x - from.x) * (to.y - from.y) < 0 ? #" flipV="1""# : ""
+            return #"<p:cxnSp><p:nvCxnSpPr><p:cNvPr id="\#(id)" name="Line \#(number)"/><p:cNvCxnSpPr/><p:nvPr/></p:nvCxnSpPr>"#
+                + #"<p:spPr><a:xfrm\#(flip)><a:off x="\#(x)" y="\#(y)"/>\#(size)</a:xfrm><a:prstGeom prst="line"><a:avLst/></a:prstGeom><a:noFill/>\#(line)</p:spPr></p:cxnSp>"#
+        case .rect, .ellipse, .roundRect:
+            // A box with an outline is a rounded rectangle with square corners: Apple's importer (Keynote,
+            // Quick Look) draws a plain rectangle's outline a hairline whatever its width.
+            var geometry = "rect", adjust = ""
+            if case .rect = shape.kind, shape.stroke != nil {
+                geometry = "roundRect"
+                adjust = #"<a:gd name="adj" fmla="val 0"/>"#
+            }
+            if case .ellipse = shape.kind { geometry = "ellipse" }
+            if case .roundRect(let radius) = shape.kind {
+                geometry = "roundRect"
+                adjust = #"<a:gd name="adj" fmla="val \#(min(50_000, Int(radius / min(shape.bounds.width, shape.bounds.height) * 100_000)))"/>"#
+            }
+            return #"<p:sp><p:nvSpPr><p:cNvPr id="\#(id)" name="Shape \#(number)"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>"#
+                + #"<p:spPr><a:xfrm><a:off x="\#(x)" y="\#(y)"/>\#(size)</a:xfrm><a:prstGeom prst="\#(geometry)"><a:avLst>\#(adjust)</a:avLst></a:prstGeom>\#(fill)\#(line)</p:spPr></p:sp>"#
+        }
     }
 
     /// A text box's position and size in EMUs.
