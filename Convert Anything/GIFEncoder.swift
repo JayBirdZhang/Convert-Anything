@@ -565,18 +565,13 @@ nonisolated extension GIFEncoder {
     /// A picture as a GIF. Animated pictures (GIF, animated PNG and WebP, HEIC sequences) keep every frame
     /// and its timing, and transparent parts stay transparent.
     static func write(imageAt input: URL, to output: URL, quality: Quality) throws {
+        // SVG isn't a bitmap ImageIO can open; it's drawn by ImageConversion.
+        if ImageConversion.isSVG(input) { return try writeStill(input, to: output, quality: quality) }
         guard let source = CGImageSourceCreateWithURL(input as CFURL, nil), CGImageSourceGetCount(source) > 0 else {
             throw ConversionError.failed("Couldn't read this image.")
         }
         let count = CGImageSourceGetCount(source)
-        guard count > 1, frameDelay(source, 0) != nil else {
-            let image = try ImageConversion.load(input, quality: quality)   // With its EXIF rotation applied
-            let encoder = try GIFEncoder(url: output, width: image.width, height: image.height, noise: 0,
-                                         keepsTransparency: hasAlpha(image))
-            try encoder.addFrame(image, duration: 0)
-            try encoder.finish()
-            return
-        }
+        guard count > 1, frameDelay(source, 0) != nil else { return try writeStill(input, to: output, quality: quality) }
 
         guard let first = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw ConversionError.failed("Couldn't decode this image.") }
         var width = first.width, height = first.height
@@ -595,6 +590,14 @@ nonisolated extension GIFEncoder {
                 encoder.extend(by: delay)
             }
         }
+        try encoder.finish()
+    }
+
+    private static func writeStill(_ input: URL, to output: URL, quality: Quality) throws {
+        let image = try ImageConversion.load(input, quality: quality)   // With its EXIF rotation applied
+        let encoder = try GIFEncoder(url: output, width: image.width, height: image.height, noise: 0,
+                                     keepsTransparency: hasAlpha(image))
+        try encoder.addFrame(image, duration: 0)
         try encoder.finish()
     }
 

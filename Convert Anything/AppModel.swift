@@ -221,7 +221,7 @@ enum OriginalsMode: String, CaseIterable {
 
         // What's actually inside the file decides the source format, not the old extension.
         let source: Format
-        switch Sniffer.detect(newURL) {
+        switch Sniffer.detect(newURL, claimed: oldFormat) {
         case .format(let detected):
             source = detected
         case .text:
