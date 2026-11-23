@@ -25,7 +25,8 @@ nonisolated struct SlideTable {
     var lineWidth: CGFloat          // Points
 
     /// The table drawn in `box` (pixels of `drawing`), reading its text from `page`, or nil if it isn't one.
-    static func detect(in box: CGRect, of drawing: ClearDrawing, page: PDFPage) -> SlideTable? {
+    /// `lines` are the page's lines when the caller has already read them.
+    static func detect(in box: CGRect, of drawing: ClearDrawing, page: PDFPage, lines: [TextLine]? = nil) -> SlideTable? {
         let left = Int(box.minX), top = Int(box.minY), width = Int(box.width), height = Int(box.height)
         let scale = drawing.scale
         guard width >= Int(20 * scale), height >= Int(10 * scale) else { return nil }
@@ -123,7 +124,7 @@ nonisolated struct SlideTable {
         func letters(_ lines: [TextLine]) -> [Character] {
             lines.flatMap { $0.runs.flatMap { $0.text.filter { !$0.isWhitespace } } }.sorted()
         }
-        let replaced = PDFText.lines(on: page).filter { frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY)) }
+        let replaced = (lines ?? PDFText.lines(on: page)).filter { frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY)) }
         guard letters(replaced) == letters(cells.flatMap { $0.flatMap(\.lines) }) else { return nil }
 
         return SlideTable(

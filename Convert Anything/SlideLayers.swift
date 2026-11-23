@@ -238,3 +238,93 @@ nonisolated final class ClearDrawing {
         return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
     }
 }
+
+// MARK: Documents
+
+/// The same grouping for a document page (PDF → Word), without rendering anything: which drawing steps
+/// make up the background and how the rest group into pictures, so the caller can decide what's worth
+/// drawing before it draws.
+extension SlideLayers {
+    struct Plan {
+        struct Group {
+            var frame: CGRect       // Page points from the top left of the visible page
+            var steps: [Int]        // In drawing order
+            var hasImage: Bool
+        }
+        var steps: [TextlessPDF.Step]
+        var areas: [CGRect?]        // Each step's visible area, like `frame`; nil where nothing shows
+        var groups: [Group]         // In the order they first draw
+        var background: [Int]       // Steps that aren't in any group
+
+        /// The largest image among the background steps, if it covers at least half the page:
+        /// a full-page photo (or a scan) rather than a plain color or gradient.
+        func backgroundPhoto(pageArea: CGFloat) -> CGRect? {
+            background.compactMap { steps[$0].isImage ? areas[$0] : nil }
+                .max { $0.width * $0.height < $1.width * $1.height }
+                .flatMap { $0.width * $0.height >= pageArea * 0.5 ? $0 : nil }
+        }
+    }
+
+    /// The page's groups, or nil when it can't be read or splits into too many pieces. Groups narrower or
+    /// shorter than `minSide` points don't count toward the limit on pieces.
+    static func plan(_ page: PDFPage, minSide: CGFloat = 0) throws -> Plan? {
+        guard let source = page.pageRef else { return nil }
+        let crop = page.bounds(for: .cropBox)
+        let pageArea = crop.width * crop.height
+        let steps = try TextlessPDF.paintedAreas(on: source)
+        let areas = steps.map { step -> CGRect? in
+            let visible = step.area.intersection(crop)
+            guard !visible.isNull, visible.width > 0, visible.height > 0 else { return nil }
+            return CGRect(x: visible.minX - crop.minX, y: crop.maxY - visible.maxY, width: visible.width, height: visible.height)
+        }
+        // The background, as in split(_:scale:).
+        var foreground: [Int] = []
+        var bands: [Int] = []
+        for (index, area) in areas.enumerated() {
+            guard let area else { continue }
+            if area.width * area.height >= pageArea * 0.75 {
+                foreground.removeAll()
+                bands.removeAll()
+            } else if foreground.isEmpty && (area.width >= crop.width * 0.9 || area.height >= crop.height * 0.9) {
+                bands.append(index)
+            } else {
+                foreground.append(index)
+            }
+        }
+        let banded = bands.reduce(CGRect.null) { $0.union(areas[$1]!) }
+        if !bands.isEmpty && banded.width * banded.height < pageArea * 0.5 { foreground = bands + foreground }
+        guard foreground.count <= maxSteps else { return nil }
+        let inForeground = Set(foreground)
+        let background = areas.indices.filter { areas[$0] != nil && !inForeground.contains($0) }
+        guard !foreground.isEmpty else { return Plan(steps: steps, areas: areas, groups: [], background: background) }
+
+        let longLine = max(crop.width, crop.height) * 0.1
+        let parts = foreground.map { index -> Part in
+            let area = areas[index]!
+            return Part(area: area, isImage: steps[index].isImage,
+                        isLine: min(area.width, area.height) <= 4 && max(area.width, area.height) >= longLine)
+        }
+        func pieces(_ frames: [CGRect]) -> Int { frames.count(where: { $0.width >= minSide && $0.height >= minSide }) }
+        var gap = max(4, max(crop.width, crop.height) * 0.012)
+        var grouped = group(parts, gap: gap)
+        for _ in 0..<3 where pieces(grouped.frames) > maxPictures {
+            gap *= 2
+            grouped = group(parts, gap: gap)
+        }
+        guard pieces(grouped.frames) <= maxPictures else { return nil }
+
+        var groups: [Plan.Group] = []
+        var slot: [Int: Int] = [:]
+        for (position, index) in foreground.enumerated() {
+            let id = grouped.member[position]
+            if let existing = slot[id] {
+                groups[existing].steps.append(index)
+                groups[existing].hasImage = groups[existing].hasImage || parts[position].isImage
+            } else {
+                slot[id] = groups.count
+                groups.append(Plan.Group(frame: grouped.frames[id], steps: [index], hasImage: parts[position].isImage))
+            }
+        }
+        return Plan(steps: steps, areas: areas, groups: groups, background: background)
+    }
+}
