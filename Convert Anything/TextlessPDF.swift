@@ -14,21 +14,35 @@ import PDFKit
 nonisolated enum TextlessPDF {
     struct Unsupported: Error { let reason: String }
 
-    /// A one-page PDF with the same boxes and rotation as `page` and none of its text.
-    static func data(for page: CGPDFPage) throws -> Data {
-        try Writer(page: page).build()
+    /// One of the page's drawing steps: where it lands and whether it draws a picture (an image).
+    struct Step {
+        var area: CGRect
+        var isImage: Bool
+    }
+
+    /// A one-page PDF with the same boxes and rotation as `page` and none of its text. With `keeping`,
+    /// only the page's own drawing steps (numbered as in `paintedAreas`) it returns true for are drawn.
+    static func data(for page: CGPDFPage, keeping: ((Int) -> Bool)? = nil) throws -> Data {
+        try Writer(page: page).build(keeping: keeping)
+    }
+
+    /// Where each of the page's own drawing steps (a filled or stroked shape, an image, a shading or a nested
+    /// drawing) lands, in page space, in drawing order. `.null` where nothing shows (clipped away); an
+    /// unclipped shading is `.infinite`. Text isn't a drawing step here: it's left out of every copy.
+    static func paintedAreas(on page: CGPDFPage) throws -> [Step] {
+        try Writer(page: page).paintedAreas()
     }
 
     /// The page without its text, opened in PDFKit, with the markup people add on top (highlights, ink,
     /// shapes, stamps, comment boxes) carried over. Links, form fields and pop-up notes draw nothing
     /// worth keeping and are left out.
-    static func document(for page: PDFPage) throws -> PDFDocument {
+    static func document(for page: PDFPage, keeping: ((Int) -> Bool)? = nil, annotations: Bool = true) throws -> PDFDocument {
         guard let source = page.pageRef else { throw Unsupported(reason: "no page reference") }
-        guard let document = PDFDocument(data: try data(for: source)), let copy = document.page(at: 0) else {
+        guard let document = PDFDocument(data: try data(for: source, keeping: keeping)), let copy = document.page(at: 0) else {
             throw Unsupported(reason: "copy couldn't be opened")
         }
         let skipped: Set<String> = ["Link", "Widget", "Popup"]
-        for annotation in page.annotations where !skipped.contains(annotation.type ?? "") && annotation.shouldDisplay {
+        for annotation in page.annotations where annotations && !skipped.contains(annotation.type ?? "") && annotation.shouldDisplay {
             if let duplicate = annotation.copy() as? PDFAnnotation { copy.addAnnotation(duplicate) }
         }
         return document
@@ -52,7 +66,7 @@ nonisolated private final class Writer {
         self.page = page
     }
 
-    func build() throws -> Data {
+    func build(keeping keep: ((Int) -> Bool)?) throws -> Data {
         guard let pageDictionary = page.dictionary else { throw TextlessPDF.Unsupported(reason: "no page dictionary") }
         let catalog = reserve(), pages = reserve(), pageNumber = reserve()
 
@@ -70,17 +84,9 @@ nonisolated private final class Writer {
             entries += " /UserUnit \(Writer.number(userUnit))"
         }
 
-        var content = Data()
-        for stream in contentStreams(pageDictionary) {
-            var format = CGPDFDataFormat.raw
-            guard let data = CGPDFStreamCopyData(stream, &format) as Data?, format == .raw else {
-                throw TextlessPDF.Unsupported(reason: "unreadable page contents")
-            }
-            content.append(data)
-            content.append(0x0A)
-        }
+        let content = try pageContent(pageDictionary)
         let contents = reserve()
-        objects[contents - 1] = streamObject("", data: try ContentFilter.strip(content))
+        objects[contents - 1] = streamObject("", data: try ContentFilter.strip(content, keeping: keep))
         entries += " /Contents \(contents) 0 R"
         objects[pageNumber - 1] = Data("<<\(entries)>>".utf8)
         objects[pages - 1] = Data("<< /Type /Pages /Kids [\(pageNumber) 0 R] /Count 1 >>".utf8)
@@ -92,6 +98,45 @@ nonisolated private final class Writer {
         }
         objects[catalog - 1] = Data("<<\(catalogEntries)>>".utf8)
         return assemble()
+    }
+
+    func paintedAreas() throws -> [TextlessPDF.Step] {
+        guard let pageDictionary = page.dictionary else { throw TextlessPDF.Unsupported(reason: "no page dictionary") }
+        let xobjects = inherited(pageDictionary, "Resources").flatMap { dictionary($0, "XObject") }
+        return try ContentFilter.areas(of: try pageContent(pageDictionary)) { name in
+            var stream: CGPDFStreamRef?
+            guard let xobjects, CGPDFDictionaryGetStream(xobjects, name, &stream), let stream,
+                  let entries = CGPDFStreamGetDictionary(stream) else { return nil }
+            var subtype: UnsafePointer<CChar>?
+            guard CGPDFDictionaryGetName(entries, "Subtype", &subtype), let subtype else { return nil }
+            if strcmp(subtype, "Image") == 0 { return .image }
+            guard strcmp(subtype, "Form") == 0 else { return nil }
+            func numbers(_ key: String) -> [CGFloat]? {
+                var array: CGPDFArrayRef?
+                guard CGPDFDictionaryGetArray(entries, key, &array), let array else { return nil }
+                return (0..<CGPDFArrayGetCount(array)).compactMap { index in
+                    var value: CGPDFReal = 0
+                    return CGPDFArrayGetNumber(array, index, &value) ? value : nil
+                }
+            }
+            let m = numbers("Matrix").flatMap { $0.count == 6 ? $0 : nil } ?? [1, 0, 0, 1, 0, 0]
+            let box = numbers("BBox").flatMap { $0.count == 4 ? $0 : nil }
+                .map { CGRect(x: $0[0], y: $0[1], width: $0[2] - $0[0], height: $0[3] - $0[1]).standardized } ?? .infinite
+            return .form(CGAffineTransform(a: m[0], b: m[1], c: m[2], d: m[3], tx: m[4], ty: m[5]), box)
+        }
+    }
+
+    private func pageContent(_ pageDictionary: CGPDFDictionaryRef) throws -> Data {
+        var content = Data()
+        for stream in contentStreams(pageDictionary) {
+            var format = CGPDFDataFormat.raw
+            guard let data = CGPDFStreamCopyData(stream, &format) as Data?, format == .raw else {
+                throw TextlessPDF.Unsupported(reason: "unreadable page contents")
+            }
+            content.append(data)
+            content.append(0x0A)
+        }
+        return content
     }
 
     // MARK: Objects
@@ -324,18 +369,41 @@ nonisolated private final class Writer {
 /// operands. Everything else, including the color and line settings made between BT and ET, stays.
 /// Text in a clipping render mode (4–7) would have narrowed the clip at ET; it becomes an empty clip,
 /// so what the letters revealed isn't drawn either.
+///
+/// It also follows the drawing position (cm, q/Q, clipping) closely enough to say where each drawing step
+/// lands: a painted path, an image, a shading or a nested drawing. `keeping` can leave steps out: a
+/// dropped path still clips (it ends with `n`), a dropped image or shading isn't drawn.
 nonisolated private struct ContentFilter {
+    enum XObject { case image, form(CGAffineTransform, CGRect) }
+
     private let bytes: [UInt8]
     private var output = Data()
+    private let keep: ((Int) -> Bool)?
+    private let xobject: ((String) -> XObject?)?
+    private var areas: [TextlessPDF.Step] = []
 
-    private init(_ content: Data) {
+    private init(_ content: Data, keep: ((Int) -> Bool)?, xobject: ((String) -> XObject?)?) {
         bytes = [UInt8](content)
+        self.keep = keep
+        self.xobject = xobject
         output.reserveCapacity(content.count)
     }
 
-    static func strip(_ content: Data) throws -> Data {
-        var filter = ContentFilter(content)
+    static func strip(_ content: Data, keeping keep: ((Int) -> Bool)? = nil) throws -> Data {
+        var filter = ContentFilter(content, keep: keep, xobject: nil)
         return try filter.run()
+    }
+
+    static func areas(of content: Data, xobject: @escaping (String) -> XObject?) throws -> [TextlessPDF.Step] {
+        var filter = ContentFilter(content, keep: nil, xobject: xobject)
+        _ = try filter.run()
+        return filter.areas
+    }
+
+    /// Records a drawing step's area and says whether it's drawn.
+    private mutating func paints(_ area: CGRect, image: Bool = false) -> Bool {
+        areas.append(TextlessPDF.Step(area: area, isImage: image))
+        return keep?(areas.count - 1) ?? true
     }
 
     private static func isSpace(_ byte: UInt8) -> Bool {
@@ -363,6 +431,27 @@ nonisolated private struct ContentFilter {
         var renderMode = 0
         var savedModes: [Int] = []
         var clipsText = false            // A clipping-mode glyph was dropped in this text object
+
+        // Where things land: the current transform, clip and line width (saved by q), the path being built.
+        var ctm = CGAffineTransform.identity
+        var clip = CGRect.infinite
+        var lineWidth: CGFloat = 1
+        var saved: [(CGAffineTransform, CGRect, CGFloat)] = []
+        var path = CGRect.null
+        var clipsPath = false            // W or W* seen: the next painting operator also clips
+        var inlineStart = 0              // Output position of the BI that starts an inline image
+        func numbers(_ operands: [Range<Int>], _ count: Int) -> [CGFloat]? {
+            guard operands.count >= count else { return nil }
+            let values = operands.suffix(count).compactMap { Double(String(decoding: bytes[$0], as: UTF8.self)) }
+            return values.count == count ? values.map { CGFloat($0) } : nil
+        }
+        func add(_ values: [CGFloat]?) {
+            guard let values else { return }
+            for pair in stride(from: 0, to: values.count - 1, by: 2) {
+                let point = CGPoint(x: values[pair], y: values[pair + 1]).applying(ctm)
+                path = path.union(CGRect(origin: point, size: .zero))
+            }
+        }
 
         while index < count {
             let byte = bytes[index]
@@ -428,7 +517,59 @@ nonisolated private struct ContentFilter {
 
                 // An operator: decide what happens to it and its operands.
                 let run = runStart..<index
-                switch String(decoding: token, as: UTF8.self) {
+                let name = String(decoding: token, as: UTF8.self)
+                switch name {
+                case "m", "l":
+                    add(numbers(operands, 2)); emit(run)
+                case "c":
+                    add(numbers(operands, 6)); emit(run)
+                case "v", "y":
+                    add(numbers(operands, 4)); emit(run)
+                case "re":
+                    if let r = numbers(operands, 4) { add([r[0], r[1], r[0] + r[2], r[1], r[0], r[1] + r[3], r[0] + r[2], r[1] + r[3]]) }
+                    emit(run)
+                case "W", "W*":
+                    clipsPath = true
+                    emit(run)
+                case "f", "F", "f*", "S", "s", "B", "B*", "b", "b*", "n":
+                    if name == "n" {
+                        emit(run)
+                    } else {
+                        var area = path
+                        if name != "f" && name != "F" && name != "f*" && !area.isNull {
+                            let pad = max(lineWidth * sqrt(abs(ctm.a * ctm.d - ctm.b * ctm.c)), 1) / 2
+                            area = area.insetBy(dx: -pad, dy: -pad)
+                        }
+                        if paints(area.intersection(clip)) { emit(run) } else { output.append(contentsOf: Array("n\n".utf8)) }
+                    }
+                    if clipsPath { clip = clip.intersection(path) }
+                    clipsPath = false
+                    path = .null
+                case "cm":
+                    if let m = numbers(operands, 6) {
+                        ctm = CGAffineTransform(a: m[0], b: m[1], c: m[2], d: m[3], tx: m[4], ty: m[5]).concatenating(ctm)
+                    }
+                    emit(run)
+                case "w":
+                    if let width = numbers(operands, 1) { lineWidth = width[0] }
+                    emit(run)
+                case "sh":
+                    if paints(clip) { emit(run) }
+                case "Do":
+                    var area = clip, image = false
+                    if let xobject, let operand = operands.last, bytes[operand.lowerBound] == 0x2F {
+                        switch xobject(ContentFilter.decodedName(bytes[operand])) {
+                        case .image:
+                            area = CGRect(x: 0, y: 0, width: 1, height: 1).applying(ctm).intersection(clip)
+                            image = true
+                        case .form(let matrix, let box) where !box.isInfinite: area = box.applying(matrix.concatenating(ctm)).intersection(clip)
+                        default: break
+                        }
+                    }
+                    if paints(area, image: image) { emit(run) }
+                case "BI":
+                    inlineStart = output.count
+                    emit(run)
                 case "Tj", "TJ":
                     if renderMode >= 4 { clipsText = true }
                 case "'":
@@ -451,16 +592,22 @@ nonisolated private struct ContentFilter {
                     emit(run)
                 case "ET":
                     emit(run)
-                    if clipsText { output.append(contentsOf: Array("0 0 0 0 re W n\n".utf8)) }
+                    if clipsText {
+                        output.append(contentsOf: Array("0 0 0 0 re W n\n".utf8))
+                        clip = .null
+                    }
                     clipsText = false
                 case "q":
                     savedModes.append(renderMode)
+                    saved.append((ctm, clip, lineWidth))
                     emit(run)
                 case "Q":
                     renderMode = savedModes.popLast() ?? renderMode
+                    if let state = saved.popLast() { (ctm, clip, lineWidth) = state }
                     emit(run)
                 case "ID":
                     // Inline image data runs to an EI that stands on its own.
+                    let drawn = paints(CGRect(x: 0, y: 0, width: 1, height: 1).applying(ctm).intersection(clip), image: true)
                     emit(run)
                     var end = index + 1
                     while true {
@@ -472,8 +619,12 @@ nonisolated private struct ContentFilter {
                         end += 1
                     }
                     end += 2
-                    output.append(contentsOf: bytes[index..<end])
-                    output.append(0x0A)
+                    if drawn {
+                        output.append(contentsOf: bytes[index..<end])
+                        output.append(0x0A)
+                    } else {
+                        output.removeSubrange(min(inlineStart, output.count)..<output.count)
+                    }
                     index = end
                 default:
                     emit(run)
@@ -486,6 +637,23 @@ nonisolated private struct ContentFilter {
         }
         if runStart < count { output.append(contentsOf: bytes[runStart..<count]) }
         return output
+    }
+
+    /// A content-stream name without its slash, with #xx escapes decoded.
+    private static func decodedName(_ token: ArraySlice<UInt8>) -> String {
+        var result: [UInt8] = []
+        var index = token.startIndex + 1
+        while index < token.endIndex {
+            if token[index] == 0x23, index + 2 < token.endIndex,
+               let value = UInt8(String(decoding: token[(index + 1)...(index + 2)], as: UTF8.self), radix: 16) {
+                result.append(value)
+                index += 3
+            } else {
+                result.append(token[index])
+                index += 1
+            }
+        }
+        return String(decoding: result, as: UTF8.self)
     }
 
     private mutating func emit(_ range: Range<Int>) {

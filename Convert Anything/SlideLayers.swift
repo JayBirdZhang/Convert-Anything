@@ -1,0 +1,223 @@
+import CoreGraphics
+import Foundation
+import PDFKit
+
+/// Splits what an editable slide shows behind its text into separate pictures, so each photo, chart or
+/// shape on the page can be moved on its own instead of the whole page being one picture.
+///
+/// TextlessPDF says where each of the page's drawing steps lands. Steps that cover most of the page
+/// (a background color or full-page photo), and the full-width or full-height bands drawn before
+/// anything else (a gradient drawn as strips, a header bar), make up the background. The rest are
+/// grouped by distance: shapes that touch or nearly touch belong to the same thing (a chart's bars and
+/// axes, a photo and its frame); two photos only when they overlap, so a tight grid of photos stays
+/// apart. A long thin line (a divider or rule) only joins what it touches or crosses, so a divider next
+/// to a photo stays its own piece while a chart's axes and gridlines stay with its bars. Groups whose boxes overlap are merged, so the groups never overlap, and each one is
+/// cut from a drawing of everything but the background, on a clear background. Every step is drawn in
+/// exactly one picture, so moving a picture never uncovers a copy of it.
+nonisolated enum SlideLayers {
+    struct Picture {
+        var frame: CGRect       // Page points, origin at the top left of the visible page
+        var image: CGImage
+    }
+
+    struct Layers {
+        var background: CGImage?    // Whole page; nil when it's plain white
+        var pictures: [Picture]     // In drawing order
+        var tables: [SlideTable] = []
+    }
+
+    private static let maxPictures = 40
+    private static let maxSteps = 4000
+
+    /// The page's background and pictures, or nil when there's nothing worth splitting (one thing or none,
+    /// or too many small pieces), in which case the page stays one picture.
+    static func split(_ page: PDFPage, scale: CGFloat) throws -> Layers? {
+        guard let source = page.pageRef else { return nil }
+        let crop = page.bounds(for: .cropBox)
+        let pageArea = crop.width * crop.height
+        let steps = try TextlessPDF.paintedAreas(on: source)
+        let areas = steps.map { step -> CGRect? in
+            let visible = step.area.intersection(crop)
+            guard !visible.isNull, visible.width > 0, visible.height > 0 else { return nil }
+            return CGRect(x: visible.minX - crop.minX, y: crop.maxY - visible.maxY, width: visible.width, height: visible.height)
+        }
+
+        var foreground: [Int] = []
+        var bands: [Int] = []
+        for (index, area) in areas.enumerated() {
+            guard let area else { continue }
+            if area.width * area.height >= pageArea * 0.75 {
+                // Something covering the page goes behind everything drawn before it too, so nothing
+                // that was under it ends up on top.
+                foreground.removeAll()
+                bands.removeAll()
+            } else if foreground.isEmpty && (area.width >= crop.width * 0.9 || area.height >= crop.height * 0.9) {
+                bands.append(index)
+            } else {
+                foreground.append(index)
+            }
+        }
+        // Leading bands are a background only when together they fill most of the page (a gradient
+        // drawn as strips); a lone rule or a striped table's first rows stay things of their own.
+        let banded = bands.reduce(CGRect.null) { $0.union(areas[$1]!) }
+        if !bands.isEmpty && banded.width * banded.height < pageArea * 0.5 { foreground = bands + foreground }
+        guard !foreground.isEmpty, foreground.count <= maxSteps else { return nil }
+
+        // Group nearby steps; when that leaves too many pieces (a map or a diagram drawn as many small
+        // shapes), group more loosely.
+        let longLine = max(crop.width, crop.height) * 0.1
+        let parts = foreground.map { index -> Part in
+            let area = areas[index]!
+            return Part(area: area, isImage: steps[index].isImage,
+                        isLine: min(area.width, area.height) <= 4 && max(area.width, area.height) >= longLine)
+        }
+        var gap = max(4, max(crop.width, crop.height) * 0.012)
+        var groups = group(parts, gap: gap)
+        for _ in 0..<3 where groups.frames.count > maxPictures {
+            gap *= 2
+            groups = group(parts, gap: gap)
+        }
+        guard groups.frames.count <= maxPictures else { return nil }
+
+        var groupOf: [Int: Int] = [:]
+        for (position, index) in foreground.enumerated() { groupOf[index] = groups.member[position] }
+
+        // The background: everything that isn't in a group, with the page's markup (highlights, ink).
+        let backgroundDocument = try TextlessPDF.document(for: page, keeping: { groupOf[$0] == nil })
+        let background = try backgroundDocument.page(at: 0).map { try ImageConversion.render($0, scale: scale) }
+        let foregroundDocument = try TextlessPDF.document(for: page, keeping: { groupOf[$0] != nil }, annotations: false)
+        guard let foregroundPage = foregroundDocument.page(at: 0) else { return nil }
+        let drawing = try ClearDrawing(foregroundPage, scale: scale)
+
+        // One picture per group, in the order the groups first draw, trimmed to what it actually shows.
+        // A group of shapes that draws a ruled grid becomes a real table instead.
+        var order: [Int] = []
+        for index in foreground where !order.contains(groupOf[index]!) { order.append(groupOf[index]!) }
+        var withImages = Set<Int>()
+        for (position, part) in parts.enumerated() where part.isImage { withImages.insert(groups.member[position]) }
+        var layers = Layers(background: background.flatMap { isWhite($0) ? nil : $0 }, pictures: [])
+        for id in order {
+            let box = groups.frames[id].insetBy(dx: -1, dy: -1)
+            guard let pixels = drawing.shownPixels(in: box) else { continue }
+            if !withImages.contains(id), let table = SlideTable.detect(in: pixels, of: drawing, page: page) {
+                layers.tables.append(table)
+            } else if let image = drawing.image.cropping(to: pixels) {
+                layers.pictures.append(Picture(frame: CGRect(x: pixels.minX / scale, y: pixels.minY / scale,
+                                                             width: pixels.width / scale, height: pixels.height / scale), image: image))
+            }
+        }
+        guard !layers.pictures.isEmpty || !layers.tables.isEmpty else { return nil }
+        return layers
+    }
+
+    /// Which group each area belongs to (an index into `frames`), and each group's box. Areas closer than
+    /// `gap` share a group, unless both are images, which only share one when they overlap. Groups whose
+    /// boxes overlap are then merged, so no two boxes (each grown by a point when cut out) overlap.
+    private struct Part {
+        var area: CGRect
+        var isImage: Bool
+        var isLine: Bool        // Long and thin: a divider, a rule, an axis
+    }
+
+    private static func group(_ parts: [Part], gap: CGFloat) -> (member: [Int], frames: [CGRect]) {
+        let areas = parts.map(\.area)
+        var parent = Array(areas.indices)
+        func root(_ index: Int) -> Int {
+            var index = index
+            while parent[index] != index { parent[index] = parent[parent[index]]; index = parent[index] }
+            return index
+        }
+        let padded = areas.map { $0.insetBy(dx: -gap / 2, dy: -gap / 2) }
+        for first in areas.indices {
+            for second in (first + 1)..<areas.count {
+                let touching: Bool
+                if parts[first].isImage && parts[second].isImage {
+                    let overlap = areas[first].intersection(areas[second])
+                    touching = overlap.width * overlap.height > 1
+                } else if parts[first].isLine || parts[second].isLine {
+                    touching = areas[first].insetBy(dx: -1, dy: -1).intersects(areas[second].insetBy(dx: -1, dy: -1))
+                } else {
+                    touching = padded[first].intersects(padded[second])
+                }
+                if touching { parent[root(second)] = root(first) }
+            }
+        }
+        // Merge groups until no two boxes overlap (with a point to spare on each side).
+        while true {
+            var frames: [Int: CGRect] = [:]
+            for index in areas.indices { frames[root(index), default: .null] = frames[root(index), default: .null].union(areas[index]) }
+            let roots = Array(frames.keys)
+            var merged = false
+            outer: for a in roots.indices {
+                for b in (a + 1)..<roots.count
+                where frames[roots[a]]!.insetBy(dx: -1.5, dy: -1.5).intersects(frames[roots[b]]!.insetBy(dx: -1.5, dy: -1.5)) {
+                    parent[roots[b]] = roots[a]
+                    merged = true
+                    break outer
+                }
+            }
+            if !merged {
+                let ids = Dictionary(uniqueKeysWithValues: roots.enumerated().map { ($1, $0) })
+                return (areas.indices.map { ids[root($0)]! }, roots.map { frames[$0]! })
+            }
+        }
+    }
+
+    private static func isWhite(_ image: CGImage) -> Bool {
+        guard let data = image.dataProvider?.data, let bytes = CFDataGetBytePtr(data),
+              image.bitsPerPixel == 32, image.bitsPerComponent == 8 else { return false }
+        let length = CFDataGetLength(data)
+        var index = 0
+        while index < length {
+            // noneSkipLast RGBX: every color byte at 255 (the padding byte doesn't matter).
+            if index % 4 != 3 && bytes[index] < 255 { return false }
+            index += 1
+        }
+        return true
+    }
+}
+
+/// A page drawn on a clear background, so what each group shows can be found from its pixels' alpha.
+nonisolated struct ClearDrawing {
+    let image: CGImage
+    let pixels: [UInt8]         // RGBA, premultiplied, rows from the top
+    let width: Int, height: Int
+    let scale: CGFloat
+
+    init(_ page: PDFPage, scale: CGFloat) throws {
+        let size = page.bounds(for: .cropBox).size
+        width = Int(size.width * scale)
+        height = Int(size.height * scale)
+        self.scale = scale
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw ConversionError.failed("Couldn't render this PDF.")
+        }
+        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+        context.scaleBy(x: scale, y: scale)
+        page.draw(with: .cropBox, to: context)
+        guard let image = context.makeImage(), let data = context.data else { throw ConversionError.failed("Couldn't render this PDF.") }
+        self.image = image
+        // Rows run top to bottom in the bitmap's memory.
+        pixels = Array(UnsafeBufferPointer(start: data.bindMemory(to: UInt8.self, capacity: width * height * 4), count: width * height * 4))
+    }
+
+    /// The smallest pixel rectangle inside `box` (page points, from the top left) holding every pixel that
+    /// shows something, or nil if none does.
+    func shownPixels(in box: CGRect) -> CGRect? {
+        let left = max(0, Int((box.minX * scale).rounded(.down))), right = min(width, Int((box.maxX * scale).rounded(.up)))
+        let top = max(0, Int((box.minY * scale).rounded(.down))), bottom = min(height, Int((box.maxY * scale).rounded(.up)))
+        guard left < right, top < bottom else { return nil }
+        var minX = right, maxX = left - 1, minY = bottom, maxY = top - 1
+        for y in top..<bottom {
+            let row = y * width
+            for x in left..<right where pixels[(row + x) * 4 + 3] > 0 {
+                minX = min(minX, x); maxX = max(maxX, x)
+                minY = min(minY, y); maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= minX else { return nil }
+        return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+}

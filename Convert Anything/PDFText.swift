@@ -50,7 +50,7 @@ nonisolated enum PDFText {
         return lines
     }
 
-    private static func styledRuns(_ attributed: NSAttributedString, lineHeight: CGFloat) -> [TextRun] {
+    static func styledRuns(_ attributed: NSAttributedString, lineHeight: CGFloat) -> [TextRun] {
         var runs: [TextRun] = []
         let string = attributed.string as NSString
         attributed.enumerateAttributes(in: NSRange(location: 0, length: attributed.length)) { attributes, range, _ in
