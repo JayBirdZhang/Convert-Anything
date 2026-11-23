@@ -24,6 +24,11 @@ enum DocumentConversion {
                 try await PDFToWord.convert(request, output: output)
                 return
             }
+            // A PDF made from Markdown with math carries that Markdown, formulas and all.
+            if request.to == .md, let markdown = MathMarkdown.embeddedMarkdown(in: input) {
+                try markdown.write(to: output, atomically: true, encoding: .utf8)
+                return
+            }
             let text = try await DocumentConversion.extractPDFText(input)
             if request.to == .txt || request.to == .md {
                 try text.write(to: output, atomically: true, encoding: .utf8)
@@ -47,15 +52,20 @@ enum DocumentConversion {
             } else {
                 try await write(html: html, title: request.title, request: request, output: output)
             }
-            if !collector.items.isEmpty {
-                try await WordMath.insert(collector.items, into: output, workDir: request.workDir)
+            if request.to == .pdf, html.contains("<math ") {
+                MathMarkdown.embed(markdown: markdown, in: output)
+            }
+            if !collector.items.isEmpty || !collector.tables.isEmpty {
+                try await WordMath.insert(collector.items, tables: collector.tables, into: output, workDir: request.workDir)
             }
         case .html:
             let html = try readText(input)
             if request.to == .pdf {
                 try await WebPDF.render(html: html, baseURL: request.originalDir, output: output)
             } else if request.to == .md {
-                try Markdown.markdown(from: attributed(html: html, baseURL: request.originalDir)).write(to: output, atomically: true, encoding: .utf8)
+                let prepared = MathMarkdown.prepare(html: html)
+                let markdown = try Markdown.markdown(from: attributed(html: prepared?.html ?? html, baseURL: request.originalDir))
+                try MathMarkdown.restore(markdown, items: prepared?.items ?? []).write(to: output, atomically: true, encoding: .utf8)
             } else {
                 try write(text: attributed(html: html, baseURL: request.originalDir), request: request, output: output)
             }
@@ -67,6 +77,11 @@ enum DocumentConversion {
                 let paragraphs = text.components(separatedBy: "\n\n").map { "<p>\(escapeHTML($0).replacingOccurrences(of: "\n", with: "<br>"))</p>" }
                 try await write(html: paragraphs.joined(separator: "\n"), title: request.title, request: request, output: output)
             }
+        case .docx where request.to == .md:
+            // Word equations come through as LaTeX, and tables as tables.
+            let prepared = try await MathMarkdown.prepare(docx: input, workDir: request.workDir)
+            let text = try NSAttributedString(url: prepared?.url ?? input, options: [:], documentAttributes: nil)
+            try MathMarkdown.restore(Markdown.markdown(from: text), docx: prepared).write(to: output, atomically: true, encoding: .utf8)
         default:
             let text = try NSAttributedString(url: input, options: [:], documentAttributes: nil)
             try write(text: text, request: request, output: output)
@@ -375,13 +390,68 @@ nonisolated enum Markdown {
     private static func cells(_ line: String) -> [String] {
         var row = line.trimmingCharacters(in: .whitespaces)
         if row.hasPrefix("|") { row.removeFirst() }
-        if row.hasSuffix("|") { row.removeLast() }
-        return row.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        if row.hasSuffix("|"), !row.hasSuffix("\\|") { row.removeLast() }
+        guard row.contains("\\|") || row.contains("$") || row.contains("`") else {
+            return row.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        // A bar inside math ($\left| x \right|$) or escaped (\|) doesn't end the cell.
+        let chars = Array(row)
+        var cells: [String] = [], cell = ""
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == "\\", i + 1 < chars.count, chars[i + 1] == "|" {
+                cell.append("|"); i += 2; continue
+            }
+            if c == "`", let end = chars[(i + 1)...].firstIndex(of: "`") {
+                // Like GitHub, an escaped bar in code is a bar.
+                cell += String(chars[i...end]).replacingOccurrences(of: "\\|", with: "|"); i = end + 1; continue
+            }
+            if c == "$", let end = mathEnd(chars, from: i) {
+                cell += String(chars[i..<end]); i = end; continue
+            }
+            if c == "|" { cells.append(cell); cell = ""; i += 1; continue }
+            cell.append(c); i += 1
+        }
+        cells.append(cell)
+        return cells.map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// Where math starting with the "$" at `start` ends, using the same rules as `inlineRegex`
+    /// (so "$5 | $10" is two prices, not math).
+    private static func mathEnd(_ chars: [Character], from start: Int) -> Int? {
+        if start > 0, chars[start - 1] == "\\" || chars[start - 1].isLetter || chars[start - 1].isNumber { return nil }
+        let isDisplay = start + 1 < chars.count && chars[start + 1] == "$"
+        let open = start + (isDisplay ? 2 : 1)
+        guard open < chars.count, !chars[open].isWhitespace else { return nil }
+        var j = open
+        while j < chars.count {
+            if chars[j] == "$" {
+                if isDisplay {
+                    if j + 1 < chars.count, chars[j + 1] == "$" { return j + 2 }
+                } else {
+                    guard !chars[j - 1].isWhitespace else { return nil }
+                    let next = j + 1 < chars.count ? chars[j + 1] : " "
+                    return next.isLetter || next.isNumber || next == "_" || next == "$" ? nil : j + 1
+                }
+            }
+            j += 1
+        }
+        return nil
     }
 
     private static func table(_ lines: inout ArraySlice<String>) -> String {
         let header = cells(lines.removeFirst())
         lines.removeFirst()
+        // macOS's Word writer drops tables, so for .docx the table is left as a marker and added afterwards.
+        if case .placeholders(let collector) = mathOutput {
+            var rows = [header.map(inline)]
+            while let line = lines.first, line.contains("|"), !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                rows.append(cells(line).map(inline))
+                lines.removeFirst()
+            }
+            return "<p>\(collector.addTable(rows))</p>"
+        }
         var html = "<table><thead><tr>" + header.map { "<th>\(inline($0))</th>" }.joined() + "</tr></thead><tbody>"
         while let line = lines.first, line.contains("|"), !line.trimmingCharacters(in: .whitespaces).isEmpty {
             html += "<tr>" + cells(line).map { "<td>\(inline($0))</td>" }.joined() + "</tr>"
@@ -465,7 +535,15 @@ nonisolated enum Markdown {
             let rowNumbers = current.rows.keys.sorted()
             let width = current.rows.values.map { ($0.keys.max() ?? 0) + 1 }.max() ?? 0
             guard width > 0 else { return }
-            var lines = rowNumbers.map { r in "| " + (0..<width).map { current.rows[r]?[$0] ?? "" }.joined(separator: " | ") + " |" }
+            var lines = rowNumbers.map { r in
+                "| " + (0..<width).map { c in
+                    let cell = current.rows[r]?[c] ?? ""
+                    // Header cells are bold anyway.
+                    let isWhollyBold = r == rowNumbers.first && cell.hasPrefix("**") && cell.hasSuffix("**") && cell.count > 4
+                        && !cell.dropFirst(2).dropLast(2).contains("**")
+                    return isWhollyBold ? String(cell.dropFirst(2).dropLast(2)) : cell
+                }.joined(separator: " | ") + " |"
+            }
             lines.insert("|" + String(repeating: " --- |", count: width), at: 1)
             blocks.append(lines.joined(separator: "\n"))
         }
@@ -584,6 +662,11 @@ nonisolated enum Markdown {
 /// Collects the math found while translating Markdown for Word, leaving a marker in its place.
 nonisolated final class MathCollector: @unchecked Sendable {
     private(set) var items: [(tex: String, display: Bool)] = []
+    private(set) var tables: [[[String]]] = []     // Rows of cells, each cell inline HTML; the first row is the header
+    func addTable(_ rows: [[String]]) -> String {
+        tables.append(rows)
+        return "ZZTABLE\(tables.count - 1)ZZ"
+    }
     func add(_ tex: String, display: Bool) -> String {
         items.append((tex, display))
         return "ZZMATH\(items.count - 1)ZZ"
@@ -592,13 +675,30 @@ nonisolated final class MathCollector: @unchecked Sendable {
 
 /// Swaps the math markers in a .docx for real Word equations.
 nonisolated enum WordMath {
-    static func insert(_ items: [(tex: String, display: Bool)], into docx: URL, workDir: URL) async throws {
+    static func insert(_ items: [(tex: String, display: Bool)], tables: [[[String]]] = [], into docx: URL, workDir: URL) async throws {
         let package = workDir.appending(path: "docx-math")
         try await Tools.run("/usr/bin/unzip", ["-q", "-o", docx.path, "-d", package.path])
         let documentURL = package.appending(path: "word/document.xml")
         var xml = try String(contentsOf: documentURL, encoding: .utf8)
         if !xml.contains("xmlns:m=\""), let root = xml.range(of: "<w:document ") {
             xml.replaceSubrange(root, with: #"<w:document xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" "#)
+        }
+
+        // Tables first: a formula in a cell is a math marker in its text, replaced below like any other.
+        if !tables.isEmpty {
+            let paragraph = try NSRegularExpression(pattern: #"<w:p\b(?:(?!</w:p>).)*?ZZTABLE(\d+)ZZ(?:(?!</w:p>).)*?</w:p>"#, options: .dotMatchesLineSeparators)
+            let string = xml as NSString
+            var result = "", last = 0
+            for match in paragraph.matches(in: xml, range: NSRange(location: 0, length: string.length)) {
+                result += string.substring(with: NSRange(location: last, length: match.range.location - last))
+                let index = Int(string.substring(with: match.range(at: 1))) ?? .max
+                let marker = string.substring(with: match.range)
+                // The cells use the font of the text around them.
+                let font = marker.firstMatch(of: /<w:rFonts[^>]*\/>/).map { String($0.output) } ?? ""
+                result += index < tables.count ? WordTable.xml(tables[index], font: font) : marker
+                last = match.range.location + match.range.length
+            }
+            xml = result + string.substring(from: last)
         }
 
         // Each run (<w:r>) that holds a marker is split into text runs and equations.
@@ -632,5 +732,59 @@ nonisolated enum WordMath {
 
         try FileManager.default.removeItem(at: docx)
         try await Tools.run("/usr/bin/zip", ["-q", "-X", "-r", docx.path, "."], currentDirectory: package)
+    }
+}
+
+/// A Markdown table as a Word table: thin borders, columns sharing the page width, a bold header row
+/// that repeats on each page. Cells hold inline HTML (bold, italic, code, struck, links as text).
+nonisolated enum WordTable {
+    static func xml(_ rows: [[String]], font: String = "") -> String {
+        let width = rows.map(\.count).max() ?? 0
+        guard width > 0 else { return "" }
+        let column = 9360 / width     // 6.5" of text width, in twentieths of a point
+        let border = #"w:val="single" w:sz="4" w:space="0" w:color="A0A0A0""#
+        var xml = #"<w:tbl><w:tblPr><w:tblW w:w="\#(column * width)" w:type="dxa"/><w:tblBorders>"#
+        xml += ["top", "left", "bottom", "right", "insideH", "insideV"].map { "<w:\($0) \(border)/>" }.joined()
+        xml += #"</w:tblBorders><w:tblLayout w:type="fixed"/><w:tblCellMar><w:left w:w="80" w:type="dxa"/><w:right w:w="80" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>"#
+        xml += String(repeating: #"<w:gridCol w:w="\#(column)"/>"#, count: width) + "</w:tblGrid>"
+        for (r, row) in rows.enumerated() {
+            xml += r == 0 ? "<w:tr><w:trPr><w:tblHeader/></w:trPr>" : "<w:tr>"
+            for c in 0..<width {
+                let content = c < row.count ? runs(row[c], bold: r == 0, font: font) : ""
+                xml += #"<w:tc><w:tcPr><w:tcW w:w="\#(column)" w:type="dxa"/></w:tcPr><w:p><w:pPr><w:spacing w:before="40" w:after="40"/></w:pPr>\#(content)</w:p></w:tc>"#
+            }
+            xml += "</w:tr>"
+        }
+        return xml + "</w:tbl>"
+    }
+
+    private static let token = /<(\/?)([a-zA-Z]+)[^>]*>|[^<]+/
+
+    /// Inline HTML as Word runs. Its text is already escaped for XML.
+    static func runs(_ html: String, bold: Bool, font: String = "") -> String {
+        var out = ""
+        var strong = 0, em = 0, code = 0, del = 0
+        for match in html.matches(of: token) {
+            guard let name = match.output.2 else {
+                let text = String(match.output.0)
+                var properties = ""
+                properties += code > 0 ? #"<w:rFonts w:ascii="Menlo" w:hAnsi="Menlo" w:cs="Menlo"/>"# : font
+                if bold || strong > 0 { properties += "<w:b/>" }
+                if em > 0 { properties += "<w:i/>" }
+                if del > 0 { properties += "<w:strike/>" }
+                if code > 0 { properties += #"<w:sz w:val="19"/>"# }
+                out += "<w:r>" + (properties.isEmpty ? "" : "<w:rPr>\(properties)</w:rPr>") + #"<w:t xml:space="preserve">\#(text)</w:t></w:r>"#
+                continue
+            }
+            let step = match.output.1 == "/" ? -1 : 1
+            switch name.lowercased() {
+            case "strong", "b": strong = max(0, strong + step)
+            case "em", "i": em = max(0, em + step)
+            case "code": code = max(0, code + step)
+            case "del", "s": del = max(0, del + step)
+            default: break
+            }
+        }
+        return out
     }
 }
