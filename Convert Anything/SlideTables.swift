@@ -139,7 +139,7 @@ nonisolated struct SlideTable {
         for selection in page.selection(for: pageRect)?.selectionsByLine() ?? [] {
             guard let attributed = selection.attributedString else { continue }
             let bounds = selection.bounds(for: page)
-            var runs = PDFText.styledRuns(attributed, lineHeight: bounds.height)
+            var runs = PDFText.styledRuns(attributed, lineHeight: bounds.height, page: page, selection: selection)
             guard !runs.isEmpty else { continue }
             while let last = runs.last?.text, last.hasSuffix(" ") { runs[runs.count - 1].text.removeLast() }
             lines.append(TextLine(frame: CGRect(x: bounds.minX - crop.minX, y: crop.maxY - bounds.maxY, width: bounds.width, height: bounds.height),
