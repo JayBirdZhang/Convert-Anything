@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/cd589974-3f86-4b3d-a146-ac4dc21ce3fd
 | **Spreadsheets** | Excel (.xlsx/.xls), CSV, Numbers |
 | **Audio** | MP3, WAV, M4A, AAC, FLAC, Ogg, Opus, AIFF |
 | **Video** | MP4, MOV, M4V, and video → GIF |
-| **Transcripts** | Audio or video → TXT, SRT or WebVTT (.vtt) subtitles; subtitles → TXT |
+| **Transcripts** | Audio or video → TXT, SRT or WebVTT (.vtt) subtitles; SRT ↔ WebVTT; subtitles → TXT or any document format |
 
 Click **Formats** at the bottom of the menu to see every conversion. (Pretty much anything you can think of is convertible.)
 

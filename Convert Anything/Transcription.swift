@@ -9,6 +9,9 @@ nonisolated enum Transcription {
         let audio = try await openAudio(request, progress: progress)
         let duration = Double(audio.length) / audio.processingFormat.sampleRate
         guard duration > 0 else { throw ConversionError.failed("This file has no sound to transcribe.") }
+        // A video's soundtrack was decoded first and already filled the first 5% of the bar.
+        let base = audio.url.lastPathComponent == extractedName ? 0.05 : 0
+        let progress: @Sendable (Double) -> Void = { progress(base + (1 - base) * $0) }
 
         var tokens: [Transcript.Token]
         if #available(macOS 26, *), SpeechTranscriber.isAvailable, !forceLegacy {
@@ -57,9 +60,10 @@ nonisolated enum Transcription {
         reader.add(trackOutput)
         guard reader.startReading() else { throw reader.error ?? ConversionError.failed("Couldn't read this file's sound.") }
 
-        let url = request.workDir.appending(path: "speech.caf")
+        let url = request.workDir.appending(path: extractedName)
         let file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatInt16, interleaved: true)
         let format = file.processingFormat
+        var reported = 0.0
         while let sample = trackOutput.copyNextSampleBuffer() {
             try Task.checkCancellation()
             let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sample))
@@ -69,11 +73,14 @@ nonisolated enum Transcription {
                                                                 into: buffer.mutableAudioBufferList) == noErr else { continue }
             try file.write(from: buffer)
             // Decoding is quick next to recognizing, so it gets the first few percent of the bar.
-            if duration > 0 { progress(0.05 * min(1, CMSampleBufferGetPresentationTimeStamp(sample).seconds / duration)) }
+            let done = duration > 0 ? min(1, CMSampleBufferGetPresentationTimeStamp(sample).seconds / duration) : 0
+            if done - reported >= 0.05 { reported = done; progress(0.05 * done) }
         }
         if reader.status == .failed { throw reader.error ?? ConversionError.failed("Couldn't read this file's sound.") }
         return try AVAudioFile(forReading: url)
     }
+
+    private static let extractedName = "speech.caf"
 
     /// The system's language when speech recognition knows it, otherwise English.
     static func languageName(_ locale: Locale) -> String {
@@ -202,7 +209,7 @@ nonisolated private enum LegacyEngine {
             try Task.checkCancellation()
             finished = try read(audio, through: converter, into: &samples, upTo: maxChunk)
             while samples.count >= maxChunk || (finished && !samples.isEmpty) {
-                let cut = samples.count <= maxChunk ? samples.count : quietestPoint(in: samples, from: searchFrom, to: maxChunk)
+                let cut = finished && samples.count <= maxChunk ? samples.count : quietestPoint(in: samples, from: searchFrom, to: maxChunk)
                 tokens += try await recognize(samples[0..<cut], offset: offset, with: recognizer, format: format)
                 samples.removeFirst(cut)
                 offset += Double(cut) / sampleRate
@@ -473,6 +480,9 @@ nonisolated enum Transcript {
 
 /// SRT and WebVTT files: their text without the timings, or the same cues in the other format.
 nonisolated enum Subtitles {
+    /// Formats that are written directly; other documents (Word, PDF…) are laid out from the plain text.
+    static let directTargets: [Format] = [.txt, .md, .srt, .vtt]
+
     static func convert(_ request: Converter.Request, output: URL) async throws {
         let data = try Data(contentsOf: request.input)
         guard let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252) else {
@@ -480,17 +490,21 @@ nonisolated enum Subtitles {
         }
         let cues = parse(text)
         guard !cues.isEmpty else { throw ConversionError.failed("No subtitles were found in this file.") }
-        let result: String
+        // Each cue joins the text like a word does, so pauses between cues still start new paragraphs.
+        let paragraphs = Transcript.paragraphs(from: cues.map { cue in
+            .init(text: cue.lines.joined(separator: " ") + " ", start: cue.start, end: cue.end)
+        })
         switch request.to {
-        case .srt: result = Transcript.srt(cues)
-        case .vtt: result = Transcript.vtt(cues)
+        case .srt: try Transcript.srt(cues).write(to: output, atomically: true, encoding: .utf8)
+        case .vtt: try Transcript.vtt(cues).write(to: output, atomically: true, encoding: .utf8)
+        case .txt, .md: try paragraphs.write(to: output, atomically: true, encoding: .utf8)
         default:
-            // Each cue joins the text like a word does, so pauses between cues still start new paragraphs.
-            result = Transcript.paragraphs(from: cues.map { cue in
-                .init(text: cue.lines.joined(separator: " ") + " ", start: cue.start, end: cue.end)
-            })
+            let text = request.workDir.appending(path: "subtitles.txt")
+            try paragraphs.write(to: text, atomically: true, encoding: .utf8)
+            let textRequest = Converter.Request(input: text, from: .txt, to: request.to, workDir: request.workDir,
+                                            title: request.title, originalDir: request.originalDir, quality: request.quality)
+            try await DocumentConversion.convert(textRequest, output: output)
         }
-        try result.write(to: output, atomically: true, encoding: .utf8)
     }
 
     /// Reads cues from SRT or WebVTT, dropping numbering, styling tags and WebVTT's notes and style blocks.

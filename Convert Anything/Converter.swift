@@ -20,7 +20,7 @@ enum Converter {
         case textRecognition   // Vision reads the text in an image
         case documentToImage   // A document or spreadsheet is laid out as a PDF, then its pages become images
         case transcription     // Speech framework writes down what's said in audio or video, on the Mac
-        case subtitles         // Subtitles lose their timings (→ text) or change format (SRT ↔ WebVTT)
+        case subtitles         // Subtitles lose their timings (→ text and documents) or change format (SRT ↔ WebVTT)
     }
 
     static let documentSources: [Format] = [.md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .pdf]
@@ -62,7 +62,7 @@ enum Converter {
     private static func transcriptionRoute(from: Format, to: Format) -> Route? {
         let subtitles: [Format] = [.srt, .vtt]
         if [.audio, .video].contains(from.kind) && (to == .txt || subtitles.contains(to)) { return .transcription }
-        if subtitles.contains(from) { return [.txt, .md, .srt, .vtt].contains(to) ? .subtitles : nil }
+        if subtitles.contains(from) { return Subtitles.directTargets.contains(to) || documentTargets.contains(to) ? .subtitles : nil }
         return nil
     }
 
