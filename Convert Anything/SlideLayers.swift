@@ -37,7 +37,6 @@ nonisolated enum SlideLayers {
     static func split(_ page: PDFPage, scale: CGFloat) throws -> Layers? {
         guard let source = page.pageRef else { return nil }
         let crop = page.bounds(for: .cropBox)
-        let pageArea = crop.width * crop.height
         let steps = try TextlessPDF.paintedAreas(on: source)
         let areas = steps.map { step -> CGRect? in
             let visible = step.area.intersection(crop)
@@ -45,25 +44,7 @@ nonisolated enum SlideLayers {
             return CGRect(x: visible.minX - crop.minX, y: crop.maxY - visible.maxY, width: visible.width, height: visible.height)
         }
 
-        var foreground: [Int] = []
-        var bands: [Int] = []
-        for (index, area) in areas.enumerated() {
-            guard let area else { continue }
-            if area.width * area.height >= pageArea * 0.75 {
-                // Something covering the page goes behind everything drawn before it too, so nothing
-                // that was under it ends up on top.
-                foreground.removeAll()
-                bands.removeAll()
-            } else if foreground.isEmpty && (area.width >= crop.width * 0.9 || area.height >= crop.height * 0.9) {
-                bands.append(index)
-            } else {
-                foreground.append(index)
-            }
-        }
-        // Leading bands are a background only when together they fill most of the page (a gradient
-        // drawn as strips); a lone rule or a striped table's first rows stay things of their own.
-        let banded = bands.reduce(CGRect.null) { $0.union(areas[$1]!) }
-        if !bands.isEmpty && banded.width * banded.height < pageArea * 0.5 { foreground = bands + foreground }
+        let foreground = foregroundSteps(areas, crop: crop)
         guard !foreground.isEmpty, foreground.count <= maxSteps else { return nil }
 
         // Group nearby steps; when that leaves too many pieces (a map or a diagram drawn as many small
@@ -103,7 +84,6 @@ nonisolated enum SlideLayers {
         // Groups that are a single drawing step: a photo drawn plainly is embedded at its own resolution.
         var members = [Int](repeating: 0, count: groups.frames.count), only = [Int: Int]()
         for (position, index) in foreground.enumerated() { members[groups.member[position]] += 1; only[groups.member[position]] = index }
-        let longSide = max(crop.width, crop.height) * scale
         var layers = Layers(background: background.flatMap { isWhite($0) ? nil : $0 }, pictures: [])
         for id in order {
             if members[id] == 1, let index = only[id], let name = steps[index].plainImage,
@@ -172,6 +152,30 @@ nonisolated enum SlideLayers {
         case .jpeg(let data): return Picture(frame: frame, image: nil, jpeg: data, hasImage: true)
         case .image(let image): return Picture(frame: frame, image: image, hasImage: true)
         }
+    }
+
+    /// The steps that aren't the page's background, in drawing order. Steps that cover most of the page
+    /// (a background color or full-page photo) are background, and so is everything drawn before one. So
+    /// are full-width or full-height bands drawn before anything else, when together they fill most of the
+    /// page (a gradient drawn as strips); a header bar, a lone rule or a striped table's first rows stay
+    /// things of their own.
+    private static func foregroundSteps(_ areas: [CGRect?], crop: CGRect) -> [Int] {
+        let pageArea = crop.width * crop.height
+        var foreground: [Int] = []
+        var bands: [Int] = []
+        for (index, area) in areas.enumerated() {
+            guard let area else { continue }
+            if area.width * area.height >= pageArea * 0.75 {
+                foreground.removeAll()
+                bands.removeAll()
+            } else if foreground.isEmpty && (area.width >= crop.width * 0.9 || area.height >= crop.height * 0.9) {
+                bands.append(index)
+            } else {
+                foreground.append(index)
+            }
+        }
+        let banded = bands.reduce(0) { $0 + areas[$1]!.width * areas[$1]!.height }
+        return !bands.isEmpty && banded < pageArea * 0.5 ? bands + foreground : foreground
     }
 
     /// Which group each area belongs to (an index into `frames`), and each group's box. Areas closer than
@@ -332,7 +336,7 @@ nonisolated final class ClearDrawing {
 /// The same grouping for a document page (PDF → Word), without rendering anything: which drawing steps
 /// make up the background and how the rest group into pictures, so the caller can decide what's worth
 /// drawing before it draws.
-extension SlideLayers {
+nonisolated extension SlideLayers {
     struct Plan {
         struct Group {
             var frame: CGRect       // Page points from the top left of the visible page
@@ -358,29 +362,13 @@ extension SlideLayers {
     static func plan(_ page: PDFPage, minSide: CGFloat = 0) throws -> Plan? {
         guard let source = page.pageRef else { return nil }
         let crop = page.bounds(for: .cropBox)
-        let pageArea = crop.width * crop.height
         let steps = try TextlessPDF.paintedAreas(on: source)
         let areas = steps.map { step -> CGRect? in
             let visible = step.area.intersection(crop)
             guard !visible.isNull, visible.width > 0, visible.height > 0 else { return nil }
             return CGRect(x: visible.minX - crop.minX, y: crop.maxY - visible.maxY, width: visible.width, height: visible.height)
         }
-        // The background, as in split(_:scale:).
-        var foreground: [Int] = []
-        var bands: [Int] = []
-        for (index, area) in areas.enumerated() {
-            guard let area else { continue }
-            if area.width * area.height >= pageArea * 0.75 {
-                foreground.removeAll()
-                bands.removeAll()
-            } else if foreground.isEmpty && (area.width >= crop.width * 0.9 || area.height >= crop.height * 0.9) {
-                bands.append(index)
-            } else {
-                foreground.append(index)
-            }
-        }
-        let banded = bands.reduce(CGRect.null) { $0.union(areas[$1]!) }
-        if !bands.isEmpty && banded.width * banded.height < pageArea * 0.5 { foreground = bands + foreground }
+        let foreground = foregroundSteps(areas, crop: crop)
         guard foreground.count <= maxSteps else { return nil }
         let inForeground = Set(foreground)
         let background = areas.indices.filter { areas[$0] != nil && !inForeground.contains($0) }

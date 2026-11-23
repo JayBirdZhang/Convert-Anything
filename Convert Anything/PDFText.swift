@@ -15,6 +15,7 @@ nonisolated struct TextLine {
     var frame: CGRect       // Page points, origin at the top left of the visible page
     var runs: [TextRun]
     var fontSize: CGFloat
+    var isFormField = false     // What's typed into a form field, rather than the page's own text
 }
 
 /// Lines that belong together (a paragraph, a title), so they become one editable text box.
@@ -34,10 +35,8 @@ nonisolated enum PDFText {
     /// Every line of text on the page, top to bottom, with its position and styling.
     static func lines(on page: PDFPage) -> [TextLine] {
         let crop = page.bounds(for: .cropBox)
-        guard let selection = page.selection(for: crop) else { return [] }
-
         var lines: [TextLine] = []
-        for lineSelection in selection.selectionsByLine() {
+        for lineSelection in page.selection(for: crop)?.selectionsByLine() ?? [] {
             guard let attributed = lineSelection.attributedString else { continue }
             let bounds = lineSelection.bounds(for: page)
             let runs = styledRuns(attributed, lineHeight: bounds.height, page: page, selection: lineSelection)
@@ -46,6 +45,39 @@ nonisolated enum PDFText {
                 frame: CGRect(x: bounds.minX - crop.minX, y: crop.maxY - bounds.maxY, width: bounds.width, height: bounds.height),
                 runs: runs,
                 fontSize: runs.map(\.size).max() ?? 12))
+        }
+        return lines + formLines(on: page, crop: crop)
+    }
+
+    /// What's typed into the page's form fields. It's drawn by the fields, not the page, so it isn't in the
+    /// page's text, and the copies of the page made without text leave it out too.
+    private static func formLines(on page: PDFPage, crop: CGRect) -> [TextLine] {
+        var lines: [TextLine] = []
+        for field in page.annotations where field.type == "Widget" && field.widgetFieldType == .text && field.shouldDisplay {
+            let value = field.widgetStringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !value.isEmpty else { continue }
+            let box = field.bounds
+            let rows = value.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            // A size of 0 means "fit the field".
+            let fitted = min(12, box.height * 0.7 / CGFloat(max(1, rows.count)))
+            let size = field.font.map { $0.pointSize > 0 ? $0.pointSize : fitted } ?? fitted
+            let font = NSFont(name: field.font?.fontName ?? "Helvetica", size: size) ?? NSFont.systemFont(ofSize: size)
+            let family = font.familyName ?? "Helvetica"
+            let traits = font.fontDescriptor.symbolicTraits
+            let height = size * 1.2
+            // Single-line fields center their text; a multiline one starts at the top.
+            var top = rows.count == 1 ? crop.maxY - box.midY - height / 2 : crop.maxY - box.maxY + 2
+            for row in rows {
+                let width = min(box.width - 4, (row as NSString).size(withAttributes: [.font: font]).width)
+                var left = box.minX + 2
+                if field.alignment == .center { left = box.midX - width / 2 } else if field.alignment == .right { left = box.maxX - 2 - width }
+                lines.append(TextLine(
+                    frame: CGRect(x: left - crop.minX, y: top, width: max(1, width), height: height),
+                    runs: [TextRun(text: row, font: family, size: size, bold: traits.contains(.bold), italic: traits.contains(.italic),
+                                   color: field.fontColor.flatMap(hex))],
+                    fontSize: size, isFormField: true))
+                top += height
+            }
         }
         return lines
     }

@@ -102,9 +102,15 @@ nonisolated enum PDFToWord {
             return Page(size: size, items: [(CGRect(origin: .zero, size: size), .image(file: try save(rendered, false), size: size))])
         }
 
-        let lines = PDFText.lines(on: page)
+        var lines = PDFText.lines(on: page)
+        // A form's answers follow the label on their row (they sit a little higher, in the field's box).
+        for index in lines.indices where lines[index].isFormField {
+            let middle = lines[index].frame.midY
+            let row = lines.filter { !$0.isFormField && $0.frame.minY <= middle && middle <= $0.frame.maxY }.map(\.frame.minY).max()
+            if let row, row > lines[index].frame.minY { lines[index].frame.origin.y = row + 0.01 }
+        }
         var rendered: CGImage?
-        if lines.isEmpty {
+        if !lines.contains(where: { !$0.isFormField }) {
             // A scan: recognize its text instead of copying the picture of it.
             let image = try ImageConversion.render(page, scale: scale)
             rendered = image
@@ -249,11 +255,21 @@ nonisolated enum PDFToWord {
             if picture.group.hasImage {
                 // Text on a photo (a caption over it, labels on a product shot) stays in it, as before;
                 // a photo under paragraphs of text is a background to them and is left out.
-                let on = lines.filter { line in line.frame.intersection(found).area > line.frame.area * 0.5 }
-                if on.reduce(0, { $0 + $1.runs.reduce(0) { $0 + $1.text.count } }) > 150 { continue }
+                func text(on rect: CGRect) -> [TextLine] { lines.filter { $0.frame.intersection(rect).area > $0.frame.area * 0.5 } }
+                func letters(_ lines: [TextLine]) -> Int { lines.reduce(0) { $0 + $1.runs.reduce(0) { $0 + $1.text.count } } }
+                var photo = found, photoPixels = picture.pixels
+                var on = text(on: photo)
+                if letters(on) > 150 {
+                    // A photo grouped with a panel it sits on (a sheet of paper drawn behind the text, with a
+                    // logo on it): the photo alone, if no paragraphs are on it.
+                    let images = picture.group.steps.compactMap { plan.steps[$0].isImage ? plan.areas[$0] : nil }.reduce(CGRect.null) { $0.union($1) }
+                    guard !images.isNull, images.area < found.area * 0.5 else { continue }
+                    photo = images; photoPixels = pixels(images); on = text(on: photo)
+                    if letters(on) > 150 { continue }
+                }
                 lines.removeAll { line in on.contains { $0.frame == line.frame } }
-                let tight = on.reduce(found) { $0.union($1.frame) }
-                add(tight, tight == found ? picture.pixels : pixels(tight), .photo)
+                let tight = on.reduce(photo) { $0.union($1.frame) }
+                add(tight, tight == photo ? photoPixels : pixels(tight), .photo)
                 continue
             }
             let others = shown.indices.filter { $0 != number }.map { shown[$0].frame }
@@ -271,14 +287,17 @@ nonisolated enum PDFToWord {
                 region.insetBy(dx: -2, dy: -2).contains(line.frame) && line.fontSize < bodySize * 1.15
                     && line.runs.first.map({ $0.text.prefixMatch(of: /\s*(Figure|Fig\.|Table|Chart)\s*\d/) == nil }) != false
             }
+            // A plain box behind some text (a callout, a colored heading bar) keeps its text editable, and so
+            // does a shape with paragraphs of ordinary text in it.
+            let plainBox = picture.group.steps.allSatisfy { plan.areas[$0].map { $0.insetBy(dx: -2, dy: -2).contains(picture.group.frame) } ?? true }
             if inside.isEmpty {
+                // Text on a plain box that doesn't count as its label (a title larger than the body text) would
+                // leave a hole in it.
+                if plainBox && lines.contains(where: { $0.frame.intersection(found).area > $0.frame.area * 0.5 }) { continue }
                 add(found, picture.pixels, .shapes)
                 continue
             }
-            // A plain box behind some text (a callout, a colored heading bar) keeps its text editable, and so
-            // does a shape with paragraphs of ordinary text in it.
             let bodyText = inside.filter { $0.fontSize >= bodySize * 0.9 }.reduce(0) { $0 + $1.runs.reduce(0) { $0 + $1.text.count } }
-            let plainBox = picture.group.steps.allSatisfy { plan.areas[$0].map { $0.insetBy(dx: -2, dy: -2).contains(picture.group.frame) } ?? true }
             if bodyText > 150 || plainBox { continue }
             lines.removeAll { line in inside.contains { $0.frame == line.frame } }
             let tight = inside.reduce(found) { $0.union($1.frame) }.insetBy(dx: -2, dy: -2).intersection(pageRect)
