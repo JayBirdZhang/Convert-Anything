@@ -21,8 +21,8 @@ enum Converter {
         case documentToImage   // A document or spreadsheet is laid out as a PDF, then its pages become images
     }
 
-    static let documentSources: [Format] = [.md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .pdf]
-    static let documentTargets: [Format] = [.md, .txt, .html, .docx, .doc, .rtf, .odt, .pdf]
+    static let documentSources: [Format] = [.md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .pdf, .epub]
+    static let documentTargets: [Format] = [.md, .txt, .html, .docx, .doc, .rtf, .odt, .pdf, .epub]
 
     static func route(from: Format, to: Format) -> Route? {
         guard from != to, !to.isIWork else { return nil }   // Pages, Numbers and Keynote can be read but not written
@@ -166,7 +166,7 @@ enum Converter {
             let pageCount = document.pageCount
             // Markdown, text and HTML have no pages of their own, so the last page loses the empty space
             // below its last line instead of keeping the whole letter-size sheet the PDF step laid it out on.
-            let trimsLastPage = [.md, .txt, .html].contains(request.from)
+            let trimsLastPage = [.md, .txt, .html, .epub].contains(request.from)
             @Sendable func save(_ page: PDFPage, to url: URL, isLast: Bool) throws {
                 var image = try ImageConversion.render(page, scale: request.quality.pageScale)
                 if trimsLastPage && isLast { image = ImageConversion.trimmingBottom(of: image) }

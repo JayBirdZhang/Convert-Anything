@@ -45,7 +45,7 @@ https://github.com/user-attachments/assets/cd589974-3f86-4b3d-a146-ac4dc21ce3fd
 | Kind | Formats |
 |---|---|
 | **Images** | PNG, JPEG, HEIC, TIFF, GIF, BMP, WebP, AVIF, ICO |
-| **Documents** | PDF, Markdown, TXT, HTML, Word (.docx/.doc), RTF, ODT, Pages, PowerPoint (.pptx/.ppt), Keynote |
+| **Documents** | PDF, Markdown, TXT, HTML, Word (.docx/.doc), RTF, ODT, Pages, EPUB, PowerPoint (.pptx/.ppt), Keynote |
 | **Spreadsheets** | Excel (.xlsx/.xls), CSV, Numbers |
 | **Audio** | MP3, WAV, M4A, AAC, FLAC, Ogg, Opus, AIFF |
 | **Video** | MP4, MOV, M4V, and video → GIF |

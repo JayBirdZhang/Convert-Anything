@@ -4,7 +4,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     // Images
     case png, jpeg, heic, tiff, gif, bmp, webp, avif, ico
     // Documents (including presentations)
-    case pdf, md, txt, html, docx, doc, rtf, odt, pages, pptx, ppt, key
+    case pdf, md, txt, html, docx, doc, rtf, odt, pages, epub, pptx, ppt, key
     // Spreadsheets
     case xlsx, xls, csv, numbers
     // Audio
@@ -32,7 +32,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     var kind: Kind {
         switch self {
         case .png, .jpeg, .heic, .tiff, .gif, .bmp, .webp, .avif, .ico: .image
-        case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .pptx, .ppt, .key: .document
+        case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .epub, .pptx, .ppt, .key: .document
         case .xlsx, .xls, .csv, .numbers: .spreadsheet
         case .mp3, .wav, .m4a, .aac, .flac, .ogg, .opus, .aiff: .audio
         case .mp4, .mov, .m4v: .video
@@ -57,6 +57,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
         case .ppt: "PowerPoint 97"
         case .key: "Keynote"
         case .pages: "Pages"
+        case .epub: "EPUB"
         case .numbers: "Numbers"
         case .xlsx: "Excel"
         case .xls: "Excel 97"
@@ -146,10 +147,12 @@ nonisolated enum Sniffer {
         return .unknown
     }
 
-    /// docx, pptx, xlsx and odt are all zip archives. odt names itself in its first entry;
+    /// docx, pptx, xlsx, odt and epub are all zip archives. odt and epub name themselves in the first entry
+    /// (epub's is a stored file called "mimetype", so its text sits at a fixed spot near the start);
     /// Office files are told apart by the folder names listed in the zip's directory at the end of the file.
     private static func detectZip(_ url: URL, head: Data) -> Result {
         if head.range(of: Data("application/vnd.oasis.opendocument.text".utf8)) != nil { return .format(.odt) }
+        if head.dropFirst(30).starts(with: Data("mimetype".utf8)), head.prefix(100).range(of: Data("application/epub+zip".utf8)) != nil { return .format(.epub) }
 
         guard let handle = try? FileHandle(forReadingFrom: url) else { return .unknown }
         defer { try? handle.close() }
