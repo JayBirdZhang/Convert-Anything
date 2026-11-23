@@ -182,12 +182,13 @@ nonisolated enum Spreadsheets {
     }
 
     /// Plain numbers only: "007", "1,000" and "+5" stay text, as a spreadsheet would show them.
-    /// Matches -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)? in under 16 characters (a regex here was the slowest step).
+    /// Matches -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)? (a regex here was the slowest step). Whole numbers
+    /// stop at 15 digits, so long IDs keep every digit as text; decimals may be longer, as in 0.14285714285714285.
     static func isNumber(_ value: String) -> Bool {
         var value = value
         return value.withUTF8 { b in
             let n = b.count
-            guard n > 0, n < 16 else { return false }
+            guard n > 0, n < 40 else { return false }
             var i = 0
             func digits() -> Int {
                 let start = i
@@ -197,13 +198,15 @@ nonisolated enum Spreadsheets {
             if b[i] == 45 { i += 1 }
             guard i < n else { return false }
             if b[i] == 48 { i += 1 } else if digits() == 0 { return false }
-            if i < n, b[i] == 46 { i += 1; if digits() == 0 { return false } }
+            var isWhole = true
+            if i < n, b[i] == 46 { i += 1; isWhole = false; if digits() == 0 { return false } }
             if i < n, b[i] == 69 || b[i] == 101 {
                 i += 1
+                isWhole = false
                 if i < n, b[i] == 43 || b[i] == 45 { i += 1 }
                 if digits() == 0 { return false }
             }
-            return i == n
+            return i == n && (n < 16 || !isWhole)
         }
     }
 

@@ -134,6 +134,16 @@ nonisolated enum Sniffer {
         return .unknown
     }
 
+    /// Whether a text file's first character is `{` or `[`. Used only to recognize JSON that was saved with a
+    /// different extension, never to decide a file's format on its own.
+    static func looksLikeJSON(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        let head = (try? handle.read(upToCount: 64)) ?? Data()
+        let first = head.drop { [0x20, 0x09, 0x0A, 0x0D].contains($0) }.first ?? 0
+        return first == UInt8(ascii: "{") || first == UInt8(ascii: "[")
+    }
+
     /// Old Word, Excel and PowerPoint files share one container format; the name of the main stream
     /// inside (stored as UTF-16) says which one it is.
     private static func detectLegacyOffice(_ url: URL) -> Result {

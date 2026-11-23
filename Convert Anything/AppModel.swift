@@ -225,6 +225,8 @@ enum OriginalsMode: String, CaseIterable {
         case .format(let detected):
             source = detected
         case .text:
+            // A text file renamed to .json is only fixing its extension when it really holds JSON.
+            if newFormat == .json && oldFormat == .txt && Sniffer.looksLikeJSON(newURL) { return }
             source = oldFormat.isPlainText ? oldFormat : .txt
         case .iWork:
             guard oldFormat.isIWork else { return }

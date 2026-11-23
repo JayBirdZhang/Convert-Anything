@@ -71,7 +71,10 @@ nonisolated enum DataFormats {
             throw ConversionError.failed(emptyMessage)
         }
         let header = rows[start]
-        let width = rows[start...].reduce(0) { max($0, $1.count) }
+        var width = rows[start...].reduce(0) { max($0, $1.count) }
+        // Numbers pads its tables with empty columns: those aren't data, so they don't become keys.
+        func isBlank(column: Int) -> Bool { rows[start...].allSatisfy { column >= $0.count || $0[column].isEmpty } }
+        while width > 1, isBlank(column: width - 1) { width -= 1 }
 
         // Keys: the header text; blank or repeated headers get a name so every column survives.
         var used = Set<String>()
