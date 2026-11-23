@@ -16,7 +16,7 @@ enum Converter {
         case fromSlides     // Keynote (or Quick Look) renders a presentation as PDF (then pages → images)
         case slidesExport   // Keynote saves older PowerPoint and Keynote files as .pptx
         case toSlides       // One slide per PDF page or image
-        case spreadsheet    // Excel ↔ CSV directly; Numbers for the rest
+        case spreadsheet    // Excel ↔ CSV and JSON ↔ CSV/Excel directly; Numbers for the rest
         case textRecognition   // Vision reads the text in an image
         case documentToImage   // A document or spreadsheet is laid out as a PDF, then its pages become images
     }
@@ -37,7 +37,9 @@ enum Converter {
         if from.kind == .spreadsheet || to.kind == .spreadsheet {
             guard from.kind == .spreadsheet else { return nil }
             if to.kind == .image { return .documentToImage }
-            return [.pdf, .csv, .xlsx].contains(to) ? .spreadsheet : nil
+            // JSON is read as a table: it can become a spreadsheet (or a laid-out document) but not Excel 97 or Numbers.
+            let targets: [Format] = from == .json ? [.pdf, .csv, .xlsx] : [.pdf, .csv, .xlsx, .json]
+            return targets.contains(to) ? .spreadsheet : nil
         }
         switch (from.kind, to.kind) {
         case (.image, .image): return .image
@@ -60,7 +62,7 @@ enum Converter {
         switch route(from: from, to: to) {
         case .media: from.kind == .video || to.kind == .video
         case .fromSlides, .slidesExport: true
-        case .spreadsheet: !(from == .xlsx && to == .csv) && !(from == .csv && to == .xlsx)
+        case .spreadsheet: !Spreadsheets.runsWithoutNumbers(from: from, to: to)
         case .document: from == .pages || (to == .pdf && [.docx, .doc, .rtf].contains(from))
         case .documentToImage: isHeavy(from: from, to: .pdf)
         default: false
@@ -128,9 +130,15 @@ enum Converter {
                 result = try await Spreadsheets.xlsxToCSV(request, output: output)
             case (.csv, .xlsx):
                 try await Spreadsheets.csvToXLSX(request, output: output)
+            case (_, .json):
+                result = try await DataFormats.tableToJSON(request, output: output)
+            case (.json, .csv), (.json, .xlsx):
+                try await DataFormats.jsonToTable(request, output: output)
             default:
                 let format: IWork.ExportFormat = request.to == .pdf ? .pdf : request.to == .csv ? .csv : .excel
-                result = try await IWork.export(request.input, with: .numbers, as: format, to: output)
+                // Numbers can't open JSON, so it gets the table as a CSV file.
+                let source = request.from == .json ? try await DataFormats.jsonAsCSV(request) : request.input
+                result = try await IWork.export(source, with: .numbers, as: format, to: output)
             }
         case .textRecognition:
             try await TextRecognition.convertImage(request, output: output)

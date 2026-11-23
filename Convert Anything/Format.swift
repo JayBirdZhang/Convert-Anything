@@ -6,7 +6,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     // Documents (including presentations)
     case pdf, md, txt, html, docx, doc, rtf, odt, pages, pptx, ppt, key
     // Spreadsheets
-    case xlsx, xls, csv, numbers
+    case xlsx, xls, csv, numbers, json
     // Audio
     case mp3, wav, m4a, aac, flac, ogg, opus, aiff
     // Video
@@ -33,15 +33,16 @@ nonisolated enum Format: String, CaseIterable, Sendable {
         switch self {
         case .png, .jpeg, .heic, .tiff, .gif, .bmp, .webp, .avif, .ico: .image
         case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .pptx, .ppt, .key: .document
-        case .xlsx, .xls, .csv, .numbers: .spreadsheet
+        case .xlsx, .xls, .csv, .numbers, .json: .spreadsheet
         case .mp3, .wav, .m4a, .aac, .flac, .ogg, .opus, .aiff: .audio
         case .mp4, .mov, .m4v: .video
         }
     }
 
     /// Plain-text formats can't be told apart by their bytes, so for these
-    /// we trust the file's old extension instead.
-    var isPlainText: Bool { [.md, .txt, .html, .csv].contains(self) }
+    /// we trust the file's old extension instead. (JSON is deliberately not sniffed: a .txt or .md file that
+    /// happens to start with "[" must not turn into a JSON source.)
+    var isPlainText: Bool { [.md, .txt, .html, .csv, .json].contains(self) }
 
     var isSlides: Bool { [.pptx, .ppt, .key].contains(self) }
 
