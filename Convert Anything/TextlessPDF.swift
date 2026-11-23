@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 import PDFKit
 
 /// Makes a copy of a PDF page with everything except its text: photos, shapes, backgrounds and lines stay,
@@ -18,6 +19,9 @@ nonisolated enum TextlessPDF {
     struct Step {
         var area: CGRect
         var isImage: Bool
+        /// The image's resource name when it's drawn plainly: upright, whole (`area` is where it's placed),
+        /// opaque and with no blending, so the image file itself looks the same as the drawing.
+        var plainImage: String? = nil
     }
 
     /// A one-page PDF with the same boxes and rotation as `page` and none of its text. With `keeping`,
@@ -31,6 +35,16 @@ nonisolated enum TextlessPDF {
     /// unclipped shading is `.infinite`. Text isn't a drawing step here: it's left out of every copy.
     static func paintedAreas(on page: CGPDFPage) throws -> [Step] {
         try Writer(page: page).paintedAreas()
+    }
+
+    enum NativeImage {
+        case jpeg(Data)         // As stored in the PDF (or made smaller)
+        case image(CGImage)     // Decoded samples, to be written as PNG
+    }
+
+    /// An image the page draws (see `Step.plainImage`), as it's stored in the PDF; see `Writer.image`.
+    static func image(named name: String, on page: CGPDFPage, maxPixels: Int, minPixels: Int) -> NativeImage? {
+        Writer(page: page).image(named: name, maxPixels: maxPixels, minPixels: minPixels)
     }
 
     /// The page without its text, opened in PDFKit, with the markup people add on top (highlights, ink,
@@ -120,8 +134,10 @@ nonisolated private final class Writer {
 
     func paintedAreas() throws -> [TextlessPDF.Step] {
         guard let pageDictionary = page.dictionary else { throw TextlessPDF.Unsupported(reason: "no page dictionary") }
-        let xobjects = inherited(pageDictionary, "Resources").flatMap { dictionary($0, "XObject") }
-        return try ContentFilter.areas(of: try pageContent(pageDictionary)) { name in
+        let resources = inherited(pageDictionary, "Resources")
+        let xobjects = resources.flatMap { dictionary($0, "XObject") }
+        let states = resources.flatMap { dictionary($0, "ExtGState") }
+        let lookup = ContentFilter.Resources(xobject: { name in
             var stream: CGPDFStreamRef?
             guard let xobjects, CGPDFDictionaryGetStream(xobjects, name, &stream), let stream,
                   let entries = CGPDFStreamGetDictionary(stream) else { return nil }
@@ -141,6 +157,106 @@ nonisolated private final class Writer {
             let box = numbers("BBox").flatMap { $0.count == 4 ? $0 : nil }
                 .map { CGRect(x: $0[0], y: $0[1], width: $0[2] - $0[0], height: $0[3] - $0[1]).standardized } ?? .infinite
             return .form(CGAffineTransform(a: m[0], b: m[1], c: m[2], d: m[3], tx: m[4], ty: m[5]), box)
+        }, isPlainState: { name in
+            // Graphics states that make what's drawn see-through or blend it with what's behind.
+            var state: CGPDFDictionaryRef?
+            guard let states, CGPDFDictionaryGetDictionary(states, name, &state), let state else { return false }
+            var mask: UnsafePointer<CChar>?, value: CGPDFReal = 1, object: CGPDFObjectRef?
+            if CGPDFDictionaryGetObject(state, "SMask", &object), !(CGPDFDictionaryGetName(state, "SMask", &mask) && strcmp(mask!, "None") == 0) { return false }
+            if CGPDFDictionaryGetNumber(state, "ca", &value), value < 1 { return false }
+            if CGPDFDictionaryGetNumber(state, "CA", &value), value < 1 { return false }
+            var blend: UnsafePointer<CChar>?
+            if CGPDFDictionaryGetObject(state, "BM", &object) {
+                guard CGPDFDictionaryGetName(state, "BM", &blend), let blend, strcmp(blend, "Normal") == 0 || strcmp(blend, "Compatible") == 0 else { return false }
+            }
+            return true
+        })
+        return try ContentFilter.areas(of: try pageContent(pageDictionary), resources: lookup)
+    }
+
+    /// The image the page draws under `name`, as a file to embed in place of a picture of it: the JPEG as
+    /// it's stored, or the decoded samples, when that's sure to look the same as the page's drawing of it
+    /// (plain RGB or gray, 8 bits, no masks or remapping). At most `maxPixels` on its longer side; nil when
+    /// it can't be taken as is, or (for samples that would be written out again) when it isn't sharper than
+    /// `minPixels` on its longer side, in which case the page's own picture is just as good.
+    func image(named name: String, maxPixels: Int, minPixels: Int) -> TextlessPDF.NativeImage? {
+        guard let pageDictionary = page.dictionary,
+              let xobjects = inherited(pageDictionary, "Resources").flatMap({ dictionary($0, "XObject") }) else { return nil }
+        var stream: CGPDFStreamRef?
+        guard CGPDFDictionaryGetStream(xobjects, name, &stream), let stream, let entries = CGPDFStreamGetDictionary(stream) else { return nil }
+        var width: CGPDFInteger = 0, height: CGPDFInteger = 0, bits: CGPDFInteger = 0, flag: CGPDFBoolean = 0
+        var object: CGPDFObjectRef?
+        guard CGPDFDictionaryGetInteger(entries, "Width", &width), CGPDFDictionaryGetInteger(entries, "Height", &height),
+              width > 0, height > 0, CGPDFDictionaryGetInteger(entries, "BitsPerComponent", &bits), bits == 8,
+              !(CGPDFDictionaryGetBoolean(entries, "ImageMask", &flag) && flag != 0),
+              !CGPDFDictionaryGetObject(entries, "SMask", &object), !CGPDFDictionaryGetObject(entries, "Mask", &object),
+              !CGPDFDictionaryGetObject(entries, "Decode", &object), !CGPDFDictionaryGetObject(entries, "SMaskInData", &object) else { return nil }
+        // DeviceRGB or DeviceGray, or (for samples) an RGB or gray ICC profile, which goes along with them.
+        var components = 0, profile: CGColorSpace?
+        var space: UnsafePointer<CChar>?, array: CGPDFArrayRef?
+        if CGPDFDictionaryGetName(entries, "ColorSpace", &space), let space {
+            components = strcmp(space, "DeviceRGB") == 0 ? 3 : strcmp(space, "DeviceGray") == 0 ? 1 : 0
+        } else if CGPDFDictionaryGetArray(entries, "ColorSpace", &array), let array, CGPDFArrayGetCount(array) == 2,
+                  CGPDFArrayGetName(array, 0, &space), let space, strcmp(space, "ICCBased") == 0 {
+            var iccStream: CGPDFStreamRef?, count: CGPDFInteger = 0, format = CGPDFDataFormat.raw
+            if CGPDFArrayGetStream(array, 1, &iccStream), let iccStream, let iccEntries = CGPDFStreamGetDictionary(iccStream),
+               CGPDFDictionaryGetInteger(iccEntries, "N", &count), count == 1 || count == 3,
+               let data = CGPDFStreamCopyData(iccStream, &format), format == .raw,
+               let colorSpace = CGColorSpace(iccData: data), colorSpace.numberOfComponents == count {
+                components = Int(count)
+                profile = colorSpace
+            }
+        }
+        guard components > 0 else { return nil }
+        let longest = max(Int(width), Int(height))
+        // Samples that wouldn't be sharper than the page picture aren't worth decoding.
+        var filter: UnsafePointer<CChar>?, filters: CGPDFArrayRef?
+        let isJPEG = CGPDFDictionaryGetName(entries, "Filter", &filter) ? strcmp(filter!, "DCTDecode") == 0
+            : CGPDFDictionaryGetArray(entries, "Filter", &filters) && filters.map {
+                CGPDFArrayGetCount($0) > 0 && CGPDFArrayGetName($0, CGPDFArrayGetCount($0) - 1, &filter) && strcmp(filter!, "DCTDecode") == 0
+            } == true
+        guard isJPEG || longest > minPixels else { return nil }
+        var format = CGPDFDataFormat.raw
+        guard let data = CGPDFStreamCopyData(stream, &format) as Data? else { return nil }
+        let fits = longest <= maxPixels
+        switch format {
+        case .jpegEncoded:
+            // The stored JPEG, unless its own header disagrees with the PDF's description, it has an ICC
+            // profile of its own in the PDF (which the file wouldn't carry), or a color-transform override.
+            // The PDF ignores the file's own orientation and color profile, which slide apps would follow,
+            // so it must have none (or the standard sRGB profile).
+            guard profile == nil, Writer.colorTransform(entries).isEmpty,
+                  let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                  properties[kCGImagePropertyPixelWidth] as? Int == Int(width), properties[kCGImagePropertyPixelHeight] as? Int == Int(height),
+                  properties[kCGImagePropertyColorModel] as? String == (components == 3 ? "RGB" : "Gray"),
+                  (properties[kCGImagePropertyOrientation] as? Int ?? 1) == 1,
+                  (properties[kCGImagePropertyProfileName] as? String).map({ components == 3 && $0.contains("sRGB") }) ?? true else { return nil }
+            if fits { return .jpeg(data) }
+            let options = [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+                           kCGImageSourceCreateThumbnailWithTransform: false] as CFDictionary
+            guard let smaller = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else { return nil }
+            let output = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(output, "public.jpeg" as CFString, 1, nil) else { return nil }
+            CGImageDestinationAddImage(destination, smaller, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
+            return CGImageDestinationFinalize(destination) ? .jpeg(output as Data) : nil
+        case .raw:
+            guard longest > minPixels, data.count >= Int(width) * Int(height) * components,
+                  let provider = CGDataProvider(data: data as CFData),
+                  let colorSpace = profile ?? CGColorSpace(name: components == 3 ? CGColorSpace.sRGB : CGColorSpace.genericGrayGamma2_2),
+                  let image = CGImage(width: Int(width), height: Int(height), bitsPerComponent: 8, bitsPerPixel: 8 * components,
+                                      bytesPerRow: Int(width) * components, space: colorSpace, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                                      provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent) else { return nil }
+            if fits { return .image(image) }
+            let scale = CGFloat(maxPixels) / CGFloat(longest)
+            let size = (width: max(1, Int(CGFloat(width) * scale)), height: max(1, Int(CGFloat(height) * scale)))
+            guard let context = CGContext(data: nil, width: size.width, height: size.height, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: colorSpace, bitmapInfo: components == 3 ? CGImageAlphaInfo.noneSkipLast.rawValue : CGImageAlphaInfo.none.rawValue) else { return nil }
+            context.interpolationQuality = .high
+            context.draw(image, in: CGRect(x: 0, y: 0, width: size.width, height: size.height))
+            return context.makeImage().map { .image($0) }
+        default:
+            return nil
         }
     }
 
@@ -338,7 +454,7 @@ nonisolated private final class Writer {
     }
 
     /// Adobe's JPEG color-transform flag; without it some CMYK and RGB JPEGs change color.
-    private static func colorTransform(_ dictionary: CGPDFDictionaryRef) -> String {
+    static func colorTransform(_ dictionary: CGPDFDictionaryRef) -> String {
         func flag(_ parameters: CGPDFDictionaryRef) -> String? {
             var value: CGPDFInteger = 0
             return CGPDFDictionaryGetInteger(parameters, "ColorTransform", &value) ? " /DecodeParms << /ColorTransform \(value) >>" : nil
@@ -394,33 +510,39 @@ nonisolated private final class Writer {
 nonisolated private struct ContentFilter {
     enum XObject { case image, form(CGAffineTransform, CGRect) }
 
+    /// Looks up the page's named resources while working out where steps land.
+    struct Resources {
+        var xobject: (String) -> XObject?
+        var isPlainState: (String) -> Bool      // An ExtGState with no transparency or blending
+    }
+
     private let bytes: [UInt8]
     private var output = Data()
     private let keep: ((Int) -> Bool)?
-    private let xobject: ((String) -> XObject?)?
+    private let resources: Resources?
     private var areas: [TextlessPDF.Step] = []
 
-    private init(_ content: Data, keep: ((Int) -> Bool)?, xobject: ((String) -> XObject?)?) {
+    private init(_ content: Data, keep: ((Int) -> Bool)?, resources: Resources?) {
         bytes = [UInt8](content)
         self.keep = keep
-        self.xobject = xobject
+        self.resources = resources
         output.reserveCapacity(content.count)
     }
 
     static func strip(_ content: Data, keeping keep: ((Int) -> Bool)? = nil) throws -> Data {
-        var filter = ContentFilter(content, keep: keep, xobject: nil)
+        var filter = ContentFilter(content, keep: keep, resources: nil)
         return try filter.run()
     }
 
-    static func areas(of content: Data, xobject: @escaping (String) -> XObject?) throws -> [TextlessPDF.Step] {
-        var filter = ContentFilter(content, keep: nil, xobject: xobject)
+    static func areas(of content: Data, resources: Resources) throws -> [TextlessPDF.Step] {
+        var filter = ContentFilter(content, keep: nil, resources: resources)
         _ = try filter.run()
         return filter.areas
     }
 
     /// Records a drawing step's area and says whether it's drawn.
-    private mutating func paints(_ area: CGRect, image: Bool = false) -> Bool {
-        areas.append(TextlessPDF.Step(area: area, isImage: image))
+    private mutating func paints(_ area: CGRect, image: Bool = false, plainImage: String? = nil) -> Bool {
+        areas.append(TextlessPDF.Step(area: area, isImage: image, plainImage: plainImage))
         return keep?(areas.count - 1) ?? true
     }
 
@@ -451,11 +573,15 @@ nonisolated private struct ContentFilter {
         var clipsText = false            // A clipping-mode glyph was dropped in this text object
 
         // Where things land: the current transform, clip and line width (saved by q), the path being built.
+        // `clip` is the clip's bounding box; `rectClip` says it's exact (every clip so far was one
+        // upright rectangle). `plain`: no transparency or blending is in effect.
         var ctm = CGAffineTransform.identity
         var clip = CGRect.infinite
         var lineWidth: CGFloat = 1
-        var saved: [(CGAffineTransform, CGRect, CGFloat)] = []
+        var rectClip = true, plain = true
+        var saved: [(CGAffineTransform, CGRect, CGFloat, Bool, Bool)] = []
         var path = CGRect.null
+        var pathParts = 0, pathIsRect = false   // Operators in the path; whether it's one `re`
         var clipsPath = false            // W or W* seen: the next painting operator also clips
         var inlineStart = 0              // Output position of the BI that starts an inline image
         func numbers(_ operands: [Range<Int>], _ count: Int) -> [CGFloat]? {
@@ -538,13 +664,15 @@ nonisolated private struct ContentFilter {
                 let name = String(decoding: token, as: UTF8.self)
                 switch name {
                 case "m", "l":
-                    add(numbers(operands, 2)); emit(run)
+                    add(numbers(operands, 2)); pathParts += 1; emit(run)
                 case "c":
-                    add(numbers(operands, 6)); emit(run)
+                    add(numbers(operands, 6)); pathParts += 1; emit(run)
                 case "v", "y":
-                    add(numbers(operands, 4)); emit(run)
+                    add(numbers(operands, 4)); pathParts += 1; emit(run)
                 case "re":
                     if let r = numbers(operands, 4) { add([r[0], r[1], r[0] + r[2], r[1], r[0], r[1] + r[3], r[0] + r[2], r[1] + r[3]]) }
+                    pathParts += 1
+                    pathIsRect = pathParts == 1
                     emit(run)
                 case "W", "W*":
                     clipsPath = true
@@ -560,9 +688,13 @@ nonisolated private struct ContentFilter {
                         }
                         if paints(area.intersection(clip)) { emit(run) } else { output.append(contentsOf: Array("n\n".utf8)) }
                     }
-                    if clipsPath { clip = clip.intersection(path) }
+                    if clipsPath {
+                        clip = clip.intersection(path)
+                        if !(pathIsRect && pathParts == 1 && ctm.b == 0 && ctm.c == 0) { rectClip = false }
+                    }
                     clipsPath = false
                     path = .null
+                    pathParts = 0; pathIsRect = false
                 case "cm":
                     if let m = numbers(operands, 6) {
                         ctm = CGAffineTransform(a: m[0], b: m[1], c: m[2], d: m[3], tx: m[4], ty: m[5]).concatenating(ctm)
@@ -574,17 +706,30 @@ nonisolated private struct ContentFilter {
                 case "sh":
                     if paints(clip) { emit(run) }
                 case "Do":
-                    var area = clip, image = false
-                    if let xobject, let operand = operands.last, bytes[operand.lowerBound] == 0x2F {
-                        switch xobject(ContentFilter.decodedName(bytes[operand])) {
+                    var area = clip, image = false, plainImage: String?
+                    if let resources, let operand = operands.last, bytes[operand.lowerBound] == 0x2F {
+                        let name = ContentFilter.decodedName(bytes[operand])
+                        switch resources.xobject(name) {
                         case .image:
-                            area = CGRect(x: 0, y: 0, width: 1, height: 1).applying(ctm).intersection(clip)
+                            let placed = CGRect(x: 0, y: 0, width: 1, height: 1).applying(ctm)
+                            area = placed.intersection(clip)
                             image = true
+                            // Upright (not turned or flipped), and the clip, if any, is a rectangle around it.
+                            if plain, ctm.b == 0, ctm.c == 0, ctm.a > 0, ctm.d > 0,
+                               clip.isInfinite || (rectClip && clip.insetBy(dx: -0.01, dy: -0.01).contains(placed)) {
+                                plainImage = name
+                            }
                         case .form(let matrix, let box) where !box.isInfinite: area = box.applying(matrix.concatenating(ctm)).intersection(clip)
                         default: break
                         }
                     }
-                    if paints(area, image: image) { emit(run) }
+                    if paints(area, image: image, plainImage: plainImage) { emit(run) }
+                case "gs":
+                    if let resources, plain, let operand = operands.last, bytes[operand.lowerBound] == 0x2F,
+                       !resources.isPlainState(ContentFilter.decodedName(bytes[operand])) {
+                        plain = false
+                    }
+                    emit(run)
                 case "BI":
                     inlineStart = output.count
                     emit(run)
@@ -613,15 +758,16 @@ nonisolated private struct ContentFilter {
                     if clipsText {
                         output.append(contentsOf: Array("0 0 0 0 re W n\n".utf8))
                         clip = .null
+                        rectClip = false
                     }
                     clipsText = false
                 case "q":
                     savedModes.append(renderMode)
-                    saved.append((ctm, clip, lineWidth))
+                    saved.append((ctm, clip, lineWidth, rectClip, plain))
                     emit(run)
                 case "Q":
                     renderMode = savedModes.popLast() ?? renderMode
-                    if let state = saved.popLast() { (ctm, clip, lineWidth) = state }
+                    if let state = saved.popLast() { (ctm, clip, lineWidth, rectClip, plain) = state }
                     emit(run)
                 case "ID":
                     // Inline image data runs to an EI that stands on its own.

@@ -64,6 +64,14 @@ nonisolated enum SlideBuilder {
                     try ImageConversion.write(image, to: media.appending(path: file), format: .png)
                     slide.pictures.append(Picture(file: file, frame: frame, text: text))
                 }
+                func save(_ picture: SlideLayers.Picture, _ name: String, text: [TextBlock]) throws {
+                    if let jpeg = picture.jpeg {
+                        try jpeg.write(to: media.appending(path: name + ".jpg"))
+                        slide.pictures.append(Picture(file: name + ".jpg", frame: picture.frame, text: text))
+                    } else if let image = picture.image {
+                        try save(image, name + ".png", picture.frame, text: text)
+                    }
+                }
                 if request.editableSlides && page.rotation == 0, let layers = splitLayers(of: page, scale: scale) {
                     // Text inside a table goes in its cells instead of text boxes; a chart's or diagram's
                     // labels are grouped with its picture.
@@ -73,7 +81,7 @@ nonisolated enum SlideBuilder {
                     let (labels, rest) = labels(PDFText.group(lines), of: layers.pictures)
                     if let background = layers.background { try save(background, "image\(index + 1).png", full) }
                     for (number, picture) in layers.pictures.enumerated() {
-                        try save(picture.image, "image\(index + 1)-\(number + 1).png", picture.frame, text: labels[number])
+                        try save(picture, "image\(index + 1)-\(number + 1)", text: labels[number])
                     }
                     slide.tables = layers.tables
                     slide.text = rest
@@ -210,8 +218,9 @@ nonisolated enum SlideBuilder {
             try change(xml).write(to: url, atomically: true, encoding: .utf8)
         }
 
+        let jpeg = slides.contains { $0.pictures.contains { $0.file.hasSuffix(".jpg") } }
         try edit("[Content_Types].xml") {
-            $0.replacingOccurrences(of: "</Types>", with: numbers.map {
+            $0.replacingOccurrences(of: "</Types>", with: (jpeg ? #"<Default Extension="jpg" ContentType="image/jpeg"/>"# : "") + numbers.map {
                 #"<Override PartName="/ppt/slides/slide\#($0).xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>"#
             }.joined() + "</Types>")
         }
