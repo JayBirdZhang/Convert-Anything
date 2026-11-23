@@ -37,6 +37,8 @@ struct FormatsView: View {
                         CardDivider()
                         tip("Camera RAW photos, Photoshop files and SVG drawings can be converted, but not created")
                         CardDivider()
+                        tip("Rename a recording to .txt, or a video to .srt, for a transcript made on your Mac")
+                        CardDivider()
                         tip("Rename a file back to undo, or press ⌘Z in Finder")
                         CardDivider()
                         tip("To convert many files, select them, choose Rename… from the right-click menu and replace the extension")

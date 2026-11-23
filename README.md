@@ -49,6 +49,7 @@ https://github.com/user-attachments/assets/cd589974-3f86-4b3d-a146-ac4dc21ce3fd
 | **Spreadsheets** | Excel (.xlsx/.xls), CSV, Numbers, JSON (a table ↔ a list of objects) |
 | **Audio** | MP3, WAV, M4A, AAC, FLAC, Ogg, Opus, AIFF |
 | **Video** | MP4, MOV, M4V, and video → GIF |
+| **Transcripts** | Audio or video → TXT, SRT or WebVTT (.vtt) subtitles; SRT ↔ WebVTT; subtitles → TXT or any document format |
 
 Click **Formats** at the bottom of the menu to see every conversion. (Pretty much anything you can think of is convertible.)
 
@@ -98,6 +99,11 @@ Hint: To convert multiple files at once, select them, right-click → Rename...,
 
 **Do my files leave my Mac?**
 No. Conversions use macOS's own frameworks plus two small bundled libraries and are all offline. Nothing is uploaded.
+
+**Is transcription private too?**
+Yes. Renaming a recording to `.txt` or a video to `.srt` uses macOS's built-in speech recognition, which runs on your Mac.
+On macOS 26 and later the first transcript in a new language may download Apple's speech model for it once.
+On macOS 14 and 15, macOS asks once to allow speech recognition.
 
 **Do I need Microsoft Office?**
 No. Keynote, Pages and Numbers (free from Apple) are optional but give the best results for
