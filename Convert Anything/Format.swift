@@ -3,6 +3,8 @@ import Foundation
 nonisolated enum Format: String, CaseIterable, Sendable {
     // Images
     case png, jpeg, heic, tiff, gif, bmp, webp, avif, ico
+    // More images: camera RAW, Photoshop and SVG are only read; JPEG XL and TGA are written when this macOS can
+    case cr2, cr3, nef, arw, dng, raf, orf, rw2, pef, srw, psd, svg, jxl, tga, icns
     // Documents (including presentations)
     case pdf, md, txt, html, docx, doc, rtf, odt, pages, pptx, ppt, key
     // Spreadsheets
@@ -23,6 +25,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
         case "markdown", "md": self = .md
         case "text", "txt": self = .txt
         case "aif", "aiff": self = .aiff
+        case "targa": self = .tga
         default:
             guard let format = Format(rawValue: ext.lowercased()) else { return nil }
             self = format
@@ -31,7 +34,8 @@ nonisolated enum Format: String, CaseIterable, Sendable {
 
     var kind: Kind {
         switch self {
-        case .png, .jpeg, .heic, .tiff, .gif, .bmp, .webp, .avif, .ico: .image
+        case .png, .jpeg, .heic, .tiff, .gif, .bmp, .webp, .avif, .ico,
+             .cr2, .cr3, .nef, .arw, .dng, .raf, .orf, .rw2, .pef, .srw, .psd, .svg, .jxl, .tga, .icns: .image
         case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .pptx, .ppt, .key: .document
         case .xlsx, .xls, .csv, .numbers: .spreadsheet
         case .mp3, .wav, .m4a, .aac, .flac, .ogg, .opus, .aiff: .audio
@@ -42,6 +46,19 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     /// Plain-text formats can't be told apart by their bytes, so for these
     /// we trust the file's old extension instead.
     var isPlainText: Bool { [.md, .txt, .html, .csv].contains(self) }
+
+    /// Camera RAW files. Most share TIFF's first bytes, so their old extension says which one they are.
+    var isRaw: Bool { [.cr2, .cr3, .nef, .arw, .dng, .raf, .orf, .rw2, .pef, .srw].contains(self) }
+
+    /// Whether a file can be converted *into* this format. RAW, Photoshop and SVG files are only read.
+    /// JPEG XL and TGA depend on what ImageIO can write on this Mac, so they're only offered when it can.
+    var isWritable: Bool {
+        switch self {
+        case .svg, .psd: false
+        case .jxl, .tga: ImageWriters.supports(self)
+        default: !isRaw
+        }
+    }
 
     var isSlides: Bool { [.pptx, .ppt, .key].contains(self) }
 
@@ -54,6 +71,9 @@ nonisolated enum Format: String, CaseIterable, Sendable {
         case .md: "Markdown"
         case .txt: "plain text"
         case .pptx: "PowerPoint"
+        case .psd: "Photoshop"
+        case .jxl: "JPEG XL"
+        case .tga: "TGA"
         case .ppt: "PowerPoint 97"
         case .key: "Keynote"
         case .pages: "Pages"
@@ -77,7 +97,9 @@ nonisolated enum Sniffer {
         case unknown
     }
 
-    static func detect(_ url: URL) -> Result {
+    /// `claimed` is the file's old extension. It settles the formats whose bytes aren't distinctive: most camera
+    /// RAW files start like TIFF, and a TGA file has no signature at all.
+    static func detect(_ url: URL, claimed: Format? = nil) -> Result {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return .unknown }
         defer { try? handle.close() }
         let data = (try? handle.read(upToCount: 4096)) ?? Data()
@@ -89,11 +111,24 @@ nonisolated enum Sniffer {
             return b.count >= offset + bytes.count && Array(b[offset..<offset + bytes.count]) == bytes
         }
 
+        if claimed == .tga, looksLikeTGA(b) { return .format(.tga) }   // Before ICO: an indexed TGA starts 00 00 01 00 too
         if b.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return .format(.png) }
         if b.starts(with: [0xFF, 0xD8, 0xFF]) { return .format(.jpeg) }
         if at(0, "GIF8") { return .format(.gif) }
         if at(0, "BM") && b.count > 14 { return .format(.bmp) }
-        if b.starts(with: [0x49, 0x49, 0x2A, 0x00]) || b.starts(with: [0x4D, 0x4D, 0x00, 0x2A]) { return .format(.tiff) }
+        if b.starts(with: [0x49, 0x49, 0x2A, 0x00]) {
+            if b.count > 10 && b[8] == 0x43 && b[9] == 0x52 { return .format(.cr2) }   // "CR" after the first directory offset
+            if let claimed, claimed.isRaw { return .format(claimed) }
+            return .format(.tiff)
+        }
+        if b.starts(with: [0x4D, 0x4D, 0x00, 0x2A]) { return .format(claimed?.isRaw == true ? claimed! : .tiff) }
+        // Olympus and Panasonic RAW use TIFF's byte order mark with their own version number.
+        if b.starts(with: [0x49, 0x49, 0x52, 0x4F]) || b.starts(with: [0x49, 0x49, 0x52, 0x53]) || b.starts(with: [0x4D, 0x4D, 0x4F, 0x52]) { return .format(.orf) }
+        if b.starts(with: [0x49, 0x49, 0x55, 0x00]) { return .format(.rw2) }
+        if at(0, "FUJIFILMCCD-RAW") { return .format(.raf) }
+        if at(0, "8BPS") { return .format(.psd) }
+        if at(0, "icns") { return .format(.icns) }
+        if b.starts(with: [0xFF, 0x0A]) || b.starts(with: [0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20]) { return .format(.jxl) }
         if b.starts(with: [0x00, 0x00, 0x01, 0x00]) { return .format(.ico) }
         if at(0, "%PDF") { return .format(.pdf) }
         if at(0, "{\\rtf") { return .format(.rtf) }
@@ -113,6 +148,7 @@ nonisolated enum Sniffer {
             case "M4V ", "M4VH", "M4VP": return .format(.m4v)
             case "heic", "heix", "heim", "heis", "mif1", "msf1": return .format(.heic)
             case "avif", "avis": return .format(.avif)
+            case "crx ": return .format(.cr3)
             default: return .format(.mp4)
             }
         }
@@ -128,9 +164,20 @@ nonisolated enum Sniffer {
             let head = String(decoding: data.prefix(512), as: UTF8.self).lowercased()
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if head.hasPrefix("<!doctype html") || head.hasPrefix("<html") { return .format(.html) }
+            // SVG is text too. A file that starts with <svg is one; one that starts with an XML header or a comment
+            // could just as well be an HTML or Markdown page with an inline icon, so its extension has to say so.
+            if head.hasPrefix("<svg") && claimed?.isPlainText != true { return .format(.svg) }
+            if claimed == .svg && (head.hasPrefix("<?xml") || head.hasPrefix("<!") ) && data.range(of: Data("<svg".utf8)) != nil { return .format(.svg) }
             return .text
         }
         return .unknown
+    }
+
+    /// A TGA header: colour map type 0 or 1, a known image type (indexed, true-colour, grey; plain or run-length),
+    /// and a pixel depth TGA actually uses.
+    private static func looksLikeTGA(_ b: [UInt8]) -> Bool {
+        guard b.count >= 18, b[1] <= 1, [1, 2, 3, 9, 10, 11].contains(b[2]), [8, 15, 16, 24, 32].contains(b[16]) else { return false }
+        return b[12] | b[13] != 0 && b[14] | b[15] != 0   // Width and height aren't zero
     }
 
     /// Old Word, Excel and PowerPoint files share one container format; the name of the main stream

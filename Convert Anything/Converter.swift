@@ -25,7 +25,7 @@ enum Converter {
     static let documentTargets: [Format] = [.md, .txt, .html, .docx, .doc, .rtf, .odt, .pdf]
 
     static func route(from: Format, to: Format) -> Route? {
-        guard from != to, !to.isIWork else { return nil }   // Pages, Numbers and Keynote can be read but not written
+        guard from != to, !to.isIWork, to.isWritable else { return nil }   // Pages, Numbers and Keynote, camera RAW, PSD and SVG can be read but not written
         if from.isSlides {
             if to == .pdf || to.kind == .image { return .fromSlides }
             return to == .pptx ? .slidesExport : nil
@@ -42,7 +42,7 @@ enum Converter {
         switch (from.kind, to.kind) {
         case (.image, .image): return .image
         case (.image, .document) where to == .pdf: return .imageToPDF
-        case (.image, .document) where [.txt, .md, .docx, .html, .rtf, .odt].contains(to): return .textRecognition
+        case (.image, .document) where from != .svg && [.txt, .md, .docx, .html, .rtf, .odt].contains(to): return .textRecognition
         case (.document, .image) where from == .pdf: return .pdfToImage
         case (.document, .image) where documentSources.contains(from): return .documentToImage
         case (.document, .document) where documentSources.contains(from) && documentTargets.contains(to): return .document
@@ -99,7 +99,7 @@ enum Converter {
             }
         case .imageToPDF:
             try await background {
-                try ImageConversion.imageToPDF(request.input, output: output)
+                try ImageConversion.imageToPDF(request.input, output: output, quality: request.quality)
             }
         case .pdfToImage:
             result = try await renderPages(of: request.input, request: request, output: output, progress: progress)
@@ -281,7 +281,12 @@ nonisolated enum ImageConversion {
     static func convert(_ input: URL, to format: Format, output: URL, quality: Quality = .balanced) throws {
         // macOS's GIF writer keeps only the first frame and has no dithering; ours keeps animations.
         if format == .gif { return try GIFEncoder.write(imageAt: input, to: output, quality: quality) }
-        var (image, properties) = try decode(input, quality: quality, maxSide: format == .ico ? 256 : nil)
+        var (image, properties) = try decode(input, quality: quality, maxSide: format == .ico ? 256 : format == .icns ? 1024 : nil)
+        // A RAW photo decodes at 16 bits; as PNG that doubles the time and the size for no visible gain.
+        // (TIFF keeps all 16 bits.)
+        if format == .png, image.bitsPerComponent > 8, Format(fileExtension: input.pathExtension)?.isRaw == true {
+            image = try image.at8BitsPerChannel()
+        }
         if [.jpeg, .bmp].contains(format), image.hasAlpha {
             image = try image.flattenedOnWhite()
         }
@@ -298,11 +303,24 @@ nonisolated enum ImageConversion {
         try write(image, to: output, format: format, properties: metadata)
     }
 
+    static func isSVG(_ url: URL) -> Bool { url.pathExtension.lowercased() == "svg" }
+
     private static func decode(_ input: URL, quality: Quality, maxSide: Int?) throws -> (image: CGImage, properties: [CFString: Any]) {
+        if isSVG(input) { return (try SVG.render(input, quality: quality, maxSide: maxSide), [:]) }
         guard let source = CGImageSourceCreateWithURL(input as CFURL, nil), CGImageSourceGetCount(source) > 0 else {
             throw ConversionError.failed("Couldn't read this image.")
         }
-        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] ?? [:]
+        // An icon file holds the same picture in several sizes; the biggest is the one worth converting.
+        var index = 0
+        if CGImageSourceGetCount(source) > 1, CGImageSourceGetType(source) as String? == UTType.icns.identifier {
+            var best = 0
+            for candidate in 0..<CGImageSourceGetCount(source) {
+                let p = CGImageSourceCopyPropertiesAtIndex(source, candidate, nil) as? [CFString: Any]
+                let pixels = (p?[kCGImagePropertyPixelWidth] as? Int ?? 0) * (p?[kCGImagePropertyPixelHeight] as? Int ?? 0)
+                if pixels > best { best = pixels; index = candidate }
+            }
+        }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any] ?? [:]
         let width = properties[kCGImagePropertyPixelWidth] as? Int ?? 0
         let height = properties[kCGImagePropertyPixelHeight] as? Int ?? 0
         var maxSize = max(width, height, 1)
@@ -315,13 +333,16 @@ nonisolated enum ImageConversion {
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxSize,
         ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            throw ConversionError.failed("Couldn't decode this image.")
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, index, options as CFDictionary) else {
+            // The Mac's RAW engine doesn't know every camera (newer or unusual models can be missing).
+            throw ConversionError.failed(Format(fileExtension: input.pathExtension)?.isRaw == true
+                                         ? "macOS can't read this camera's RAW files." : "Couldn't decode this image.")
         }
         return (image, properties)
     }
 
     static func write(_ image: CGImage, to output: URL, format: Format, properties: [CFString: Any] = [:]) throws {
+        if format == .icns { return try ICNS.write(image, to: output) }
         guard let type = format.utType,
               let destination = CGImageDestinationCreateWithURL(output as CFURL, type.identifier as CFString, 1, nil) else {
             throw ConversionError.failed("Can't write \(format.displayName) images.")
@@ -332,13 +353,26 @@ nonisolated enum ImageConversion {
         }
     }
 
-    static func imageToPDF(_ input: URL, output: URL) throws {
-        guard let image = NSImage(contentsOf: input), let page = PDFPage(image: image) else {
+    static func imageToPDF(_ input: URL, output: URL, quality: Quality = .balanced) throws {
+        if isSVG(input) { return try SVG.writePDF(input, to: output) }
+        var picture = Format(fileExtension: input.pathExtension)?.isRaw == true ? try jpegPicture(input, quality: quality) : nil
+        picture = picture ?? NSImage(contentsOf: input)
+        guard let image = picture, let page = PDFPage(image: image) else {
             throw ConversionError.failed("Couldn't read this image.")
         }
         let document = PDFDocument()
         document.insert(page, at: 0)
         guard document.write(to: output) else { throw ConversionError.failed("Couldn't write the PDF.") }
+    }
+
+    /// A camera RAW file as a JPEG picture, so a PDF keeps it as a compressed photo instead of
+    /// 24 MB of raw pixels (a 36 MP shot), with its rotation applied.
+    private static func jpegPicture(_ input: URL, quality: Quality) throws -> NSImage? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, try load(input, quality: quality),
+                                   [kCGImageDestinationLossyCompressionQuality: quality.imageQuality] as CFDictionary)
+        return CGImageDestinationFinalize(destination) ? NSImage(data: data as Data) : nil
     }
 
     /// Renders one page (the first by default) at the quality's resolution.
@@ -406,6 +440,9 @@ nonisolated extension Format {
         case .bmp: .bmp
         case .ico: .ico
         case .avif: UTType("public.avif")
+        case .icns: .icns
+        case .tga: UTType("com.truevision.tga-image")
+        case .jxl: UTType("public.jpeg-xl")
         case .pdf: .pdf
         default: nil
         }
@@ -415,6 +452,18 @@ nonisolated extension Format {
 nonisolated extension CGImage {
     var hasAlpha: Bool {
         ![.none, .noneSkipFirst, .noneSkipLast].contains(alphaInfo)
+    }
+
+    /// The same picture and color space with 8 bits per channel.
+    fileprivate func at8BitsPerChannel() throws -> CGImage {
+        guard let space = colorSpace,
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                      bitmapInfo: (hasAlpha ? CGImageAlphaInfo.premultipliedLast : .noneSkipLast).rawValue) else {
+            throw ConversionError.failed("Couldn't process this image.")
+        }
+        context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = context.makeImage() else { throw ConversionError.failed("Couldn't process this image.") }
+        return image
     }
 
     fileprivate func flattenedOnWhite() throws -> CGImage {

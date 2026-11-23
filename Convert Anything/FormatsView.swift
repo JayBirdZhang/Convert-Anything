@@ -35,6 +35,8 @@ struct FormatsView: View {
                     Card(title: "Tips") {
                         tip("Rename a photo or scanned PDF to .txt or .docx to get its text")
                         CardDivider()
+                        tip("Camera RAW photos, Photoshop files and SVG drawings can be converted, but not created")
+                        CardDivider()
                         tip("Rename a file back to undo, or press ⌘Z in Finder")
                         CardDivider()
                         tip("To convert many files, select them, choose Rename… from the right-click menu and replace the extension")

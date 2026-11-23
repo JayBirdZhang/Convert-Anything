@@ -256,7 +256,7 @@ enum OriginalsMode: String, CaseIterable {
     /// What's actually inside the file decides the source format, not the old extension.
     /// Nil when it's not something we understand, which is left alone.
     private func sourceFormat(of url: URL, oldFormat: Format) -> Format? {
-        switch Sniffer.detect(url) {
+        switch Sniffer.detect(url, claimed: oldFormat) {
         case .format(let detected): detected
         case .text: oldFormat.isPlainText ? oldFormat : .txt
         case .iWork: oldFormat.isIWork ? oldFormat : nil
