@@ -181,8 +181,9 @@ nonisolated private enum ModernEngine {
 
 // MARK: - macOS 14 and 15
 
-/// SFSpeechRecognizer, kept on-device. It works on about a minute of audio at a time, so the audio is fed in
-/// pieces of at most 55 seconds, each cut at the quietest moment near its end so no word is split.
+/// SFSpeechRecognizer, kept on-device. It works on about a minute of audio at a time and forgets what came
+/// before a long pause, so the audio is fed in pieces cut at each pause, or at the quietest moment before
+/// 55 seconds when the speaker doesn't stop.
 nonisolated private enum LegacyEngine {
     static let sampleRate = 16_000.0
 
@@ -205,16 +206,15 @@ nonisolated private enum LegacyEngine {
         var offset = 0.0
         var tokens: [Transcript.Token] = []
         var finished = false
-        while !finished {
+        while !finished || !samples.isEmpty {
             try Task.checkCancellation()
-            finished = try read(audio, through: converter, into: &samples, upTo: maxChunk)
-            while samples.count >= maxChunk || (finished && !samples.isEmpty) {
-                let cut = finished && samples.count <= maxChunk ? samples.count : quietestPoint(in: samples, from: searchFrom, to: maxChunk)
-                tokens += try await recognize(samples[0..<cut], offset: offset, with: recognizer, format: format)
-                samples.removeFirst(cut)
-                offset += Double(cut) / sampleRate
-                progress(min(1, offset / duration))
-            }
+            if !finished { finished = try read(audio, through: converter, into: &samples, upTo: maxChunk) }
+            let cut = firstPause(in: samples, limit: maxChunk)
+                ?? (samples.count > maxChunk ? quietestPoint(in: samples, from: searchFrom, to: maxChunk) : samples.count)
+            tokens += try await recognize(samples[0..<cut], offset: offset, with: recognizer, format: format)
+            samples.removeFirst(cut)
+            offset += Double(cut) / sampleRate
+            progress(min(1, offset / duration))
         }
         return tokens
     }
@@ -261,6 +261,27 @@ nonisolated private enum LegacyEngine {
             if status == .endOfStream || (ended && output.frameLength == 0) { return true }
         }
         return false
+    }
+
+    /// The middle of the first pause of 0.7 seconds or more (quieter than -40 dB) that follows some sound,
+    /// within the first `limit` samples.
+    private static func firstPause(in samples: [Float], limit: Int) -> Int? {
+        let window = Int(sampleRate / 20), needed = Int(0.7 * sampleRate)
+        var heard = false, quiet = 0, position = 0
+        let end = min(samples.count, limit)
+        while position + window <= end {
+            var energy: Float = 0
+            for index in position..<position + window { energy += samples[index] * samples[index] }
+            if energy / Float(window) < 1e-4 {
+                quiet += window
+                if heard && quiet >= needed { return position + window - quiet / 2 }
+            } else {
+                heard = true
+                quiet = 0
+            }
+            position += window
+        }
+        return nil
     }
 
     /// The start of the quietest tenth of a second between `start` and `end`.
