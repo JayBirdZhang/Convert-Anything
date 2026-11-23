@@ -18,6 +18,7 @@ nonisolated enum SlideLayers {
     struct Picture {
         var frame: CGRect       // Page points, origin at the top left of the visible page
         var image: CGImage
+        var hasImage = false    // Shows a photo (rather than only shapes: a chart, a diagram)
     }
 
     struct Layers {
@@ -105,7 +106,8 @@ nonisolated enum SlideLayers {
                 layers.tables.append(table)
             } else if let image = drawing.image.cropping(to: pixels) {
                 layers.pictures.append(Picture(frame: CGRect(x: pixels.minX / scale, y: pixels.minY / scale,
-                                                             width: pixels.width / scale, height: pixels.height / scale), image: image))
+                                                             width: pixels.width / scale, height: pixels.height / scale),
+                                               image: image, hasImage: withImages.contains(id)))
             }
         }
         guard !layers.pictures.isEmpty || !layers.tables.isEmpty else { return nil }
