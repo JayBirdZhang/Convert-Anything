@@ -709,9 +709,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         guard let paths = response.notification.request.content.userInfo["reveal"] as? [String] else { return }
-        await MainActor.run {
-            FinderReveal.show(paths.map { URL(fileURLWithPath: $0) })
-        }
+        await FinderReveal.show(paths.map { URL(fileURLWithPath: $0) })
     }
 }
 

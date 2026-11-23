@@ -105,7 +105,6 @@ enum UnsupportedConversion {
         case .spreadsheet: "a spreadsheet"
         case .audio: "an audio file"
         case .video: "a video"
-        default: "another kind of file"
         }
     }
 }
