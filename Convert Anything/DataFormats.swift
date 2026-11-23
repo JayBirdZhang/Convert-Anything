@@ -8,8 +8,8 @@ import Foundation
 /// - Cells become JSON values: plain numbers stay numbers ("007" and long IDs stay text, as when
 ///   writing CSV → Excel), TRUE/FALSE become booleans, empty cells become `null`, dates stay text.
 /// - A workbook with several sheets becomes a folder with one JSON file per sheet, like Excel → CSV does.
-/// - A JSON value inside a cell (an object or a list) is written into the cell as JSON text, rather than
-///   being spread over extra columns, so nothing is lost and the columns stay the ones you can see.
+/// - Nested objects get a column per value ("address.zip"), and those columns become nested objects again
+///   on the way back. Lists are written into one cell as JSON text, since they don't split into columns cleanly.
 nonisolated enum DataFormats {
     // MARK: Spreadsheet → JSON
 
@@ -78,7 +78,7 @@ nonisolated enum DataFormats {
 
         // Keys: the header text; blank or repeated headers get a name so every column survives.
         var used = Set<String>()
-        var keys: [[UInt8]] = []
+        var names: [String] = []
         for column in 0..<width {
             var name = column < header.count && !header[column].isEmpty ? header[column] : "Column \(column + 1)"
             if used.contains(name) {
@@ -87,28 +87,96 @@ nonisolated enum DataFormats {
                 name = "\(name) \(n)"
             }
             used.insert(name)
-            var key: [UInt8] = []
-            appendQuoted(name, to: &key)
-            key.append(contentsOf: [58, 32])   // ": "
-            keys.append(key)
+            names.append(name)
         }
+        let layout = Column.layout(names)
 
         var out: [UInt8] = []
         out.reserveCapacity(rows.count * (width * 24 + 8))
         out.append(91)   // [
         var wroteRow = false
         for row in rows[(start + 1)...] where !row.allSatisfy(\.isEmpty) {
-            out.append(contentsOf: wroteRow ? [44, 10, 32, 32, 123] : [10, 32, 32, 123])   // ",\n  {"
+            out.append(contentsOf: wroteRow ? [44, 10, 32, 32] : [10, 32, 32])   // ",\n  "
             wroteRow = true
-            for column in 0..<width {
-                if column > 0 { out.append(contentsOf: [44, 32]) }
-                out.append(contentsOf: keys[column])
-                appendCell(column < row.count ? row[column] : "", to: &out)
-            }
-            out.append(125)   // }
+            layout.append(row, to: &out, isTop: true)
         }
         out.append(contentsOf: wroteRow ? [10, 93, 10] : [93, 10])
         return Data(out)
+    }
+
+    /// How a table's columns map onto each row's JSON object. Headers like "address.zip" (what a nested object
+    /// becomes in a spreadsheet) are put back together as {"address": {"zip": …}}. Only headers whose parts are
+    /// all plain names nest, so ones like "No.", "U.S. sales" or "v1.2" stay single keys, and so does a header
+    /// that would clash with another ("address" next to "address.zip").
+    private indirect enum Column {
+        case cell(Int)
+        case group([(key: [UInt8], column: Column)])   // Keys already written as `"name": `
+
+        static func layout(_ names: [String]) -> Column {
+            let split = names.map { name -> [String] in
+                let parts = name.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+                return parts.count > 1 && parts.allSatisfy(isPlainName) ? parts : [name]
+            }
+            let whole = Set(split.map { $0.joined(separator: "\u{0}") })
+            let paths = zip(names, split).map { name, parts -> [String] in
+                let clashes = (1..<max(parts.count, 1)).contains { whole.contains(parts.prefix($0).joined(separator: "\u{0}")) }
+                return clashes ? [name] : parts
+            }
+
+            // Built in order of first appearance, so the JSON keys follow the columns.
+            final class Node { var order: [String] = []; var children: [String: Node] = [:]; var cell: Int? }
+            let root = Node()
+            for (column, path) in paths.enumerated() {
+                var node = root
+                for part in path {
+                    if let next = node.children[part] { node = next; continue }
+                    let next = Node()
+                    node.children[part] = next
+                    node.order.append(part)
+                    node = next
+                }
+                node.cell = column
+            }
+            func build(_ node: Node) -> Column {
+                if let cell = node.cell { return .cell(cell) }
+                return .group(node.order.map { name in
+                    var key: [UInt8] = []
+                    DataFormats.appendQuoted(name, to: &key)
+                    key.append(contentsOf: [58, 32])   // ": "
+                    return (key, build(node.children[name]!))
+                })
+            }
+            return build(root)
+        }
+
+        private static func isPlainName(_ part: String) -> Bool {
+            guard let first = part.first, first.isLetter || first == "_" else { return false }
+            return part.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+        }
+
+        /// A nested group whose cells are all empty is `null`, like an empty cell, rather than an object of nulls.
+        func append(_ row: [String], to out: inout [UInt8], isTop: Bool = false) {
+            switch self {
+            case .cell(let column):
+                DataFormats.appendCell(column < row.count ? row[column] : "", to: &out)
+            case .group(let members):
+                if !isTop && isEmpty(in: row) { out.append(contentsOf: Array("null".utf8)); return }
+                out.append(123)   // {
+                for (n, member) in members.enumerated() {
+                    if n > 0 { out.append(contentsOf: [44, 32]) }
+                    out.append(contentsOf: member.key)
+                    member.column.append(row, to: &out)
+                }
+                out.append(125)   // }
+            }
+        }
+
+        private func isEmpty(in row: [String]) -> Bool {
+            switch self {
+            case .cell(let column): column >= row.count || row[column].isEmpty
+            case .group(let members): members.allSatisfy { $0.column.isEmpty(in: row) }
+            }
+        }
     }
 
     /// A cell's text as the JSON value it looks like.
@@ -119,8 +187,21 @@ nonisolated enum DataFormats {
             out.append(contentsOf: text.utf8)
         } else if text.utf8.count <= 5, let flag = boolean(text) {
             out.append(contentsOf: Array((flag ? "true" : "false").utf8))
+        } else if let first = text.utf8.first, first == 91 || first == 123, let value = embeddedJSON(text) {
+            value.write(to: &out)   // A list or object written into a cell (see `cellText`) goes back to being one
         } else {
             appendQuoted(text, to: &out)
+        }
+    }
+
+    private static func embeddedJSON(_ text: String) -> JSONReader.Value? {
+        var text = text
+        return text.withUTF8 { bytes -> JSONReader.Value? in
+            guard let value = try? JSONReader.parse(bytes) else { return nil }
+            switch value {
+            case .array, .object: return value
+            default: return nil
+            }
         }
     }
 
@@ -206,9 +287,9 @@ nonisolated enum DataFormats {
             var names: [String] = []
             for (n, item) in list.enumerated() {
                 guard case .object(let members) = item else { throw notARow(n, "an object") }
-                for member in members where index[member.key] == nil {
-                    index[member.key] = names.count
-                    names.append(member.key)
+                for (path, _) in flattened(members) where index[path] == nil {
+                    index[path] = names.count
+                    names.append(path)
                 }
             }
             var rows: [[String]] = [names]
@@ -216,7 +297,7 @@ nonisolated enum DataFormats {
             for item in list {
                 guard case .object(let members) = item else { continue }
                 var row = [String](repeating: "", count: names.count)
-                for member in members { row[index[member.key]!] = member.value.cellText }
+                for (path, value) in flattened(members) { row[index[path]!] = value.cellText }
                 rows.append(row)
             }
             return rows
@@ -228,6 +309,25 @@ nonisolated enum DataFormats {
         default:
             throw ConversionError.failed("This JSON is a list of plain values. A spreadsheet needs a list of objects, like [{\"name\": \"Ann\"}, …].")
         }
+    }
+
+    /// An object's values with nested objects spread into their own columns: {"address": {"zip": "02139"}}
+    /// gives "address.zip". Lists and empty objects stay whole (as JSON text in one cell), since they don't
+    /// split into columns cleanly.
+    private static func flattened(_ members: [(key: String, value: JSONReader.Value)]) -> [(String, JSONReader.Value)] {
+        var out: [(String, JSONReader.Value)] = []
+        func add(_ members: [(key: String, value: JSONReader.Value)], prefix: String) {
+            for member in members {
+                let path = prefix + member.key
+                if case .object(let inner) = member.value, !inner.isEmpty {
+                    add(inner, prefix: path + ".")
+                } else {
+                    out.append((path, member.value))
+                }
+            }
+        }
+        add(members, prefix: "")
+        return out
     }
 
     private static func notARow(_ index: Int, _ expected: String) -> ConversionError {
@@ -256,11 +356,11 @@ nonisolated enum JSONReader {
             case .bool(let flag): flag ? "true" : "false"
             case .number(let text), .string(let text): text
             case .array, .object:
-                String(decoding: { () -> [UInt8] in var out: [UInt8] = []; append(to: &out); return out }(), as: UTF8.self)
+                String(decoding: { () -> [UInt8] in var out: [UInt8] = []; write(to: &out); return out }(), as: UTF8.self)
             }
         }
 
-        private func append(to out: inout [UInt8]) {
+        func write(to out: inout [UInt8]) {
             switch self {
             case .null: out.append(contentsOf: Array("null".utf8))
             case .bool(let flag): out.append(contentsOf: Array((flag ? "true" : "false").utf8))
@@ -270,7 +370,7 @@ nonisolated enum JSONReader {
                 out.append(91)
                 for (n, item) in items.enumerated() {
                     if n > 0 { out.append(44) }
-                    item.append(to: &out)
+                    item.write(to: &out)
                 }
                 out.append(93)
             case .object(let members):
@@ -279,7 +379,7 @@ nonisolated enum JSONReader {
                     if n > 0 { out.append(44) }
                     DataFormats.appendQuoted(member.key, to: &out)
                     out.append(58)
-                    member.value.append(to: &out)
+                    member.value.write(to: &out)
                 }
                 out.append(125)
             }
