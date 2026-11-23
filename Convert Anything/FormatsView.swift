@@ -35,6 +35,8 @@ struct FormatsView: View {
                     Card(title: "Tips") {
                         tip("Rename a photo or scanned PDF to .txt or .docx to get its text")
                         CardDivider()
+                        tip("Rename a recording to .txt, or a video to .srt, for a transcript made on your Mac")
+                        CardDivider()
                         tip("Rename a file back to undo, or press ⌘Z in Finder")
                         CardDivider()
                         tip("To convert many files, select them, choose Rename… from the right-click menu and replace the extension")

@@ -19,6 +19,8 @@ enum Converter {
         case spreadsheet    // Excel ↔ CSV directly; Numbers for the rest
         case textRecognition   // Vision reads the text in an image
         case documentToImage   // A document or spreadsheet is laid out as a PDF, then its pages become images
+        case transcription     // Speech framework writes down what's said in audio or video, on the Mac
+        case subtitles         // Subtitles lose their timings (→ text) or change format (SRT ↔ WebVTT)
     }
 
     static let documentSources: [Format] = [.md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .pdf]
@@ -26,6 +28,7 @@ enum Converter {
 
     static func route(from: Format, to: Format) -> Route? {
         guard from != to, !to.isIWork else { return nil }   // Pages, Numbers and Keynote can be read but not written
+        if let route = transcriptionRoute(from: from, to: to) { return route }
         if from.isSlides {
             if to == .pdf || to.kind == .image { return .fromSlides }
             return to == .pptx ? .slidesExport : nil
@@ -55,7 +58,15 @@ enum Converter {
         }
     }
 
-    /// Video and the iWork apps are slow or can only do one file at a time, so they run one at a time.
+    /// Speech → text or subtitles, and subtitles → text or the other subtitle format. Nothing else reads or writes subtitles.
+    private static func transcriptionRoute(from: Format, to: Format) -> Route? {
+        let subtitles: [Format] = [.srt, .vtt]
+        if [.audio, .video].contains(from.kind) && (to == .txt || subtitles.contains(to)) { return .transcription }
+        if subtitles.contains(from) { return [.txt, .md, .srt, .vtt].contains(to) ? .subtitles : nil }
+        return nil
+    }
+
+    /// Video, transcription and the iWork apps are slow or can only do one file at a time, so they run one at a time.
     static func isHeavy(from: Format, to: Format) -> Bool {
         switch route(from: from, to: to) {
         case .media: from.kind == .video || to.kind == .video
@@ -63,6 +74,7 @@ enum Converter {
         case .spreadsheet: !(from == .xlsx && to == .csv) && !(from == .csv && to == .xlsx)
         case .document: from == .pages || (to == .pdf && [.docx, .doc, .rtf].contains(from))
         case .documentToImage: isHeavy(from: from, to: .pdf)
+        case .transcription: true
         default: false
         }
     }
@@ -138,6 +150,10 @@ enum Converter {
             try await DocumentConversion.convert(request, output: output)
         case .media:
             try await MediaConversion.convert(request, output: output, progress: progress)
+        case .transcription:
+            try await Transcription.convert(request, output: output, progress: progress)
+        case .subtitles:
+            try await Subtitles.convert(request, output: output)
         case .documentToImage:
             // Same layout as converting to PDF (fonts, page size, margins), so the picture matches that PDF.
             var pdfRequest = Request(input: request.input, from: request.from, to: .pdf, workDir: request.workDir,

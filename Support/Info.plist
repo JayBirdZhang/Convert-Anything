@@ -9,5 +9,8 @@
 	<string>eq8DzqpmEUfAQkel8yvF1KWlNPmBVWvgE0hNNFnRe3Y=</string>
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
+	<!-- Transcription (audio or video renamed to .txt, .srt or .vtt). Asked the first time it's used. -->
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Convert Anything writes down what's said in audio and video you rename to .txt, .srt or .vtt. It all happens on your Mac.</string>
 </dict>
 </plist>

@@ -11,6 +11,8 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     case mp3, wav, m4a, aac, flac, ogg, opus, aiff
     // Video
     case mp4, mov, m4v
+    // Subtitles (written by transcription; read back as plain text)
+    case srt, vtt
 
     enum Kind { case image, document, spreadsheet, audio, video }
 
@@ -36,6 +38,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
         case .xlsx, .xls, .csv, .numbers: .spreadsheet
         case .mp3, .wav, .m4a, .aac, .flac, .ogg, .opus, .aiff: .audio
         case .mp4, .mov, .m4v: .video
+        case .srt, .vtt: .document
         }
     }
 
@@ -122,6 +125,7 @@ nonisolated enum Sniffer {
             if b[1] & 0xE0 == 0xE0 { return .format(.mp3) }   // MPEG audio frame sync
         }
         if at(0, "PK\u{03}\u{04}") { return detectZip(url, head: data) }
+        if let subtitles = detectSubtitles(data) { return .format(subtitles) }
 
         // Text: no NUL bytes and valid UTF-8 (allowing a character cut off at the 4 KB boundary).
         if !b.contains(0), String(data: data, encoding: .utf8) != nil || String(data: data.dropLast(3), encoding: .utf8) != nil {
@@ -131,6 +135,17 @@ nonisolated enum Sniffer {
             return .text
         }
         return .unknown
+    }
+
+    /// Subtitles are text, but their cue timings give them away, so a .txt full of cues renamed to .srt
+    /// is just an extension fix.
+    private static func detectSubtitles(_ data: Data) -> Format? {
+        var head = String(decoding: data.prefix(256), as: UTF8.self)
+        if head.hasPrefix("\u{FEFF}") { head.removeFirst() }
+        if head.hasPrefix("WEBVTT") { return .vtt }
+        let lines = head.split(whereSeparator: \.isNewline).prefix(3).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard lines.count >= 2, Int(lines[0]) != nil else { return nil }
+        return lines[1].wholeMatch(of: /\d+:\d\d:\d\d,\d{3} *--> *\d+:\d\d:\d\d,\d{3}.*/) != nil ? .srt : nil
     }
 
     /// Old Word, Excel and PowerPoint files share one container format; the name of the main stream
