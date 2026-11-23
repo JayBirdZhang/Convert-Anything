@@ -17,7 +17,10 @@ import PDFKit
 nonisolated enum SlideLayers {
     struct Picture {
         var frame: CGRect       // Page points, origin at the top left of the visible page
-        var image: CGImage
+        var image: CGImage?     // A picture of it, cut from the page's drawing (or the photo's own pixels)
+        var jpeg: Data? = nil   // Or, for a photo drawn plainly, its own JPEG file
+        var shape: TextlessPDF.Shape? = nil     // Or a simple shape, rebuilt as one (page points from the top left)
+        var hasImage = false    // Shows a photo (rather than only shapes: a chart, a diagram)
     }
 
     struct Layers {
@@ -97,19 +100,78 @@ nonisolated enum SlideLayers {
         for index in foreground where seen.insert(groupOf[index]!).inserted { order.append(groupOf[index]!) }
         var withImages = Set<Int>()
         for (position, part) in parts.enumerated() where part.isImage { withImages.insert(groups.member[position]) }
+        // Groups that are a single drawing step: a photo drawn plainly is embedded at its own resolution.
+        var members = [Int](repeating: 0, count: groups.frames.count), only = [Int: Int]()
+        for (position, index) in foreground.enumerated() { members[groups.member[position]] += 1; only[groups.member[position]] = index }
+        let longSide = max(crop.width, crop.height) * scale
         var layers = Layers(background: background.flatMap { isWhite($0) ? nil : $0 }, pictures: [])
         for id in order {
+            if members[id] == 1, let index = only[id], let name = steps[index].plainImage,
+               crop.insetBy(dx: -0.01, dy: -0.01).contains(steps[index].area),
+               let picture = nativePicture(name, placed: steps[index].area, on: source, crop: crop, scale: scale),
+               drawing.showsAnything(in: picture.frame) {
+                layers.pictures.append(picture)
+                continue
+            }
+            // A lone line, box or circle becomes a real shape.
+            if members[id] == 1, let index = only[id], var shape = steps[index].shape,
+               crop.insetBy(dx: -0.01, dy: -0.01).contains(steps[index].area) {
+                func flip(_ point: CGPoint) -> CGPoint { CGPoint(x: point.x - crop.minX, y: crop.maxY - point.y) }
+                shape.bounds = CGRect(x: shape.bounds.minX - crop.minX, y: crop.maxY - shape.bounds.maxY, width: shape.bounds.width, height: shape.bounds.height)
+                if case .line(let from, let to) = shape.kind { shape.kind = .line(flip(from), flip(to)) }
+                if isDrawn(shape, in: drawing) {
+                    layers.pictures.append(Picture(frame: groups.frames[id], image: nil, shape: shape))
+                    continue
+                }
+            }
             let box = groups.frames[id].insetBy(dx: -1, dy: -1)
             guard let pixels = drawing.shownPixels(in: box) else { continue }
             if !withImages.contains(id), let table = SlideTable.detect(in: pixels, of: drawing, page: page) {
                 layers.tables.append(table)
             } else if let image = drawing.image.cropping(to: pixels) {
                 layers.pictures.append(Picture(frame: CGRect(x: pixels.minX / scale, y: pixels.minY / scale,
-                                                             width: pixels.width / scale, height: pixels.height / scale), image: image))
+                                                             width: pixels.width / scale, height: pixels.height / scale),
+                                               image: image, hasImage: withImages.contains(id)))
             }
         }
         guard !layers.pictures.isEmpty || !layers.tables.isEmpty else { return nil }
         return layers
+    }
+
+    /// Whether the drawing shows the shape in its colors where it should be: its fill in the middle, its
+    /// outline at the middle of a line or of the top edge. Catches a shape in a hidden layer, and a color
+    /// space that isn't the standard RGB the colors were taken as.
+    private static func isDrawn(_ shape: TextlessPDF.Shape, in drawing: ClearDrawing) -> Bool {
+        func shows(_ color: UInt32, at point: CGPoint) -> Bool {
+            let (red, green, blue) = (Int(color >> 16), Int(color >> 8 & 255), Int(color & 255))
+            return drawing.pixel(near: point) { r, g, b, alpha in
+                alpha >= 48 && abs(r - red) <= 10 && abs(g - green) <= 10 && abs(b - blue) <= 10
+            }
+        }
+        let box = shape.bounds
+        if let fill = shape.fill, !shows(fill, at: CGPoint(x: box.midX, y: box.midY)) { return false }
+        if let stroke = shape.stroke {
+            let point: CGPoint
+            if case .line(let from, let to) = shape.kind { point = CGPoint(x: (from.x + to.x) / 2, y: (from.y + to.y) / 2) }
+            else { point = CGPoint(x: box.midX, y: box.minY) }
+            if !shows(stroke, at: point) { return false }
+        }
+        return true
+    }
+
+    /// A photo the page draws plainly (see `TextlessPDF.Step.plainImage`), taken from the PDF itself rather
+    /// than from a picture of the page: sharper when it has more pixels than the page picture would give it,
+    /// and when it's a JPEG, embedded as it is. Up to twice the page picture's sharpness, or 3000 pixels
+    /// (whichever is more, so it's never less sharp than the page picture).
+    private static func nativePicture(_ name: String, placed: CGRect, on page: CGPDFPage, crop: CGRect, scale: CGFloat) -> Picture? {
+        let rendered = Int((max(placed.width, placed.height) * scale).rounded(.up))
+        let maxPixels = max(min(3000, rendered * 2), rendered)
+        guard rendered > 0, let native = TextlessPDF.image(named: name, on: page, maxPixels: maxPixels, minPixels: rendered + rendered / 20) else { return nil }
+        let frame = CGRect(x: placed.minX - crop.minX, y: crop.maxY - placed.maxY, width: placed.width, height: placed.height)
+        switch native {
+        case .jpeg(let data): return Picture(frame: frame, image: nil, jpeg: data, hasImage: true)
+        case .image(let image): return Picture(frame: frame, image: image, hasImage: true)
+        }
     }
 
     /// Which group each area belongs to (an index into `frames`), and each group's box. Areas closer than
@@ -218,6 +280,32 @@ nonisolated final class ClearDrawing {
         self.context = context
         // Rows run top to bottom in the bitmap's memory.
         pixels = UnsafePointer(data.bindMemory(to: UInt8.self, capacity: width * height * 4))
+    }
+
+    /// Whether the drawing shows something at a few points spread over `box` (page points from the top
+    /// left): false for something that's drawn but hidden (in a layer that's off).
+    func showsAnything(in box: CGRect) -> Bool {
+        [(0.5, 0.5), (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)].contains { fx, fy in
+            pixel(near: CGPoint(x: box.minX + box.width * fx, y: box.minY + box.height * fy)) { _, _, _, alpha in alpha > 0 }
+        }
+    }
+
+    /// Whether a pixel within about a pixel of `point` (page points from the top left; a page with a
+    /// fractional height is drawn up to a pixel higher) passes `test`, given its color (not premultiplied)
+    /// and alpha.
+    func pixel(near point: CGPoint, _ test: (_ red: Int, _ green: Int, _ blue: Int, _ alpha: Int) -> Bool) -> Bool {
+        let x = Int(point.x * scale), y = Int(point.y * scale)
+        let top = max(0, y - 1), bottom = min(height - 1, y + 1), left = max(0, x - 1), right = min(width - 1, x + 1)
+        guard top <= bottom, left <= right else { return false }
+        for row in top...bottom {
+            for column in left...right {
+                let index = (row * width + column) * 4
+                let alpha = Int(pixels[index + 3])
+                func plain(_ value: UInt8) -> Int { alpha == 0 ? 0 : min(255, (Int(value) * 255 + alpha / 2) / alpha) }
+                if test(plain(pixels[index]), plain(pixels[index + 1]), plain(pixels[index + 2]), alpha) { return true }
+            }
+        }
+        return false
     }
 
     /// The smallest pixel rectangle inside `box` (page points, from the top left) holding every pixel that
