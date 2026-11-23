@@ -69,11 +69,11 @@ nonisolated struct SlideTable {
             }
             return bands
         }
+        // Rows first: most groups (photos aside, which never get here) aren't tables and stop there.
         guard let rows = rules(count: height, span: width, isLine: { isLine(left + $1, top + $0, across: (0, 1)) }),
+              rows.count >= 2, rows.count <= 41, rows.first!.lowerBound <= 2, rows.last!.upperBound >= height - 3,
               let columns = rules(count: width, span: height, isLine: { isLine(left + $0, top + $1, across: (1, 0)) }),
-              rows.count >= 2, columns.count >= 2, rows.count <= 41, columns.count <= 21,
-              (rows.count - 1) * (columns.count - 1) >= 2,
-              rows.first!.lowerBound <= 2, rows.last!.upperBound >= height - 3,
+              columns.count >= 2, columns.count <= 21, (rows.count - 1) * (columns.count - 1) >= 2,
               columns.first!.lowerBound <= 2, columns.last!.upperBound >= width - 3 else { return nil }
 
         let ys = rows.map { CGFloat(top) + CGFloat($0.lowerBound + $0.upperBound + 1) / 2 }

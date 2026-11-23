@@ -23,7 +23,7 @@ nonisolated enum TextlessPDF {
     /// A one-page PDF with the same boxes and rotation as `page` and none of its text. With `keeping`,
     /// only the page's own drawing steps (numbered as in `paintedAreas`) it returns true for are drawn.
     static func data(for page: CGPDFPage, keeping: ((Int) -> Bool)? = nil) throws -> Data {
-        try Writer(page: page).build(keeping: keeping)
+        try Writer(page: page).build(keepings: [keeping])[0]
     }
 
     /// Where each of the page's own drawing steps (a filled or stroked shape, an image, a shading or a nested
@@ -37,15 +37,29 @@ nonisolated enum TextlessPDF {
     /// shapes, stamps, comment boxes) carried over. Links, form fields and pop-up notes draw nothing
     /// worth keeping and are left out.
     static func document(for page: PDFPage, keeping: ((Int) -> Bool)? = nil, annotations: Bool = true) throws -> PDFDocument {
+        try documents(for: page, [(keeping, annotations)])[0]
+    }
+
+    /// Several copies of the page that differ only in which drawing steps they keep (and whether the
+    /// markup comes along), from one reading of the page: its images are decoded once for all of them.
+    static func documents(for page: PDFPage, _ copies: [(keeping: ((Int) -> Bool)?, annotations: Bool)]) throws -> [PDFDocument] {
         guard let source = page.pageRef else { throw Unsupported(reason: "no page reference") }
-        guard let document = PDFDocument(data: try data(for: source, keeping: keeping)), let copy = document.page(at: 0) else {
-            throw Unsupported(reason: "copy couldn't be opened")
-        }
+        let datas = try Writer(page: source).build(keepings: copies.map(\.keeping))
         let skipped: Set<String> = ["Link", "Widget", "Popup"]
-        for annotation in page.annotations where annotations && !skipped.contains(annotation.type ?? "") && annotation.shouldDisplay {
-            if let duplicate = annotation.copy() as? PDFAnnotation { copy.addAnnotation(duplicate) }
+        return try zip(datas, copies).map { data, options in
+            guard let document = PDFDocument(data: data), let copy = document.page(at: 0) else {
+                throw Unsupported(reason: "copy couldn't be opened")
+            }
+            for annotation in page.annotations where options.annotations && !skipped.contains(annotation.type ?? "") && annotation.shouldDisplay {
+                if let duplicate = annotation.copy() as? PDFAnnotation { copy.addAnnotation(duplicate) }
+            }
+            return document
         }
-        return document
+    }
+
+    /// Whether the page has markup that `document(for:)` carries over.
+    static func hasMarkup(_ page: PDFPage) -> Bool {
+        page.annotations.contains { !["Link", "Widget", "Popup"].contains($0.type ?? "") && $0.shouldDisplay }
     }
 }
 
@@ -66,7 +80,9 @@ nonisolated private final class Writer {
         self.page = page
     }
 
-    func build(keeping keep: ((Int) -> Bool)?) throws -> Data {
+    /// One copy of the page per entry in `keepings`; everything but the page's own drawing steps is
+    /// written once and shared.
+    func build(keepings: [((Int) -> Bool)?]) throws -> [Data] {
         guard let pageDictionary = page.dictionary else { throw TextlessPDF.Unsupported(reason: "no page dictionary") }
         let catalog = reserve(), pages = reserve(), pageNumber = reserve()
 
@@ -86,7 +102,6 @@ nonisolated private final class Writer {
 
         let content = try pageContent(pageDictionary)
         let contents = reserve()
-        objects[contents - 1] = streamObject("", data: try ContentFilter.strip(content, keeping: keep))
         entries += " /Contents \(contents) 0 R"
         objects[pageNumber - 1] = Data("<<\(entries)>>".utf8)
         objects[pages - 1] = Data("<< /Type /Pages /Kids [\(pageNumber) 0 R] /Count 1 >>".utf8)
@@ -97,7 +112,10 @@ nonisolated private final class Writer {
             catalogEntries += " /OCProperties " + (try reference(dictionary: layers))
         }
         objects[catalog - 1] = Data("<<\(catalogEntries)>>".utf8)
-        return assemble()
+        return try keepings.map { keep in
+            objects[contents - 1] = streamObject("", data: try ContentFilter.strip(content, keeping: keep))
+            return assemble()
+        }
     }
 
     func paintedAreas() throws -> [TextlessPDF.Step] {

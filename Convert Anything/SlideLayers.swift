@@ -83,16 +83,18 @@ nonisolated enum SlideLayers {
         for (position, index) in foreground.enumerated() { groupOf[index] = groups.member[position] }
 
         // The background: everything that isn't in a group, with the page's markup (highlights, ink).
-        let backgroundDocument = try TextlessPDF.document(for: page, keeping: { groupOf[$0] == nil })
-        let background = try backgroundDocument.page(at: 0).map { try ImageConversion.render($0, scale: scale) }
-        let foregroundDocument = try TextlessPDF.document(for: page, keeping: { groupOf[$0] != nil }, annotations: false)
-        guard let foregroundPage = foregroundDocument.page(at: 0) else { return nil }
+        // A page with nothing behind its pieces has none (a white slide).
+        let hasBackground = areas.indices.contains { areas[$0] != nil && groupOf[$0] == nil } || TextlessPDF.hasMarkup(page)
+        let documents = try TextlessPDF.documents(for: page, [(keeping: { groupOf[$0] != nil }, annotations: false)]
+                                                     + (hasBackground ? [(keeping: { groupOf[$0] == nil }, annotations: true)] : []))
+        guard let foregroundPage = documents[0].page(at: 0) else { return nil }
         let drawing = try ClearDrawing(foregroundPage, scale: scale)
+        let background = try documents.dropFirst().first?.page(at: 0).map { try ImageConversion.render($0, scale: scale) }
 
         // One picture per group, in the order the groups first draw, trimmed to what it actually shows.
         // A group of shapes that draws a ruled grid becomes a real table instead.
-        var order: [Int] = []
-        for index in foreground where !order.contains(groupOf[index]!) { order.append(groupOf[index]!) }
+        var order: [Int] = [], seen = Set<Int>()
+        for index in foreground where seen.insert(groupOf[index]!).inserted { order.append(groupOf[index]!) }
         var withImages = Set<Int>()
         for (position, part) in parts.enumerated() where part.isImage { withImages.insert(groups.member[position]) }
         var layers = Layers(background: background.flatMap { isWhite($0) ? nil : $0 }, pictures: [])
@@ -128,8 +130,11 @@ nonisolated enum SlideLayers {
             return index
         }
         let padded = areas.map { $0.insetBy(dx: -gap / 2, dy: -gap / 2) }
-        for first in areas.indices {
-            for second in (first + 1)..<areas.count {
+        // Sweep left to right: only areas whose padded spans overlap horizontally can touch.
+        let byLeft = areas.indices.sorted { padded[$0].minX < padded[$1].minX }
+        for (position, first) in byLeft.enumerated() {
+            for second in byLeft[(position + 1)...] {
+                guard padded[second].minX <= padded[first].maxX else { break }
                 let touching: Bool
                 if parts[first].isImage && parts[second].isImage {
                     let overlap = areas[first].intersection(areas[second])
@@ -142,45 +147,56 @@ nonisolated enum SlideLayers {
                 if touching { parent[root(second)] = root(first) }
             }
         }
-        // Merge groups until no two boxes overlap (with a point to spare on each side).
-        while true {
-            var frames: [Int: CGRect] = [:]
-            for index in areas.indices { frames[root(index), default: .null] = frames[root(index), default: .null].union(areas[index]) }
-            let roots = Array(frames.keys)
-            var merged = false
-            outer: for a in roots.indices {
-                for b in (a + 1)..<roots.count
-                where frames[roots[a]]!.insetBy(dx: -1.5, dy: -1.5).intersects(frames[roots[b]]!.insetBy(dx: -1.5, dy: -1.5)) {
-                    parent[roots[b]] = roots[a]
-                    merged = true
-                    break outer
+        // Merge groups until no two boxes overlap (with a point to spare on each side). A merged box can
+        // reach new neighbors, so passes repeat until one merges nothing.
+        var roots: [Int] = [], frames: [CGRect] = []
+        var slot: [Int: Int] = [:]
+        for index in areas.indices {
+            let group = root(index)
+            if let existing = slot[group] { frames[existing] = frames[existing].union(areas[index]) }
+            else { slot[group] = roots.count; roots.append(group); frames.append(areas[index]) }
+        }
+        var merged = true
+        while merged {
+            merged = false
+            var a = 0
+            while a < roots.count {
+                var b = a + 1
+                while b < roots.count {
+                    if frames[a].insetBy(dx: -1.5, dy: -1.5).intersects(frames[b].insetBy(dx: -1.5, dy: -1.5)) {
+                        frames[a] = frames[a].union(frames[b])
+                        parent[roots[b]] = roots[a]
+                        roots.remove(at: b); frames.remove(at: b)
+                        merged = true
+                    } else {
+                        b += 1
+                    }
                 }
-            }
-            if !merged {
-                let ids = Dictionary(uniqueKeysWithValues: roots.enumerated().map { ($1, $0) })
-                return (areas.indices.map { ids[root($0)]! }, roots.map { frames[$0]! })
+                a += 1
             }
         }
+        let ids = Dictionary(uniqueKeysWithValues: roots.enumerated().map { ($1, $0) })
+        return (areas.indices.map { ids[root($0)]! }, frames)
     }
 
     private static func isWhite(_ image: CGImage) -> Bool {
         guard let data = image.dataProvider?.data, let bytes = CFDataGetBytePtr(data),
               image.bitsPerPixel == 32, image.bitsPerComponent == 8 else { return false }
-        let length = CFDataGetLength(data)
-        var index = 0
-        while index < length {
-            // noneSkipLast RGBX: every color byte at 255 (the padding byte doesn't matter).
-            if index % 4 != 3 && bytes[index] < 255 { return false }
-            index += 1
+        // noneSkipLast RGBX: every color byte at 255. The padding byte, and any padding at the end of a
+        // row, doesn't matter.
+        for y in 0..<image.height {
+            let row = bytes + y * image.bytesPerRow
+            for x in 0..<image.width where row[x * 4] & row[x * 4 + 1] & row[x * 4 + 2] != 255 { return false }
         }
         return true
     }
 }
 
 /// A page drawn on a clear background, so what each group shows can be found from its pixels' alpha.
-nonisolated struct ClearDrawing {
+nonisolated final class ClearDrawing {
     let image: CGImage
-    let pixels: [UInt8]         // RGBA, premultiplied, rows from the top
+    let pixels: UnsafePointer<UInt8>   // RGBA, premultiplied, rows from the top; lives as long as `context`
+    private let context: CGContext
     let width: Int, height: Int
     let scale: CGFloat
 
@@ -199,8 +215,9 @@ nonisolated struct ClearDrawing {
         page.draw(with: .cropBox, to: context)
         guard let image = context.makeImage(), let data = context.data else { throw ConversionError.failed("Couldn't render this PDF.") }
         self.image = image
+        self.context = context
         // Rows run top to bottom in the bitmap's memory.
-        pixels = Array(UnsafeBufferPointer(start: data.bindMemory(to: UInt8.self, capacity: width * height * 4), count: width * height * 4))
+        pixels = UnsafePointer(data.bindMemory(to: UInt8.self, capacity: width * height * 4))
     }
 
     /// The smallest pixel rectangle inside `box` (page points, from the top left) holding every pixel that
