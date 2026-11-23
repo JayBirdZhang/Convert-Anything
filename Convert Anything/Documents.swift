@@ -19,6 +19,24 @@ enum DocumentConversion {
             input = try await IWork.export(input, with: .pages, as: .word, to: docx)
             from = .docx
         }
+        // E-books: an EPUB is read as one HTML page, and writing one cuts the document into chapters.
+        if from == .epub {
+            let page = try await EPUB.asHTMLRequest(request)
+            if request.to == .pdf {
+                // Loading the page from disk is what lets the web engine show the book's pictures.
+                try await WebPDF.render(html: "", baseURL: page.originalDir, output: output, file: page.input)
+            } else if request.to == .html {
+                // The joined page already carries its pictures and styling, so it is the result.
+                try FileManager.default.copyItem(at: page.input, to: output)
+            } else {
+                try await convert(page, output: output)
+            }
+            return
+        }
+        if request.to == .epub {
+            try await EPUB.write(request, from: from, input: input, output: output)
+            return
+        }
         if from == .pdf {
             if request.to == .docx {
                 try await PDFToWord.convert(request, output: output)
@@ -301,7 +319,7 @@ nonisolated enum Markdown {
             var paragraph: [String] = []
             while let next = lines.first {
                 let t = next.trimmingCharacters(in: .whitespaces)
-                if t.isEmpty || t.hasPrefix("#") || t.hasPrefix(">") || t.hasPrefix("```") || (listMarker(next) != nil && !paragraph.isEmpty) { break }
+                if t.isEmpty || (t.hasPrefix("#") && t.wholeMatch(of: headingRegex) != nil) || t.hasPrefix(">") || t.hasPrefix("```") || (listMarker(next) != nil && !paragraph.isEmpty) { break }
                 if !paragraph.isEmpty, t.wholeMatch(of: equalsRegex) != nil || t.wholeMatch(of: dashesRegex) != nil {
                     let level = t.hasPrefix("=") ? 1 : 2
                     out.append("<h\(level)>\(inline(paragraph.joined(separator: " ")))</h\(level)>")
@@ -391,7 +409,8 @@ nonisolated enum Markdown {
     }
 
     // Compiled once: Swift builds a regex literal from its pattern each time the code runs, which dominated big files.
-    private static let headingRegex = /(#{1,6})\s+(.*?)\s*#*/
+    // A heading can hold a line-break character (from a soft break in a Word title, say); "." has to match it, or the line never parses.
+    private static let headingRegex = /(#{1,6})\s+(.*?)\s*#*/.dotMatchesNewlines()
     private static let ruleRegex = /([-*_])(\s*\1){2,}/
     private static let equalsRegex = /=+/
     private static let dashesRegex = /-+/
