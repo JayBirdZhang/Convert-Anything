@@ -25,6 +25,8 @@ import UserNotifications
     var originalInTrash: URL?
     var keptOriginal: URL?  // With "Keep both", where the original was put back
     var resultURL: URL?     // The converted file, or a folder of images when every page was exported
+    var combinedInto: URL?  // When the batch's PDFs were merged, the merged file (the separate ones are in the Trash)
+    var resultMissing = false   // Showing it in Finder found it gone
     var pageCount: Int?
     var task: Task<Void, Never>?
 
@@ -215,23 +217,14 @@ enum OriginalsMode: String, CaseIterable {
 
         let name = newURL.lastPathComponent
         guard !name.hasPrefix("."), !name.hasPrefix("~$"),
-              let oldFormat = Format(fileExtension: oldURL.pathExtension),
-              let newFormat = Format(fileExtension: newURL.pathExtension),
-              oldFormat != newFormat else { return }   // Includes harmless renames like .jpg → .jpeg
-
-        // What's actually inside the file decides the source format, not the old extension.
-        let source: Format
-        switch Sniffer.detect(newURL) {
-        case .format(let detected):
-            source = detected
-        case .text:
-            source = oldFormat.isPlainText ? oldFormat : .txt
-        case .iWork:
-            guard oldFormat.isIWork else { return }
-            source = oldFormat
-        case .unknown:
-            return   // Not something we understand; leave it alone.
+              let oldFormat = Format(fileExtension: oldURL.pathExtension) else { return }
+        guard let newFormat = Format(fileExtension: newURL.pathExtension) else {
+            noteUnknownExtension(from: oldURL, to: newURL, oldFormat: oldFormat)
+            return
         }
+        guard oldFormat != newFormat else { return }   // Includes harmless renames like .jpg → .jpeg
+
+        guard let source = sourceFormat(of: newURL, oldFormat: oldFormat) else { return }
         // Already in the new format: the rename just fixed a wrong extension.
         guard source != newFormat else { return }
 
@@ -252,12 +245,67 @@ enum OriginalsMode: String, CaseIterable {
 
         guard Converter.route(from: source, to: newFormat) != nil else {
             revertRename(job)
-            job.state = .failed(ConversionError.unsupported(source, newFormat).localizedDescription)
+            job.state = .failed(failureMessage(ConversionError.unsupported(source, newFormat), for: job))
             summarizeWhenFinished(batch)
             return
         }
         job.task = Task { await run(job) }
         updatePulse()
+    }
+
+    /// What's actually inside the file decides the source format, not the old extension.
+    /// Nil when it's not something we understand, which is left alone.
+    private func sourceFormat(of url: URL, oldFormat: Format) -> Format? {
+        switch Sniffer.detect(url) {
+        case .format(let detected): detected
+        case .text: oldFormat.isPlainText ? oldFormat : .txt
+        case .iWork: oldFormat.isIWork ? oldFormat : nil
+        case .unknown: nil
+        }
+    }
+
+    /// Extensions people add to keep a copy or mark a file, which aren't asking for a conversion.
+    private static let notConversions: Set<String> = [
+        "bak", "old", "orig", "tmp", "temp", "backup", "copy", "part", "crdownload", "download", "lock", "swp",
+    ]
+    private var unknownRenames: [(name: String, ext: String, message: String)] = []
+    private var unknownFlush: Task<Void, Never>?
+
+    /// A known kind of file renamed to an extension we don't know (.epub, .xyz): nothing is converted and the
+    /// file keeps the name it was given, but the user hears why nothing happened. Only a plain extension swap
+    /// on a file we can read counts, so saves that go through temporary names stay quiet. There's no history
+    /// row (a row needs a target format), just a notification, and one for a whole batch rename.
+    private func noteUnknownExtension(from oldURL: URL, to newURL: URL, oldFormat: Format) {
+        let ext = newURL.pathExtension.lowercased()
+        guard (1...6).contains(ext.count), ext.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }),
+              !Self.notConversions.contains(ext),
+              oldURL.deletingPathExtension().lastPathComponent == newURL.deletingPathExtension().lastPathComponent,
+              showNotifications,
+              let source = sourceFormat(of: newURL, oldFormat: oldFormat) else { return }
+        unknownRenames.append((newURL.lastPathComponent, ext, UnsupportedConversion.unknownExtension(ext, from: source)))
+        guard unknownFlush == nil else { return }
+        unknownFlush = Task {
+            try? await Task.sleep(for: .seconds(Self.batchWindow))
+            let renames = unknownRenames
+            unknownRenames = []
+            unknownFlush = nil
+            log.notice("\(renames.count) file(s) renamed to an extension we don't know: \(renames.map(\.ext).joined(separator: ","), privacy: .public)")
+            if let only = renames.first, renames.count == 1 {
+                notify("Couldn't convert \(only.name)", body: only.message)
+            } else {
+                let extensions = renames.map(\.ext).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+                notify("Couldn't convert \(renames.count) files",
+                       body: "Convert Anything doesn't know " + extensions.prefix(3).map { ".\($0)" }.joined(separator: ", ") + ".")
+            }
+        }
+    }
+
+    /// Plain words for a failure. A rename to a format that can't be made from the file also says what would work.
+    private func failureMessage(_ error: Error, for job: Job) -> String {
+        if case ConversionError.unsupported(let from, let to) = error {
+            return UnsupportedConversion.message(from: from, to: to, originalExtension: job.originalURL.pathExtension)
+        }
+        return error.localizedDescription
     }
 
     // MARK: Running a conversion
@@ -349,7 +397,7 @@ enum OriginalsMode: String, CaseIterable {
         } catch {
             log.error("\(job.from.rawValue, privacy: .public) → \(job.to.rawValue, privacy: .public) failed: \(String(describing: error), privacy: .public)")
             revertRename(job)
-            job.state = .failed(error.localizedDescription)
+            job.state = .failed(failureMessage(error, for: job))
         }
     }
 
@@ -404,6 +452,7 @@ enum OriginalsMode: String, CaseIterable {
             }.value
             for url in pdfs { try? FileManager.default.trashItem(at: url, resultingItemURL: nil) }
             batch.jobs.forEach { undoStore.remove(converted: $0.fileURL.path) }
+            batch.jobs.filter { $0.resultURL.map(pdfs.contains) == true }.forEach { $0.combinedInto = combined }
             batch.combinedURL = combined
         } catch {
             log.error("Combining PDFs failed: \(error.localizedDescription, privacy: .public)")
@@ -534,9 +583,11 @@ enum OriginalsMode: String, CaseIterable {
         job.state = .undone
     }
 
+    /// Selects the file in Finder. If it has been moved or deleted since, opens its folder and marks the row.
     func reveal(_ job: Job) {
-        let url = job.state == .done ? job.resultURL ?? job.fileURL : job.originalURL
-        NSWorkspace.shared.activateFileViewerSelecting([url])
+        let url = job.combinedInto ?? (job.state == .done ? job.resultURL ?? job.fileURL : job.originalURL)
+        let found = FinderReveal.show([url])
+        if job.state == .done { job.resultMissing = !found }
     }
 
     func cancel(_ batch: Batch) {
@@ -554,7 +605,7 @@ enum OriginalsMode: String, CaseIterable {
     /// Selects the converted files in Finder, or the folder if none were converted.
     func reveal(_ batch: Batch) {
         let results = batch.combinedURL.map { [$0] } ?? batch.jobs.filter { $0.state == .done }.compactMap(\.resultURL)
-        NSWorkspace.shared.activateFileViewerSelecting(results.isEmpty ? [batch.folder] : results)
+        FinderReveal.show(results.isEmpty ? [batch.folder] : results, in: batch.folder)
     }
 
     func clearFinished() {
@@ -657,7 +708,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         guard let paths = response.notification.request.content.userInfo["reveal"] as? [String] else { return }
         await MainActor.run {
-            NSWorkspace.shared.activateFileViewerSelecting(paths.map { URL(fileURLWithPath: $0) })
+            FinderReveal.show(paths.map { URL(fileURLWithPath: $0) })
         }
     }
 }

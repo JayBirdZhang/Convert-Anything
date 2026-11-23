@@ -54,6 +54,12 @@ private struct JobRow: View {
         .hoverHighlight(hovering && !job.isActive)
         .onHover { hovering = $0 }
         .onTapGesture { if !job.isActive { model.reveal(job) } }
+        .contextMenu {
+            if !job.isActive {
+                Button("Show in Finder") { model.reveal(job) }
+                if job.state == .done && job.canUndo { Button("Undo") { model.undo(job) } }
+            }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityAction(named: "Show in Finder") { model.reveal(job) }
     }
@@ -76,7 +82,12 @@ private struct JobRow: View {
     }
 
     private var isDimmed: Bool {
-        [.waiting, .cancelled, .undone].contains(job.state)
+        [.waiting, .cancelled, .undone].contains(job.state) || isMissing
+    }
+
+    /// Done, but showing it in Finder found nothing there.
+    private var isMissing: Bool {
+        job.state == .done && job.resultMissing
     }
 
     @ViewBuilder private var detail: some View {
@@ -97,6 +108,7 @@ private struct JobRow: View {
             HStack(spacing: 8) {
                 change
                 Text(([job.pageCount.map { "\($0) \(job.to.kind == .image ? "images" : "files")" },
+                       isMissing ? "Moved or deleted" : nil,
                        now.map { timeLabel(job.started, now: $0) }].compactMap { $0 }).joined(separator: " · "))
                     .font(.subheadline)
                     .monospacedDigit()
@@ -179,6 +191,14 @@ private struct BatchRow: View {
             .onHover { hovering = $0 }
             .onTapGesture {
                 withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) { expanded.toggle() }
+            }
+            .contextMenu {
+                if !batch.isActive {
+                    Button("Show in Finder") { model.reveal(batch) }
+                    if batch.jobs.contains(where: { $0.state == .done && $0.canUndo }) {
+                        Button("Undo All") { model.undoAll(batch) }
+                    }
+                }
             }
             .accessibilityElement(children: .contain)
             .accessibilityAddTraits(.isButton)
