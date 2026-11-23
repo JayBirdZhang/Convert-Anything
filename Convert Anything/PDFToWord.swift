@@ -200,8 +200,9 @@ nonisolated enum PDFToWord {
         // clear background on a dark slide).
         let coloredPage = !plan.background.isEmpty && coarseInk().share > 0.75
         let shapes = Set(candidates.filter { !$0.hasImage || coloredPage }.flatMap(\.steps))
-        let drawing = try shapes.isEmpty ? nil : TextlessPDF.document(for: page, keeping: { shapes.contains($0) }, annotations: false)
-            .page(at: 0).map { try ClearDrawing($0, scale: scale) }
+        var drawing = try shapes.isEmpty ? nil : autoreleasepool {
+            try TextlessPDF.document(for: page, keeping: { shapes.contains($0) }, annotations: false).page(at: 0).map { try ClearDrawing($0, scale: scale) }
+        }
         let pagePixels = CGRect(x: 0, y: 0, width: Int(size.width * scale), height: Int(size.height * scale))
 
         // Ruled grids become tables; their text goes in their cells.
@@ -298,6 +299,16 @@ nonisolated enum PDFToWord {
         let area = cuts.reduce(CGRect.null) { $0.union($1.pixels) }
             .intersection(pagePixels)
         let left = Int(area.minX), top = Int(area.minY), width = Int(area.width), height = Int(area.height)
+        // Only where the shapes show is still needed from their drawing, for clearing a colored background:
+        // keep that, for the pictures' area, and let the whole drawing go before making another.
+        var shapeAlpha: [UInt8] = []
+        if let drawing, !plan.background.isEmpty, width > 0, height > 0 {
+            shapeAlpha = [UInt8](repeating: 0, count: width * height)
+            for y in 0..<height {
+                for x in 0..<width { shapeAlpha[y * width + x] = drawing.pixels[((top + y) * drawing.width + left + x) * 4 + 3] }
+            }
+        }
+        drawing = nil
         guard width > 0, height > 0,
               let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
                                       space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
@@ -319,9 +330,9 @@ nonisolated enum PDFToWord {
             if cuts.contains(where: { $0.kind != .photo && $0.pixels.intersects(pixels) }) { context.clear(local(pixels)) }
         }
         let memory = data.bindMemory(to: UInt8.self, capacity: width * height * 4)
-        if let drawing, !plan.background.isEmpty {
+        if !shapeAlpha.isEmpty {
             for cut in cuts where cut.kind == .shapes || (cut.kind == .photo && coloredPage) {
-                clearBackground(memory, width: width, origin: (left, top), in: cut.pixels.intersection(area), labels: cut.labels, drawing: drawing)
+                clearBackground(memory, width: width, origin: (left, top), in: cut.pixels.intersection(area), labels: cut.labels, shapes: shapeAlpha)
             }
         }
         guard let image = context.makeImage() else { return nil }
@@ -352,14 +363,14 @@ nonisolated enum PDFToWord {
     }
 
     /// Clears the page's background from `rect` (pixels of the page) in `memory`, a drawing of the page
-    /// from `origin`, where the picture's own shapes (`drawing`) show nothing. When the background there is
-    /// clear (a page template that only draws a logo), nothing changes. Otherwise only the picture's
-    /// `labels` keep what's around its shapes, less their own background color, found in each label's
-    /// small area so a gradient doesn't matter.
+    /// from `origin`, where the picture's own shapes show nothing (`shapes` is their alpha, laid out like
+    /// `memory`). When the background there is clear (a page template that only draws a logo) or white,
+    /// nothing changes. Otherwise only the picture's `labels` keep what's around its shapes, less their
+    /// own background color, found in each label's small area so a gradient doesn't matter.
     private static func clearBackground(_ memory: UnsafeMutablePointer<UInt8>, width: Int, origin: (x: Int, y: Int), in rect: CGRect,
-                                        labels: [CGRect], drawing: ClearDrawing) {
+                                        labels: [CGRect], shapes: [UInt8]) {
         func local(_ x: Int, _ y: Int) -> Int { ((y - origin.y) * width + (x - origin.x)) * 4 }
-        func isEmpty(_ x: Int, _ y: Int) -> Bool { drawing.pixels[(y * drawing.width + x) * 4 + 3] == 0 }
+        func isEmpty(_ x: Int, _ y: Int) -> Bool { shapes[(y - origin.y) * width + x - origin.x] == 0 }
         func clear(_ i: Int) { memory[i] = 0; memory[i + 1] = 0; memory[i + 2] = 0; memory[i + 3] = 0 }
         /// The most common color where the shapes show nothing, as RGBA.
         func dominant(_ rect: CGRect, step: Int) -> (Int, Int, Int, Int)? {
@@ -372,7 +383,10 @@ nonisolated enum PDFToWord {
             }
             return counts.max { $0.value < $1.value }.map { key in (Int(key.key >> 24), Int(key.key >> 16 & 0xFF), Int(key.key >> 8 & 0xFF), Int(key.key & 0xFF)) }
         }
-        guard rect.width >= 1, rect.height >= 1, let color = dominant(rect, step: 3), color.3 > 0 else { return }
+        // Clear or white around the shapes: nothing to take out (and text the page's text layer doesn't
+        // list stays).
+        guard rect.width >= 1, rect.height >= 1, let color = dominant(rect, step: 3), color.3 > 0,
+              min(color.0, color.1, color.2) < 245 || color.3 < 255 else { return }
         let labels = labels.map { $0.intersection(rect).integral.intersection(rect) }.filter { !$0.isEmpty }
         let x0 = Int(rect.minX), y0 = Int(rect.minY), columns = Int(rect.maxX) - x0, rows = Int(rect.maxY) - y0
         var kept = [Bool](repeating: false, count: columns * rows)
