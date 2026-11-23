@@ -49,12 +49,19 @@ nonisolated enum PDFText {
         return lines + formLines(on: page, crop: crop)
     }
 
-    /// What's typed into the page's form fields. It's drawn by the fields, not the page, so it isn't in the
-    /// page's text, and the copies of the page made without text leave it out too.
+    /// What's typed into the page's form fields, or onto it as text boxes (Preview's Text tool). It's drawn
+    /// by annotations, not the page, so it isn't in the page's text, and the copies of the page made
+    /// without text leave it out too (see TextlessPDF.skipped).
     private static func formLines(on page: PDFPage, crop: CGRect) -> [TextLine] {
         var lines: [TextLine] = []
-        for field in page.annotations where field.type == "Widget" && field.widgetFieldType == .text && field.shouldDisplay {
-            let value = field.widgetStringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        for field in page.annotations where field.shouldDisplay {
+            let typed: String?
+            switch field.type {
+            case "Widget": typed = field.widgetFieldType == .text ? field.widgetStringValue : nil
+            case "FreeText": typed = field.contents
+            default: typed = nil
+            }
+            let value = typed?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !value.isEmpty else { continue }
             let box = field.bounds
             let rows = value.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
@@ -65,8 +72,8 @@ nonisolated enum PDFText {
             let family = font.familyName ?? "Helvetica"
             let traits = font.fontDescriptor.symbolicTraits
             let height = size * 1.2
-            // Single-line fields center their text; a multiline one starts at the top.
-            var top = rows.count == 1 ? crop.maxY - box.midY - height / 2 : crop.maxY - box.maxY + 2
+            // Single-line fields center their text; a multiline one, and a text box, start at the top.
+            var top = rows.count == 1 && field.type == "Widget" ? crop.maxY - box.midY - height / 2 : crop.maxY - box.maxY + 2
             for row in rows {
                 let width = min(box.width - 4, (row as NSString).size(withAttributes: [.font: font]).width)
                 var left = box.minX + 2

@@ -73,7 +73,6 @@ nonisolated enum TextlessPDF {
     static func documents(for page: PDFPage, _ copies: [(keeping: ((Int) -> Bool)?, annotations: Bool)]) throws -> [PDFDocument] {
         guard let source = page.pageRef else { throw Unsupported(reason: "no page reference") }
         let datas = try Writer(page: source).build(keepings: copies.map(\.keeping))
-        let skipped: Set<String> = ["Link", "Widget", "Popup"]
         return try zip(datas, copies).map { data, options in
             guard let document = PDFDocument(data: data), let copy = document.page(at: 0) else {
                 throw Unsupported(reason: "copy couldn't be opened")
@@ -85,9 +84,13 @@ nonisolated enum TextlessPDF {
         }
     }
 
+    /// Annotations the copies leave out: links and popups draw nothing worth keeping, and what form fields
+    /// and text boxes show is text (PDFText reads it).
+    private static let skipped: Set<String> = ["Link", "Widget", "Popup", "FreeText"]
+
     /// Whether the page has markup that `document(for:)` carries over.
     static func hasMarkup(_ page: PDFPage) -> Bool {
-        page.annotations.contains { !["Link", "Widget", "Popup"].contains($0.type ?? "") && $0.shouldDisplay }
+        page.annotations.contains { !skipped.contains($0.type ?? "") && $0.shouldDisplay }
     }
 }
 
