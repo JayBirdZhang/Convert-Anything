@@ -108,6 +108,8 @@ nonisolated enum Ligatures {
         // In a word in capitals the ligature is in capitals too.
         let others = characters.indices.filter { !spots.contains($0) }.map { characters[$0] }
         let upper = others.allSatisfy(\.isUppercase)
+        // A capital stand-in only inside an otherwise lowercase word: "DiRAC" and "MuSCAT" are acronyms.
+        if letterSpots > 0 && others.dropFirst().contains(where: \.isUppercase) { return nil }
         func build(_ choice: [String]) -> String {
             var text = ""
             var next = 0
@@ -120,6 +122,8 @@ nonisolated enum Ligatures {
         let standIns = spots.map { String(characters[$0]) }
         let learned = standIns.map { memory?.learned(font: font, standIn: $0) }
         let allLearned = learned.allSatisfy { $0 != nil }
+        // A symbol ending a word is usually a footnote mark ("the*"), not a ligature, unless already learned.
+        if let last = spots.last, last == characters.count - 1, !characters[last].isLetter, learned.last! == nil { return nil }
         // Two different capitals inside one word is usually camel case ("LaTeX"): only repaired with learned
         // ligatures. The same one twice ("desAnaAon") is tried as the same ligature twice.
         let sameStandIn = standIns.count == 2 && standIns[0] == standIns[1]

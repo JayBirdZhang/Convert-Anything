@@ -456,7 +456,8 @@ nonisolated enum PDFToWord {
         for (index, line) in block.lines.enumerated() {
             var lineRuns = line.runs
             if index > 0, var last = runs.last {
-                let text = last.text.trimmingCharacters(in: .whitespaces)
+                var text = last.text   // Trailing spaces only: a run can start with the space after a bold run.
+                while text.last?.isWhitespace == true { text.removeLast() }
                 let nextStartsLower = lineRuns.first?.text.first?.isLowercase == true
                 if text.hasSuffix("-") && nextStartsLower {
                     last.text = String(text.dropLast())
