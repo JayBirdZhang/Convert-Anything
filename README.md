@@ -46,7 +46,7 @@ https://github.com/user-attachments/assets/cd589974-3f86-4b3d-a146-ac4dc21ce3fd
 |---|---|
 | **Images** | PNG, JPEG, HEIC, TIFF, GIF, BMP, WebP, AVIF, ICO, ICNS (app icons), TGA. Convert *from* but not to: camera RAW (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, PEF, SRW), Photoshop (PSD), SVG and JPEG XL (to JPEG XL only where macOS can write it) |
 | **Documents** | PDF, Markdown, TXT, HTML, Word (.docx/.doc), RTF, ODT, Pages, EPUB, PowerPoint (.pptx/.ppt), Keynote |
-| **Spreadsheets** | Excel (.xlsx/.xls), CSV, Numbers, JSON (a table ↔ a list of objects) |
+| **Spreadsheets** | Excel (.xlsx/.xls), CSV, Numbers, JSON |
 | **Audio** | MP3, WAV, M4A, AAC, FLAC, Ogg, Opus, AIFF |
 | **Video** | MP4, MOV, M4V, and video → GIF |
 | **Transcripts** | Audio or video → TXT, SRT or WebVTT (.vtt) subtitles; SRT ↔ WebVTT; subtitles → TXT or any document format |
@@ -100,11 +100,6 @@ Hint: To convert multiple files at once, select them, right-click → Rename...,
 **Do my files leave my Mac?**
 No. Conversions use macOS's own frameworks plus two small bundled libraries and are all offline. Nothing is uploaded.
 
-**Is transcription private too?**
-Yes. Renaming a recording to `.txt` or a video to `.srt` uses macOS's built-in speech recognition, which runs on your Mac.
-On macOS 26 and later the first transcript in a new language may download Apple's speech model for it once.
-On macOS 14 and 15, macOS asks once to allow speech recognition.
-
 **Do I need Microsoft Office?**
 No. Keynote, Pages and Numbers (free from Apple) are optional but give the best results for
 PowerPoint → PDF and Word → PDF, and Numbers is needed for Excel → PDF. The first time the app uses
@@ -112,7 +107,7 @@ one, macOS asks for permission to control it: click **OK**.
 
 **How do updates work?**
 About once a day the app checks this repository's latest release and offers to install it.
-Turn that off, or check now, under **Settings → Updates**.
+Turn that off or check it yourself under **Settings → Updates**.
 
 ## License
 
