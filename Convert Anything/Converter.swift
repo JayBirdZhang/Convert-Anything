@@ -311,6 +311,10 @@ nonisolated enum ImageConversion {
         if format == .png, image.bitsPerComponent > 8, Format(fileExtension: input.pathExtension)?.isRaw == true {
             image = try image.at8BitsPerChannel()
         }
+        // An icon has to be square, so a wider or taller picture is centered on a transparent square.
+        if format == .ico, image.width != image.height {
+            image = try ICNS.square(image, pixels: max(image.width, image.height))
+        }
         if [.jpeg, .bmp].contains(format), image.hasAlpha {
             image = try image.flattenedOnWhite()
         }

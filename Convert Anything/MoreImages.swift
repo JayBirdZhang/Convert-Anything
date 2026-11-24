@@ -111,7 +111,8 @@ nonisolated enum ICNS {
         try file.write(to: output)
     }
 
-    private static func square(_ image: CGImage, pixels: Int) throws -> CGImage {
+    /// The picture centered on a transparent square `pixels` wide.
+    static func square(_ image: CGImage, pixels: Int) throws -> CGImage {
         guard let context = CGContext(data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0,
                                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {

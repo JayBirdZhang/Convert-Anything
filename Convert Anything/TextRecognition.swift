@@ -49,7 +49,11 @@ nonisolated enum TextRecognition {
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
         request.automaticallyDetectsLanguage = true
-        try VNImageRequestHandler(cgImage: image).perform([request])
+        do {
+            try VNImageRequestHandler(cgImage: image).perform([request])
+        } catch {
+            throw ConversionError.failed("macOS couldn't read the text in this image. Try again in a moment.")
+        }
 
         // Vision's boxes are 0–1 with the origin at the bottom left.
         let lines = (request.results ?? []).compactMap { observation -> (box: CGRect, text: String)? in

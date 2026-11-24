@@ -398,7 +398,12 @@ nonisolated private final class CoreAudioSink: PCMSink {
         settings[AVSampleRateKey] = rate
         do {
             file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
-        } catch {
+        } catch where settings[AVEncoderBitRateKey] != nil {
+            // Low sample rates (speech recordings, 22 kHz mono) can't take a music bitrate; let the encoder pick.
+            settings[AVEncoderBitRateKey] = nil
+            file = try? AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        } catch {}
+        guard file != nil else {
             throw ConversionError.failed("This Mac can't write \(format.displayName) audio.")
         }
         if channels < source.channelCount {
