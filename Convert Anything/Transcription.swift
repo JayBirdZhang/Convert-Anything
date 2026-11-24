@@ -211,7 +211,10 @@ nonisolated private enum LegacyEngine {
             if !finished { finished = try read(audio, through: converter, into: &samples, upTo: maxChunk) }
             let cut = firstPause(in: samples, limit: maxChunk)
                 ?? (samples.count > maxChunk ? quietestPoint(in: samples, from: searchFrom, to: maxChunk) : samples.count)
-            tokens += try await recognize(samples[0..<cut], offset: offset, with: recognizer, format: format)
+            // A silent piece (the quiet tail after the last words) makes the old recognizer invent a word.
+            if hasSound(samples[0..<cut]) {
+                tokens += try await recognize(samples[0..<cut], offset: offset, with: recognizer, format: format)
+            }
             samples.removeFirst(cut)
             offset += Double(cut) / sampleRate
             progress(min(1, offset / duration))
@@ -282,6 +285,19 @@ nonisolated private enum LegacyEngine {
             position += window
         }
         return nil
+    }
+
+    /// Whether any twentieth of a second is louder than the pause threshold.
+    private static func hasSound(_ samples: ArraySlice<Float>) -> Bool {
+        let window = Int(sampleRate / 20)
+        var position = samples.startIndex
+        while position + window <= samples.endIndex {
+            var energy: Float = 0
+            for index in position..<position + window { energy += samples[index] * samples[index] }
+            if energy / Float(window) >= 1e-4 { return true }
+            position += window
+        }
+        return false
     }
 
     /// The start of the quietest tenth of a second between `start` and `end`.
