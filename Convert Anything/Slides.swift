@@ -43,7 +43,7 @@ nonisolated enum SlideBuilder {
         let slides = try await background { () throws -> [Slide] in
             guard request.from == .pdf else {
                 let png = media.appending(path: "image1.png")
-                try ImageConversion.convert(request.input, to: .png, output: png)
+                try ImageConversion.convert(request.input, to: .png, output: png, keepsLocation: request.keepsLocation)
                 guard let source = CGImageSourceCreateWithURL(png as CFURL, nil),
                       let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                     throw ConversionError.failed("Couldn't read this image.")
