@@ -170,14 +170,16 @@ nonisolated enum Transcription {
 nonisolated enum StallLimit {
     /// Locale lookups and format queries, which take milliseconds.
     static var lookup: Duration { Debug.stallSeconds ?? .seconds(30) }
-    /// The model download reports progress about every 2 seconds, even on a slow connection.
+    /// The model download reports progress about every 2 seconds in whole percents, so this only trips on a
+    /// download that would take more than about 2.5 hours.
     static var download: Duration { Debug.stallSeconds ?? .seconds(90) }
     /// The language sample takes about a second.
     static var detection: Duration { Debug.stallSeconds ?? .seconds(30) }
     /// SpeechAnalyzer asks for more audio, or hands back text, many times a second; the first time a model
     /// is loaded after a download can take a while longer.
     static var analysis: Duration { Debug.stallSeconds ?? .seconds(60) }
-    /// The older recognizer reports once per piece of up to 55 seconds, at least twice as fast as it plays.
+    /// The older recognizer reports once per piece of up to 55 seconds; this allows it to run at half the
+    /// speed the audio plays (on an M-series Mac it runs about 50 times faster).
     static var legacyPiece: Duration { Debug.stallSeconds ?? .seconds(120) }
     /// The system's permission prompt, which waits for the person to answer it.
     static var permission: Duration { Debug.stallSeconds.map { $0 * 2 } ?? .seconds(180) }
@@ -222,7 +224,7 @@ extension Transcription {
                 log.error("\(step, privacy: .public) made no progress for \(seconds, privacy: .public) s; stopping it")
                 work.cancel()
                 let deadline = ContinuousClock.now + StallLimit.windDown
-                while !outcome.hasEnded && ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(100)) }
+                while !outcome.hasEnded && !Task.isCancelled && ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(100)) }
                 if !outcome.hasEnded { log.error("\(step, privacy: .public) didn't stop when cancelled; leaving it behind") }
                 outcome.deliver(.failure(Stalled(step: step, seconds: seconds)))
             }
@@ -366,6 +368,8 @@ nonisolated final class AnalyzerAudio: @unchecked Sendable {
               let input = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 32_768) else {
             throw ConversionError.failed("Couldn't read this file's sound.")
         }
+        // Mixes every channel in, so speech on only one side of a stereo file is still heard.
+        converter.downmix = true
         self.converter = converter
         self.input = input
     }
@@ -540,47 +544,68 @@ nonisolated private enum ModernEngine {
         }
     }
 
-    /// Transcribes about 15 seconds of speech, from the first sound on, in every candidate language at once
-    /// (one analyzer, one model per language), and keeps the language the recognizer was surest of. When the
+    /// Transcribes about 15 seconds of audio, from the first sound on, in every candidate language at once
+    /// (one analyzer, one model per language), and keeps the language the recognizer was surest of. A sample
+    /// with hardly any words (a music intro) is followed by the next 15 seconds, up to a minute in. When the first
     /// sample turns out to be the whole file, its transcript is the result too.
     private static func detect(_ url: URL, among candidates: [Locale], heartbeat: Heartbeat) async throws -> (Locale, [Transcript.Token]?) {
         let log = Transcription.log
         let started = ContinuousClock.now
-        let transcribers = candidates.map { transcriber($0, confidence: true) }
-        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: transcribers) else {
+        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: candidates.map { transcriber($0, confidence: true) }) else {
             throw ModernFailure.unavailable("no audio format for the sample")
         }
         let audio = try AnalyzerAudio(url, as: format)
-        // Skip the silence before the first sound, then take the sample, and a little more rather than
-        // leaving a sliver of the file unheard.
-        var sample: [AnalyzerInput] = []
+        let rate = Int(format.sampleRate)
+        var totals = Array(repeating: (confidence: 0.0, words: 0), count: candidates.count)
+        var heard = 0.0
+        for round in 0..<4 {
+            guard let (inputs, seconds, wholeFile) = try sample(of: audio, heartbeat: heartbeat, skippingSilence: round == 0, rate: rate) else { break }
+            heard += seconds
+            // A module belongs to one analyzer for good (Speech traps on reuse), so each sample gets new ones.
+            let scores = try await score(inputs, with: candidates.map { transcriber($0, confidence: true) }, heartbeat: heartbeat)
+            if round == 0 && wholeFile {
+                let best = bestIndex(scores.map { ($0.confidence, $0.words) })
+                log.notice("Language detection on the whole file (\(Int(seconds.rounded()), privacy: .public) s): \(summary(candidates, scores.map { ($0.confidence, $0.words) }), privacy: .public) → \(candidates[best].identifier, privacy: .public), in \(Transcription.elapsed(since: started), privacy: .public) s")
+                return (candidates[best], scores[best].tokens)
+            }
+            for index in scores.indices {
+                totals[index].confidence += scores[index].confidence * Double(scores[index].words)
+                totals[index].words += scores[index].words
+            }
+            // A word or two is what the recognizer makes of music; it takes a few to judge the language.
+            if totals.contains(where: { $0.words >= 5 }) || wholeFile { break }
+        }
+        let averages = totals.map { (confidence: $0.words > 0 ? $0.confidence / Double($0.words) : 0, words: $0.words) }
+        let best = bestIndex(averages)
+        log.notice("Language detection on \(Int(heard.rounded()), privacy: .public) s: \(summary(candidates, averages), privacy: .public) → \(candidates[best].identifier, privacy: .public), in \(Transcription.elapsed(since: started), privacy: .public) s")
+        return (candidates[best], nil)
+    }
+
+    /// The next 15 seconds, optionally starting at the first sound. Nil when there's nothing left.
+    private static func sample(of audio: AnalyzerAudio, heartbeat: Heartbeat, skippingSilence: Bool,
+                               rate: Int) throws -> (inputs: [AnalyzerInput], seconds: Double, wholeFile: Bool)? {
+        var inputs: [AnalyzerInput] = []
         var lengths: [Int] = []
-        let wanted = Int(format.sampleRate) * sampleSeconds, enough = Int(format.sampleRate) * (sampleSeconds + 5)
+        let wanted = rate * sampleSeconds
         while let buffer = try audio.next() {
             heartbeat.beat()
-            if sample.isEmpty {
-                guard AnalyzerAudio.hasSound(buffer) else { continue }
-                let start = CMTime(value: audio.position - AVAudioFramePosition(buffer.frameLength), timescale: CMTimeScale(format.sampleRate))
-                sample.append(AnalyzerInput(buffer: buffer, bufferStartTime: start))
+            if inputs.isEmpty {
+                if skippingSilence && !AnalyzerAudio.hasSound(buffer) { continue }
+                let start = CMTime(value: audio.position - AVAudioFramePosition(buffer.frameLength), timescale: CMTimeScale(rate))
+                inputs.append(AnalyzerInput(buffer: buffer, bufferStartTime: start))
             } else {
-                sample.append(AnalyzerInput(buffer: buffer))
+                inputs.append(AnalyzerInput(buffer: buffer))
             }
             lengths.append(Int(buffer.frameLength))
-            if lengths.reduce(0, +) >= enough { break }
+            if lengths.reduce(0, +) >= wanted { break }
         }
-        let wholeFile = audio.ended
-        guard !sample.isEmpty else {
-            log.notice("Language detection: no sound found; using \(candidates[0].identifier, privacy: .public)")
-            return (candidates[0], wholeFile ? [] : nil)
-        }
-        if !wholeFile {
-            while lengths.count > 1 && lengths.reduce(0, +) - lengths[lengths.count - 1] >= wanted {
-                lengths.removeLast()
-                sample.removeLast()
-            }
-        }
-        let sampleSeconds = Double(lengths.reduce(0, +)) / format.sampleRate
+        guard !inputs.isEmpty else { return nil }
+        return (inputs, Double(lengths.reduce(0, +)) / Double(rate), audio.ended)
+    }
 
+    /// Each language's average confidence per word, word count and transcript for one sample.
+    private static func score(_ inputs: [AnalyzerInput], with transcribers: [SpeechTranscriber],
+                              heartbeat: Heartbeat) async throws -> [(confidence: Double, words: Int, tokens: [Transcript.Token])] {
         let analyzer = SpeechAnalyzer(modules: transcribers, options: .init(priority: .utility, modelRetention: .whileInUse))
         let collectors = transcribers.map { transcriber in
             Task { () -> (confidence: Double, words: Int, tokens: [Transcript.Token]) in
@@ -596,7 +621,6 @@ nonisolated private enum ModernEngine {
                 return (words > 0 ? total / Double(words) : 0, words, tokens)
             }
         }
-        let inputs = sample
         let stream = AsyncStream<AnalyzerInput> { continuation in
             for input in inputs { continuation.yield(input) }
             continuation.finish()
@@ -619,13 +643,18 @@ nonisolated private enum ModernEngine {
         }
         var scores: [(confidence: Double, words: Int, tokens: [Transcript.Token])] = []
         for collector in collectors { scores.append(try await collector.value) }
+        return scores
+    }
 
-        // The highest average confidence per word; on a tie, the language listed first.
+    /// The highest average confidence per word; on a tie, or when nothing was heard, the language listed first.
+    private static func bestIndex(_ scores: [(confidence: Double, words: Int)]) -> Int {
         var best = 0
         for index in scores.indices where scores[index].words > 0 && scores[index].confidence > scores[best].confidence { best = index }
-        let summary = zip(candidates, scores).map { "\($0.identifier) \(String(format: "%.3f", $1.confidence)) (\($1.words) words)" }
-        log.notice("Language detection on \(Int(sampleSeconds.rounded()), privacy: .public) s: \(summary.joined(separator: ", "), privacy: .public) → \(candidates[best].identifier, privacy: .public), in \(Transcription.elapsed(since: started), privacy: .public) s")
-        return (candidates[best], wholeFile ? scores[best].tokens : nil)
+        return best
+    }
+
+    private static func summary(_ candidates: [Locale], _ scores: [(confidence: Double, words: Int)]) -> String {
+        zip(candidates, scores).map { "\($0.identifier) \(String(format: "%.3f", $1.confidence)) (\($1.words) words)" }.joined(separator: ", ")
     }
 
     private static func analyze(_ url: URL, in locale: Locale, duration: Double,
@@ -755,6 +784,7 @@ nonisolated private enum LegacyEngine {
               let converter = AVAudioConverter(from: audio.processingFormat, to: format) else {
             throw ConversionError.failed("Couldn't read this file's sound.")
         }
+        converter.downmix = true
         let maxChunk = Int(55 * sampleRate), searchFrom = Int(40 * sampleRate)
         var samples: [Float] = []
         var offset = 0.0
