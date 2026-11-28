@@ -3,14 +3,17 @@ import Observation
 import SwiftUI
 import UserNotifications
 
-/// Quiet signs that conversions finished: a checkmark in the menu-bar icon for a moment, and a one-time
+/// Quiet signs that conversions finished: a checkmark (or an exclamation mark) in the menu-bar icon, and a
 /// note in the menu when notifications are off, so people who never see banners still know.
 @Observable final class CompletionFeedback {
-    /// The menu-bar icon shows a checkmark while this is true.
-    private(set) var showsCheck = false
+    enum Outcome { case succeeded, failed }
+    /// What the idle menu-bar icon shows instead of the prism, if anything.
+    private(set) var outcome: Outcome?
     /// The menu shows "Notifications are off" while this is true.
     private(set) var showsNotificationNote = false
 
+    /// When the icon last showed a result; only conversions started after it count toward the next one.
+    @ObservationIgnored private(set) var lastReported = Date.distantPast
     @ObservationIgnored private var checkTask: Task<Void, Never>?
     @ObservationIgnored private var status: UNAuthorizationStatus?
     @ObservationIgnored private var keyObserver: NSObjectProtocol?
@@ -18,33 +21,57 @@ import UserNotifications
 
     private enum Keys {
         static let conversions = "completedConversions"   // Counts up to `noteAfter`, then stops being written
-        static let dismissed = "notificationNoteDismissed"
+        static let snoozedUntil = "notificationNoteSnoozedUntil"
+        static let dismissals = "notificationNoteDismissals"
         static let notifyWhenDone = "showNotifications"     // AppModel's "Notify when done" setting
         static let debugStatus = "debugNotificationStatus" // Debug builds only: denied, notDetermined or authorized
     }
     private static let noteAfter = 3
+    /// "Not now" hides the note for a week; the third time, for good.
+    private static let snooze: TimeInterval = 7 * 24 * 3600
+    private static let maxDismissals = 3
 
     init() {
         // The menu panel becoming key is the menu opening (Welcome.swift relies on the same thing).
         keyObserver = NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
                                                              object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshNote() }
+            MainActor.assumeIsolated { self?.menuOpened() }
         }
     }
 
-    // MARK: Checkmark
+    // MARK: Menu-bar icon
 
-    /// Everything that was converting has finished. Shows the checkmark for 2 seconds when it all worked;
-    /// a later success restarts the 2 seconds rather than adding a second checkmark.
+    /// Everything that was converting has finished. When it all worked, a checkmark for 2 seconds (a later
+    /// success restarts the 2 seconds rather than adding a second checkmark). When anything failed, an
+    /// exclamation mark until the menu opens or the next conversions finish.
     func conversionsFinished(succeeded: Bool) {
-        guard succeeded else { return }
+        lastReported = Date()
         checkTask?.cancel()
-        showsCheck = true
+        checkTask = nil
+        guard succeeded else {
+            outcome = .failed
+            return
+        }
+        outcome = .succeeded
         checkTask = Task {
-            do { try await Task.sleep(for: .seconds(2)) } catch { return }   // Cancelled: a newer one owns the flag
-            showsCheck = false
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }   // Cancelled: a newer one owns the icon
+            outcome = nil
             checkTask = nil
         }
+    }
+
+    /// The icon to show instead of the prism, when nothing is converting.
+    var icon: NSImage? {
+        switch outcome {
+        case .succeeded: DoneIcon.check
+        case .failed: DoneIcon.exclamation
+        case nil: nil
+        }
+    }
+
+    private func menuOpened() {
+        if outcome == .failed { outcome = nil }   // They've seen which file failed
+        refreshNote()
     }
 
     // MARK: Notifications-off note
@@ -70,15 +97,16 @@ import UserNotifications
     }
 
     func notNow() {
-        defaults.set(true, forKey: Keys.dismissed)
+        defaults.set(defaults.integer(forKey: Keys.dismissals) + 1, forKey: Keys.dismissals)
+        defaults.set(Date().addingTimeInterval(Self.snooze).timeIntervalSinceReferenceDate, forKey: Keys.snoozedUntil)
         showsNotificationNote = false
-        if let keyObserver { NotificationCenter.default.removeObserver(keyObserver) }
-        keyObserver = nil
     }
 
     /// Cheap checks first; asks the notification center only once the note could actually show.
     private func refreshNote() {
-        guard !defaults.bool(forKey: Keys.dismissed), defaults.object(forKey: Keys.notifyWhenDone) as? Bool ?? true,
+        guard defaults.integer(forKey: Keys.dismissals) < Self.maxDismissals,
+              Date().timeIntervalSinceReferenceDate >= defaults.double(forKey: Keys.snoozedUntil),
+              defaults.object(forKey: Keys.notifyWhenDone) as? Bool ?? true,
               defaults.integer(forKey: Keys.conversions) >= Self.noteAfter else {
             showsNotificationNote = false
             return
@@ -118,10 +146,10 @@ import UserNotifications
     }
 }
 
-/// Menu-bar icon for a moment after conversions finish: a checkmark drawn like the idle prism
-/// (same canvas, stroke weight and round ends), as a template image.
+/// Menu-bar icons after conversions finish, drawn like the idle prism (same canvas, stroke weight and
+/// round ends) as template images: a checkmark when they worked, an exclamation mark when something failed.
 enum DoneIcon {
-    static let image: NSImage = {
+    static let check: NSImage = {
         let image = NSImage(size: NSSize(width: 22, height: 18), flipped: false) { _ in
             let check = NSBezierPath()
             check.move(to: NSPoint(x: 5.4, y: 9.6))
@@ -136,6 +164,23 @@ enum DoneIcon {
         }
         image.isTemplate = true
         image.accessibilityDescription = "Conversion finished"
+        return image
+    }()
+
+    static let exclamation: NSImage = {
+        let image = NSImage(size: NSSize(width: 22, height: 18), flipped: false) { _ in
+            NSColor.black.set()
+            let bar = NSBezierPath()
+            bar.move(to: NSPoint(x: 11, y: 15.4))
+            bar.line(to: NSPoint(x: 11, y: 7.4))
+            bar.lineWidth = 1.6
+            bar.lineCapStyle = .round
+            bar.stroke()
+            NSBezierPath(ovalIn: NSRect(x: 10, y: 2.8, width: 2, height: 2)).fill()
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "A conversion failed"
         return image
     }()
 }

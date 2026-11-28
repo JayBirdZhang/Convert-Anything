@@ -251,6 +251,7 @@ enum OriginalsMode: String, CaseIterable {
         guard Converter.route(from: source, to: newFormat) != nil else {
             revertRename(job)
             job.state = .failed(failureMessage(ConversionError.unsupported(source, newFormat), for: job))
+            if !hasActiveJobs { feedback.conversionsFinished(succeeded: false) }   // Never started, so no pulse to end
             summarizeWhenFinished(batch)
             return
         }
@@ -416,9 +417,9 @@ enum OriginalsMode: String, CaseIterable {
                 }
             }
         } else if !hasActiveJobs {
-            // Just finished: batches not yet summarized are the ones that were converting.
+            // Just finished: the jobs started since the icon last showed a result are the ones that were converting.
             if pulseTask != nil {
-                let recent = batches.filter { !$0.summarized }.flatMap(\.jobs)
+                let recent = jobs.filter { $0.started > feedback.lastReported }
                 feedback.conversionsFinished(succeeded: recent.contains { $0.state == .done }
                     && !recent.contains { if case .failed = $0.state { true } else { false } })
             }
