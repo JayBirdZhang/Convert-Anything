@@ -37,7 +37,7 @@ nonisolated private final class ODPBuilder {
     private var commonStyles: [String: XMLElement] = [:]
     private var defaults: [String: XMLElement] = [:]
     private var fonts: [String: String] = [:]                // font-face name → CSS font list
-    private var fillImages: [String: String] = [:], gradients: [String: XMLElement] = [:]
+    private var fillImages: [String: String] = [:], gradients: [String: XMLElement] = [:], fades: [String: XMLElement] = [:]
     private var masters: [String: XMLElement] = [:]
     private var layouts: [String: CGSize] = [:]
     private var footers: [String: String] = [:], dates: [String: String] = [:]
@@ -77,6 +77,8 @@ nonisolated private final class ODPBuilder {
             case "style:default-style": if let family = element["style:family"] { defaults[family] = element }
             case "draw:fill-image": if let name = element["draw:name"], let href = Self.packagePath(element["xlink:href"]) { fillImages[name] = href }
             case "draw:gradient": if let name = element["draw:name"] { gradients[name] = element }
+            case "draw:opacity":   // A transparency gradient
+                if let name = element["draw:name"] { fades[name] = element }
             default: break
             }
         }
@@ -209,8 +211,39 @@ nonisolated private final class ODPBuilder {
             default:
                 return "background-image:linear-gradient(\(180 - angle)deg, \(start), \(end));"
             }
+        case "hatch":   // Just its fill colour: the ruled lines' transparent gaps print as black
+            return p["draw:fill-hatch-solid"] == "true" ? "background-color:\(Self.safe(p["draw:fill-color"] ?? "#ffffff"));" : ""
         default:
             return ""
+        }
+    }
+
+    /// A gradient or picture fill as an SVG paint server, in the shape's own box (matching `fillCSS`).
+    private func svgPaint(_ p: [String: String]) -> (id: String, definition: String)? {
+        func id(_ name: String) -> String { "paint-" + String(name.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.map(Character.init)) }
+        switch p["draw:fill"] {
+        case "bitmap":
+            guard let name = p["draw:fill-image-name"], let href = fillImages[name] else { return nil }
+            return (id(name), "<pattern id=\"\(id(name))\" patternContentUnits=\"objectBoundingBox\" width=\"1\" height=\"1\">"
+                + "<image href=\"\(Self.escape(href))\" width=\"1\" height=\"1\" preserveAspectRatio=\"none\"/></pattern>")
+        case "gradient":
+            guard let name = p["draw:fill-gradient-name"], let gradient = gradients[name] else { return nil }
+            let start = Self.safe(gradient["draw:start-color"] ?? "#ffffff"), end = Self.safe(gradient["draw:end-color"] ?? "#000000")
+            var angle = 0.0
+            if let text = gradient["draw:angle"] {
+                angle = text.hasSuffix("deg") ? Double(text.dropLast(3)) ?? 0 : (Double(text) ?? 0) / 10
+            }
+            func stop(_ offset: Double, _ color: String) -> String { "<stop offset=\"\(offset)\" stop-color=\"\(color)\"/>" }
+            switch gradient["draw:style"] {
+            case "radial", "ellipsoid", "square", "rectangular":
+                return (id(name), "<radialGradient id=\"\(id(name))\">\(stop(0, end))\(stop(1, start))</radialGradient>")
+            default:   // The CSS angle 180 - angle, as a line across the box
+                let radians = (180 - angle) * .pi / 180, dx = sin(radians) / 2, dy = -cos(radians) / 2
+                let stops = gradient["draw:style"] == "axial" ? stop(0, end) + stop(0.5, start) + stop(1, end) : stop(0, start) + stop(1, end)
+                return (id(name), "<linearGradient id=\"\(id(name))\" x1=\"\(0.5 - dx)\" y1=\"\(0.5 - dy)\" x2=\"\(0.5 + dx)\" y2=\"\(0.5 + dy)\">\(stops)</linearGradient>")
+            }
+        default:
+            return nil
         }
     }
 
@@ -366,15 +399,26 @@ nonisolated private final class ODPBuilder {
         let width = Self.points(element["svg:width"]) ?? 0, height = Self.points(element["svg:height"]) ?? 0
         var rotate = ""
         if let transform = element["draw:transform"] {
-            if let match = transform.firstMatch(of: /rotate\s*\(\s*(-?[\d.eE+-]+)\s*\)/), let angle = Double(match.1) {
-                rotate = "transform:rotate(\(-angle)rad);transform-origin:0 0;"
+            // Applied left to right (skew, then rotate, then move); CSS applies its list right to left.
+            var steps: [String] = []
+            for match in transform.matches(of: /(rotate|skewX|skewY)\s*\(\s*(-?[\d.eE+-]+)\s*\)/) {
+                guard let angle = Double(match.2), angle.isFinite else { continue }
+                steps.insert(match.1 == "rotate" ? "rotate(\(-angle)rad)" : "\(match.1)(\(-angle)rad)", at: 0)
             }
+            if !steps.isEmpty { rotate = "transform:\(steps.joined(separator: " "));transform-origin:0 0;" }
             if let match = transform.firstMatch(of: /translate\s*\(\s*([^\s)]+)\s+([^\s)]+)\s*\)/) {
                 x = Self.points(String(match.1)) ?? x; y = Self.points(String(match.2)) ?? y
             }
         }
         var css = "left:\(Self.pt(x));top:\(Self.pt(y));width:\(Self.pt(width));height:\(Self.pt(height));\(rotate)"
-        if let opacity = graphic["draw:opacity"], let percent = Double(opacity.dropLast()), graphic["draw:fill"] != "solid" { css += "opacity:\(percent / 100);" }
+        if let fade = graphic["draw:opacity-name"].flatMap({ fades[$0] }) {
+            // A transparency gradient, drawn at its most see-through: printing turns graded transparency opaque,
+            // and a faint glow is better lost than a veil over the slide.
+            let start = Double(fade["draw:start"]?.dropLast() ?? "100") ?? 100, end = Double(fade["draw:end"]?.dropLast() ?? "100") ?? 100
+            css += "opacity:\(min(start, end) / 100);"
+        } else if let opacity = graphic["draw:opacity"], let percent = Double(opacity.dropLast()), graphic["draw:fill"] != "solid" {
+            css += "opacity:\(percent / 100);"
+        }
 
         var inner = ""
         var isTextFrame = false
@@ -406,7 +450,15 @@ nonisolated private final class ODPBuilder {
             default: break
             }
             if name == "draw:rect", let radius = Self.points(element["draw:corner-radius"]) { css += "border-radius:\(Self.pt(radius));" }
-            if name == "draw:polygon" || name == "draw:polyline" || name == "draw:path" {
+            // A freeform shape whose outline is plain numbers (no formulas) is drawn like a path.
+            let geometryElement = element.elements(forName: "draw:enhanced-geometry").first
+            if geometry == "non-primitive", let path = geometryElement?["draw:enhanced-path"],
+               path.wholeMatch(of: /[MLCZN0-9.\s-]+/) != nil, path.contains("M") {
+                let freeform = XMLElement(name: "draw:path")
+                freeform.addAttribute(XMLNode.attribute(withName: "svg:d", stringValue: path.replacingOccurrences(of: "N", with: "")) as! XMLNode)
+                if let box = geometryElement?["svg:viewBox"] { freeform.addAttribute(XMLNode.attribute(withName: "svg:viewBox", stringValue: box) as! XMLNode) }
+                inner = outline(freeform, graphic: graphic, width: width, height: height)
+            } else if name == "draw:polygon" || name == "draw:polyline" || name == "draw:path" {
                 inner = outline(element, graphic: graphic, width: width, height: height)
             } else {
                 css += fillCSS(graphic) + strokeCSS(graphic)
@@ -418,7 +470,10 @@ nonisolated private final class ODPBuilder {
         }
         if isTextFrame { css += fillCSS(graphic) + strokeCSS(graphic) }
         if graphic["draw:shadow"] == "visible" {
-            css += "box-shadow:\(Self.pt(Self.points(graphic["draw:shadow-offset-x"]) ?? 2)) \(Self.pt(Self.points(graphic["draw:shadow-offset-y"]) ?? 2)) 2pt \(Self.safe(graphic["draw:shadow-color"] ?? "#808080"));"
+            let shadow = "\(Self.pt(Self.points(graphic["draw:shadow-offset-x"]) ?? 2)) \(Self.pt(Self.points(graphic["draw:shadow-offset-y"]) ?? 2)) 2pt \(Self.safe(graphic["draw:shadow-color"] ?? "#808080"))"
+            // A box's shadow around a picture or drawn outline shows as a stray rectangle, and a shape-following
+            // drop-shadow turns the page into a large picture when printed, so those go without.
+            if !(inner.hasPrefix("<img") || inner.contains("<svg")) { css += "box-shadow:\(shadow);" }
         }
         for side in ["left", "right", "top", "bottom"] {
             if let value = Self.points(graphic["fo:padding-\(side)"]) { css += "padding-\(side):\(Self.pt(value));" }
@@ -448,7 +503,8 @@ nonisolated private final class ODPBuilder {
     /// Polygons and paths, drawn as SVG in the shape's own coordinates.
     private func outline(_ element: XMLElement, graphic: [String: String], width: Double, height: Double) -> String {
         let viewBox = element["svg:viewBox"] ?? "0 0 \(width) \(height)"
-        let fill = graphic["draw:fill"] == "solid" && element.name != "draw:polyline" ? Self.safe(graphic["draw:fill-color"] ?? "#729fcf") : "none"
+        let solid = graphic["draw:fill"] == "solid" || (graphic["draw:fill"] == "hatch" && graphic["draw:fill-hatch-solid"] == "true")
+        var fill = solid && element.name != "draw:polyline" ? Self.safe(graphic["draw:fill-color"] ?? "#729fcf") : "none"
         let stroke = graphic["draw:stroke"] == "none" ? "none" : Self.safe(graphic["svg:stroke-color"] ?? "#3465a4")
         let strokeWidth = max(Self.points(graphic["svg:stroke-width"]) ?? 0, 0.75)
         let shape: String
@@ -459,7 +515,10 @@ nonisolated private final class ODPBuilder {
         } else {
             return ""
         }
-        return "<svg style=\"left:0;top:0;width:100%;height:100%\" viewBox=\"\(Self.escape(viewBox))\" preserveAspectRatio=\"none\">"
+        // Gradient and picture fills become SVG paint (a CSS mask over them prints as solid black).
+        var defs = ""
+        if element.name != "draw:polyline", let paint = svgPaint(graphic) { fill = "url(#\(paint.id))"; defs = "<defs>\(paint.definition)</defs>" }
+        return "<svg style=\"left:0;top:0;width:100%;height:100%\" viewBox=\"\(Self.escape(viewBox))\" preserveAspectRatio=\"none\">\(defs)"
             + "\(shape) fill=\"\(fill)\" stroke=\"\(stroke)\" stroke-width=\"\(strokeWidth)\" vector-effect=\"non-scaling-stroke\"/></svg>"
     }
 
