@@ -3,7 +3,11 @@
 A separate menu-bar app for trying the 1.6 drop zone by hand. **It never converts anything and will never be merged.**
 Bundle id `io.github.jaybirdzhang.ConvertAnything.dropzone-proto`. It has its own defaults domain and does not watch folders, so it can't affect the installed app.
 
-## Run
+## Try it
+
+Double-click **`Try It.command`** in this folder. It makes test files on your Desktop, opens them in Finder, starts the prototype and lists what to try. Press Return in its Terminal window when done to see a summary.
+
+## Run by hand
 
 ```sh
 Prototypes/DropZone/build.sh                         # → Prototypes/DropZone/build/DropZoneProto.app
