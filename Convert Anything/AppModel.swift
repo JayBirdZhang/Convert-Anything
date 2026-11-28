@@ -82,11 +82,12 @@ import UserNotifications
 
 /// What happens to the original file after a conversion.
 enum OriginalsMode: String, CaseIterable {
-    case trash, keep, delete
+    case trash, backup, keep, delete
 
     var title: String {
         switch self {
         case .trash: "Move to Trash"
+        case .backup: "Keep for 3 days"
         case .keep: "Keep next to the new file"
         case .delete: "Delete"
         }
@@ -167,6 +168,7 @@ enum OriginalsMode: String, CaseIterable {
     private let undoStore = UndoStore()
     /// Jobs whose undo is waiting for Finder to notice the rename (see `undo`).
     private var undoing: Set<ObjectIdentifier> = []
+    private var lastBackupCleanup = Date.distantPast
 
     private enum Keys {
         static let watchedFolders = "watchedFolders"
@@ -200,6 +202,7 @@ enum OriginalsMode: String, CaseIterable {
             Task { @MainActor [weak self] in self?.notify(title, body: body, important: true) }
         }
         restartWatcher()
+        cleanUpBackups()
     }
 
     private func restartWatcher() {
@@ -209,6 +212,12 @@ enum OriginalsMode: String, CaseIterable {
     // MARK: Deciding whether a rename is a conversion request
 
     private func handleRename(from oldURL: URL, to newURL: URL) {
+        if let record = undoStore.records.first(where: { $0.converted == oldURL.path && $0.original == newURL.path }),
+           OriginalsBackup.isGone(URL(fileURLWithPath: record.trashed)) {
+            // The kept original has expired: say so, then convert back as usual.
+            undoStore.remove(converted: record.converted)
+            originalGone(newURL.lastPathComponent)
+        }
         // Renaming a converted file back to its old name (also what ⌘Z in Finder does) restores the original.
         if let record = undoStore.match(converted: oldURL.path, original: newURL.path) {
             restoreOriginal(record, at: newURL)
@@ -361,6 +370,8 @@ enum OriginalsMode: String, CaseIterable {
                 var trashed: NSURL?
                 try fileManager.trashItem(at: backup, resultingItemURL: &trashed)
                 job.originalInTrash = trashed as URL?
+            case .backup:
+                job.originalInTrash = try OriginalsBackup.keep(input, named: job.originalURL.lastPathComponent)
             case .keep:
                 let keep = fileManager.fileExists(atPath: job.originalURL.path) ? uniqueFileURL(job.originalURL) : job.originalURL
                 try fileManager.moveItem(at: input, to: keep)
@@ -390,6 +401,7 @@ enum OriginalsMode: String, CaseIterable {
             }
 
             job.state = .done
+            cleanUpBackups()
         } catch is CancellationError {
             revertRename(job)
             job.state = .cancelled
@@ -512,6 +524,7 @@ enum OriginalsMode: String, CaseIterable {
         do {
             try fileManager.trashItem(at: url, resultingItemURL: nil)
             try fileManager.moveItem(at: URL(fileURLWithPath: record.trashed), to: url)
+            OriginalsBackup.discardFolder(of: URL(fileURLWithPath: record.trashed))
             undoStore.remove(converted: record.converted)
             jobs.first { $0.state == .done && $0.fileURL.path == record.converted }?.state = .undone
             notify("Restored \(url.lastPathComponent)", body: "The original is back. The converted file is in the Trash.")
@@ -532,6 +545,12 @@ enum OriginalsMode: String, CaseIterable {
               !undoing.contains(ObjectIdentifier(job)) else { return }
         let fileManager = FileManager.default
         let result = job.resultURL ?? job.fileURL
+        if let kept = job.originalInTrash, OriginalsBackup.isGone(kept) {
+            job.originalInTrash = nil   // Nothing left to undo, so the button goes away
+            undoStore.remove(converted: job.fileURL.path)
+            originalGone(job.originalURL.lastPathComponent)
+            return
+        }
         do {
             guard let trashed = job.originalInTrash else {
                 // With "Keep both" the original is already there; undoing just removes the converted file.
@@ -572,7 +591,9 @@ enum OriginalsMode: String, CaseIterable {
                     try fileManager.moveItem(at: trashed, to: job.originalURL)
                     finishUndo(job)
                 } catch {
-                    notify("Couldn't undo", body: "\(error.localizedDescription) Both files are in the Trash.")
+                    let whereabouts = OriginalsBackup.contains(trashed) ? "The converted file is in the Trash; try Undo again."
+                        : "Both files are in the Trash."
+                    notify("Couldn't undo", body: "\(error.localizedDescription) \(whereabouts)")
                 }
             }
         } catch {
@@ -581,8 +602,22 @@ enum OriginalsMode: String, CaseIterable {
     }
 
     private func finishUndo(_ job: Job) {
+        if let kept = job.originalInTrash { OriginalsBackup.discardFolder(of: kept) }
         undoStore.remove(converted: job.fileURL.path)
         job.state = .undone
+    }
+
+    /// Shown even with notifications off, since the user asked for the original back.
+    private func originalGone(_ name: String) {
+        log.notice("Undo: kept original of \(name, privacy: .private) has expired")
+        notify("Couldn't restore \(name)", body: OriginalsBackup.goneMessage, important: true)
+    }
+
+    /// Deletes originals kept longer than 3 days: at launch, then at most once a day after a conversion.
+    private func cleanUpBackups() {
+        guard Date().timeIntervalSince(lastBackupCleanup) > 24 * 60 * 60 else { return }
+        lastBackupCleanup = Date()
+        Task.detached(priority: .background) { OriginalsBackup.removeExpired() }
     }
 
     /// Selects the file in Finder. If it has been moved or deleted since, opens its folder and marks the row.
