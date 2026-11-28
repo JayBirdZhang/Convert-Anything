@@ -225,7 +225,7 @@ private struct BatchRow: View {
         if batch.isActive {
             HStack(spacing: 6) {
                 ProgressView(value: batch.progress).controlSize(.small).tint(batch.to.kind.tint)
-                Text("\(batch.finishedCount) of \(batch.jobs.count)")
+                Text(batch.joinProgress != nil ? "Joining" : "\(batch.finishedCount) of \(batch.jobs.count)")
                     .font(.subheadline)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)

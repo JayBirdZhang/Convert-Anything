@@ -57,18 +57,20 @@ import UserNotifications
     var lastAdded = Date()
     var summarized = false      // Its notification has been sent; later renames start a new batch
     var combinedURL: URL?       // When a batch renamed to PDF or M4B was merged into one file
-    var combining = false       // Joining an audiobook's parts, which takes a moment
+    var joinProgress: Double?   // While an audiobook's parts are being joined into one, how far along it is
+    var joinTask: Task<Void, Error>?
 
     init(folder: URL, to: Format) {
         self.folder = folder
         self.to = to
     }
 
-    var isActive: Bool { combining || jobs.contains(where: \.isActive) }
+    var isActive: Bool { joinProgress != nil || jobs.contains(where: \.isActive) }
     var finishedCount: Int { jobs.count(where: { !$0.isActive }) }
 
     /// Fraction of the batch's work that's done, counting each file's own progress.
     var progress: Double {
+        if let joinProgress { return joinProgress }
         guard !jobs.isEmpty else { return 0 }
         let total = jobs.reduce(0.0) { sum, job in
             switch job.state {
@@ -109,6 +111,9 @@ enum OriginalsMode: String, CaseIterable {
     }
     var combinePDFs: Bool {
         didSet { defaults.set(combinePDFs, forKey: Keys.combinePDFs) }
+    }
+    var combineAudiobooks: Bool {
+        didSet { defaults.set(combineAudiobooks, forKey: Keys.combineAudiobooks) }
     }
     var showNotifications: Bool {
         didSet { defaults.set(showNotifications, forKey: Keys.notifications) }
@@ -176,6 +181,7 @@ enum OriginalsMode: String, CaseIterable {
         static let originals = "originals"
         static let quality = "quality"
         static let combinePDFs = "combinePDFs"
+        static let combineAudiobooks = "combineAudiobooks"
         static let notifications = "showNotifications"
         static let allPages = "exportAllPages"
         static let editableSlides = "editableSlides"
@@ -190,6 +196,7 @@ enum OriginalsMode: String, CaseIterable {
         originals = defaults.string(forKey: Keys.originals).flatMap(OriginalsMode.init) ?? (oldTrashSetting == false ? .delete : .trash)
         quality = defaults.string(forKey: Keys.quality).flatMap(Quality.init) ?? .balanced
         combinePDFs = defaults.object(forKey: Keys.combinePDFs) as? Bool ?? true
+        combineAudiobooks = defaults.object(forKey: Keys.combineAudiobooks) as? Bool ?? true
         showNotifications = defaults.object(forKey: Keys.notifications) as? Bool ?? true
         exportAllPages = defaults.object(forKey: Keys.allPages) as? Bool ?? true
         editableSlides = defaults.object(forKey: Keys.editableSlides) as? Bool ?? true
@@ -430,7 +437,7 @@ enum OriginalsMode: String, CaseIterable {
             guard !batch.isActive, !batch.summarized,
                   Date().timeIntervalSince(batch.lastAdded) >= Self.batchWindow else { return }
             batch.summarized = true
-            if batch.to == .m4b || (combinePDFs && batch.to == .pdf) { await combine(batch) }
+            if (combineAudiobooks && batch.to == .m4b) || (combinePDFs && batch.to == .pdf) { await combine(batch) }
             summarize(batch)
         }
     }
@@ -450,10 +457,18 @@ enum OriginalsMode: String, CaseIterable {
         let combined = uniqueFileURL(batch.folder.appending(path: "\(name).\(batch.to.rawValue)"))
         do {
             if batch.to == .m4b {
-                batch.combining = true
+                // Cancelling the batch now stops the join; the separate books stay.
+                batch.joinProgress = 0
                 updatePulse()
-                defer { batch.combining = false; updatePulse() }
-                try await Audiobook.combine(files, into: combined, title: name, quality: quality)
+                defer { batch.joinProgress = nil; batch.joinTask = nil; updatePulse() }
+                let quality = quality
+                let task = Task {
+                    try await Audiobook.combine(files, into: combined, title: name, quality: quality) { progress in
+                        Task { @MainActor in if batch.joinProgress != nil { batch.joinProgress = progress } }
+                    }
+                }
+                batch.joinTask = task
+                try await task.value
             } else {
                 try await Task.detached(priority: .utility) {
                     let merged = PDFDocument()
@@ -470,6 +485,8 @@ enum OriginalsMode: String, CaseIterable {
             batch.jobs.forEach { undoStore.remove(converted: $0.fileURL.path) }
             batch.jobs.filter { $0.resultURL.map(files.contains) == true }.forEach { $0.combinedInto = combined }
             batch.combinedURL = combined
+        } catch ConversionError.cancelled {
+            log.notice("Joining the audiobook was cancelled")
         } catch {
             log.error("Combining \(batch.to.rawValue, privacy: .public) files failed: \(error.localizedDescription, privacy: .public)")
         }
@@ -607,6 +624,7 @@ enum OriginalsMode: String, CaseIterable {
     }
 
     func cancel(_ batch: Batch) {
+        batch.joinTask?.cancel()
         batch.jobs.filter(\.isActive).forEach { $0.task?.cancel() }
     }
 

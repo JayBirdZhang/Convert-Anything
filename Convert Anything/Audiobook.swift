@@ -42,7 +42,8 @@ nonisolated enum Audiobook {
 
     /// Joins audiobooks (each a file the batch turned into .m4b) into one, a chapter per part, named after each
     /// part's title. The book is named after the album, and takes the first artist and cover art it finds.
-    static func combine(_ parts: [URL], into output: URL, title fallback: String, quality: Quality) async throws {
+    static func combine(_ parts: [URL], into output: URL, title fallback: String, quality: Quality,
+                        progress: @escaping @Sendable (Double) -> Void) async throws {
         try await background {
             let temporary = FileManager.default.temporaryDirectory.appending(path: "ConvertAnything/\(UUID().uuidString)")
             try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -58,12 +59,20 @@ nonisolated enum Audiobook {
             var seconds: [Layout: Double] = [:]
             for piece in pieces { seconds[piece.layout, default: 0] += piece.duration.seconds }
             guard let target = seconds.max(by: { $0.value < $1.value })?.key else { return }
+            // Progress counts encoding a second of audio as about ten times the work of copying one.
+            let total = seconds.values.reduce(0, +)
+            let work = total + 10 * (total - seconds[target, default: 0])
+            var done = 0.0
             for index in pieces.indices where pieces[index].layout != target {
                 let piece = pieces[index]
                 let converted = temporary.appending(path: "\(index).m4a")
                 let writer = try BookWriter(output: converted, encodeTo: target.settings(quality: quality),
                                             hint: piece.layout.description, chapters: [], metadata: [])
-                try await writer.encode(piece.asset, piece.track, total: piece.duration) { _ in }
+                let start = done, length = piece.duration.seconds
+                try await writer.encode(piece.asset, piece.track, total: piece.duration) { fraction in
+                    progress((start + 10 * fraction * length) / work)
+                }
+                done += 10 * length
                 guard var redone = await Piece(converted) else { throw ConversionError.failed("Couldn't convert \(piece.name).") }
                 redone.tags = piece.tags
                 redone.name = piece.name
@@ -85,7 +94,10 @@ nonisolated enum Audiobook {
             let book = temporary.appending(path: "book.m4a")
             let writer = try BookWriter(output: book, encodeTo: nil, hint: pieces[0].layout.description,
                                         chapters: chapters, metadata: tags.items(title: title))
-            try await writer.copy(pieces.map { ($0.asset, $0.track) }, total: start) { _ in }
+            let copied = done
+            try await writer.copy(pieces.map { ($0.asset, $0.track) }, total: start) { fraction in
+                progress(min(1, (copied + fraction * total) / work))
+            }
             markAsAudiobook(book)
             try FileManager.default.moveItem(at: book, to: output)
         }

@@ -118,6 +118,11 @@ struct SettingsView: View {
                        help: "When several files are renamed to .pdf at once, merge them into a single Combined.pdf in name order.") {
                 Toggle("Combine PDFs", isOn: $model.combinePDFs)
             }
+            CardDivider()
+            SettingRow("Combine audiobooks", detail: "Files renamed to .m4b together",
+                       help: "When several audio files are renamed to .m4b at once, join them into one audiobook in name order, a chapter per file, named after their album. Off: each file becomes its own audiobook.") {
+                Toggle("Combine audiobooks", isOn: $model.combineAudiobooks)
+            }
         }
     }
 }
