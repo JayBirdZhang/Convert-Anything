@@ -10,7 +10,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     // Spreadsheets
     case xlsx, xls, csv, numbers, json
     // Audio
-    case mp3, wav, m4a, aac, flac, ogg, opus, aiff
+    case mp3, wav, m4a, m4b, aac, flac, ogg, opus, aiff   // m4b: an audiobook, M4A with chapters
     // Video
     case mp4, mov, m4v
     // Subtitles (written by transcription; read back as plain text)
@@ -40,7 +40,7 @@ nonisolated enum Format: String, CaseIterable, Sendable {
              .cr2, .cr3, .nef, .arw, .dng, .raf, .orf, .rw2, .pef, .srw, .psd, .svg, .jxl, .tga, .icns: .image
         case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .epub, .pptx, .ppt, .key: .document
         case .xlsx, .xls, .csv, .numbers, .json: .spreadsheet
-        case .mp3, .wav, .m4a, .aac, .flac, .ogg, .opus, .aiff: .audio
+        case .mp3, .wav, .m4a, .m4b, .aac, .flac, .ogg, .opus, .aiff: .audio
         case .mp4, .mov, .m4v: .video
         case .srt, .vtt: .document
         }
@@ -149,7 +149,8 @@ nonisolated enum Sniffer {
             let brand = String(decoding: b[8..<12], as: UTF8.self)
             switch brand {
             case "qt  ": return .format(.mov)
-            case "M4A ", "M4B ": return .format(.m4a)
+            case "M4A ": return .format(.m4a)
+            case "M4B ": return .format(.m4b)
             case "M4V ", "M4VH", "M4VP": return .format(.m4v)
             case "heic", "heix", "heim", "heis", "mif1", "msf1": return .format(.heic)
             case "avif", "avis": return .format(.avif)

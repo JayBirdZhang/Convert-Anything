@@ -14,7 +14,7 @@ enum UnsupportedConversion {
         .pdf, .docx, .pptx, .txt, .md, .rtf, .html, .odt, .doc,
         .png, .jpeg, .heic, .webp, .gif, .tiff, .bmp, .avif, .ico,
         .xlsx, .csv,
-        .m4a, .mp3, .wav, .flac, .aac, .aiff, .opus, .ogg,
+        .m4a, .mp3, .wav, .m4b, .flac, .aac, .aiff, .opus, .ogg,
         .mp4, .mov, .m4v,
     ]
 

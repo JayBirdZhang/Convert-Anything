@@ -7,6 +7,8 @@ import UniformTypeIdentifiers
 nonisolated enum MediaConversion {
     static func convert(_ request: Converter.Request, output: URL, progress: @escaping @Sendable (Double) -> Void) async throws {
         switch (request.to.kind, request.to) {
+        case (.audio, .m4b):
+            try await Audiobook.make(request, output: output, progress: progress)
         case (.audio, _):
             try await AudioConversion.convert(request, output: output, progress: progress)
         case (.video, _) where request.from == .gif:

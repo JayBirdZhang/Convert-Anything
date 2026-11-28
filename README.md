@@ -47,7 +47,7 @@ https://github.com/user-attachments/assets/cd589974-3f86-4b3d-a146-ac4dc21ce3fd
 | **Images** | PNG, JPEG, HEIC, TIFF, GIF, BMP, WebP, AVIF, ICO, ICNS (app icons), TGA. Convert *from* but not to: camera RAW (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, PEF, SRW), Photoshop (PSD), SVG and JPEG XL (to JPEG XL only where macOS can write it) |
 | **Documents** | PDF, Markdown, TXT, HTML, Word (.docx/.doc), RTF, ODT, Pages, EPUB, PowerPoint (.pptx/.ppt), Keynote |
 | **Spreadsheets** | Excel (.xlsx/.xls), CSV, Numbers, JSON |
-| **Audio** | MP3, WAV, M4A, AAC, FLAC, Ogg, Opus, AIFF |
+| **Audio** | MP3, WAV, M4A, AAC, FLAC, Ogg, Opus, AIFF, M4B audiobooks (rename several files to .m4b together for one book, a chapter per file) |
 | **Video** | MP4, MOV, M4V, and video → GIF |
 | **Transcripts** | Audio or video → TXT, SRT or WebVTT (.vtt) subtitles; SRT ↔ WebVTT; subtitles → TXT or any document format |
 

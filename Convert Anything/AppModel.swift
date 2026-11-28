@@ -56,14 +56,15 @@ import UserNotifications
     var jobs: [Job] = []
     var lastAdded = Date()
     var summarized = false      // Its notification has been sent; later renames start a new batch
-    var combinedURL: URL?       // When a batch renamed to PDF was merged into one file
+    var combinedURL: URL?       // When a batch renamed to PDF or M4B was merged into one file
+    var combining = false       // Joining an audiobook's parts, which takes a moment
 
     init(folder: URL, to: Format) {
         self.folder = folder
         self.to = to
     }
 
-    var isActive: Bool { jobs.contains(where: \.isActive) }
+    var isActive: Bool { combining || jobs.contains(where: \.isActive) }
     var finishedCount: Int { jobs.count(where: { !$0.isActive }) }
 
     /// Fraction of the batch's work that's done, counting each file's own progress.
@@ -227,8 +228,8 @@ enum OriginalsMode: String, CaseIterable {
         // A text file renamed to .json is only fixing its extension when it really holds JSON.
         if newFormat == .json && oldFormat == .txt && Sniffer.looksLikeJSON(newURL) { return }
         guard let source = sourceFormat(of: newURL, oldFormat: oldFormat) else { return }
-        // Already in the new format: the rename just fixed a wrong extension.
-        guard source != newFormat else { return }
+        // Already in the new format: the rename just fixed a wrong extension. (An audiobook is an M4A file too.)
+        guard source != newFormat, !(source == .m4b && newFormat == .m4a) else { return }
 
         let job = Job(originalURL: oldURL, fileURL: newURL, from: source, to: newFormat)
         let folder = newURL.deletingLastPathComponent()
@@ -429,35 +430,48 @@ enum OriginalsMode: String, CaseIterable {
             guard !batch.isActive, !batch.summarized,
                   Date().timeIntervalSince(batch.lastAdded) >= Self.batchWindow else { return }
             batch.summarized = true
-            if combinePDFs, batch.to == .pdf { await combine(batch) }
+            if batch.to == .m4b || (combinePDFs && batch.to == .pdf) { await combine(batch) }
             summarize(batch)
         }
     }
 
-    /// Merges a batch's new PDFs (in name order) into one "Combined.pdf" and trashes the separate ones.
+    /// Merges a batch's new PDFs (in name order) into one "Combined.pdf", or its new audiobooks into one book
+    /// named after their album, a chapter each, and trashes the separate ones.
     private func combine(_ batch: Batch) async {
-        let pdfs = batch.jobs.filter { $0.state == .done }.compactMap(\.resultURL)
-            .filter { $0.pathExtension.lowercased() == "pdf" }
+        let files = batch.jobs.filter { $0.state == .done }.compactMap(\.resultURL)
+            .filter { $0.pathExtension.lowercased() == batch.to.rawValue }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-        guard pdfs.count > 1 else { return }
-        let combined = uniqueFileURL(batch.folder.appending(path: "Combined.pdf"))
+        guard files.count > 1 else { return }
+        var name = "Combined"
+        if batch.to == .m4b, let album = await Audiobook.album(of: files) {
+            name = album.replacing(/[\/:]/, with: "-").trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+            if name.isEmpty { name = "Combined" }
+        }
+        let combined = uniqueFileURL(batch.folder.appending(path: "\(name).\(batch.to.rawValue)"))
         do {
-            try await Task.detached(priority: .utility) {
-                let merged = PDFDocument()
-                for url in pdfs {
-                    guard let document = PDFDocument(url: url) else { continue }
-                    for index in 0..<document.pageCount {
-                        if let page = document.page(at: index) { merged.insert(page, at: merged.pageCount) }
+            if batch.to == .m4b {
+                batch.combining = true
+                updatePulse()
+                defer { batch.combining = false; updatePulse() }
+                try await Audiobook.combine(files, into: combined, title: name, quality: quality)
+            } else {
+                try await Task.detached(priority: .utility) {
+                    let merged = PDFDocument()
+                    for url in files {
+                        guard let document = PDFDocument(url: url) else { continue }
+                        for index in 0..<document.pageCount {
+                            if let page = document.page(at: index) { merged.insert(page, at: merged.pageCount) }
+                        }
                     }
-                }
-                guard merged.write(to: combined) else { throw ConversionError.failed("Couldn't write the combined PDF.") }
-            }.value
-            for url in pdfs { try? FileManager.default.trashItem(at: url, resultingItemURL: nil) }
+                    guard merged.write(to: combined) else { throw ConversionError.failed("Couldn't write the combined PDF.") }
+                }.value
+            }
+            for url in files { try? FileManager.default.trashItem(at: url, resultingItemURL: nil) }
             batch.jobs.forEach { undoStore.remove(converted: $0.fileURL.path) }
-            batch.jobs.filter { $0.resultURL.map(pdfs.contains) == true }.forEach { $0.combinedInto = combined }
+            batch.jobs.filter { $0.resultURL.map(files.contains) == true }.forEach { $0.combinedInto = combined }
             batch.combinedURL = combined
         } catch {
-            log.error("Combining PDFs failed: \(error.localizedDescription, privacy: .public)")
+            log.error("Combining \(batch.to.rawValue, privacy: .public) files failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
