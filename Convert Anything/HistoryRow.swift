@@ -249,7 +249,7 @@ private struct BatchRow: View {
 
     @ViewBuilder private var actions: some View {
         if batch.jobs.contains(where: { $0.state == .done && $0.canUndo }) {
-            IconButton("Undo All", symbol: "arrow.uturn.backward", help: "Bring back every original from the Trash") {
+            IconButton("Undo All", symbol: "arrow.uturn.backward", help: "Bring back every original") {
                 model.undoAll(batch)
             }
         }
