@@ -90,9 +90,17 @@ struct SettingsView: View {
 
     private var conversions: some View {
         Card(title: "Conversions") {
-            SettingRow("Originals", help: "Move to Trash keeps a backup you can restore by renaming the file back (or ⌘Z in Finder). Keep for 3 days does the same without cluttering the Trash: originals are kept privately for 3 days so Undo still works.") {
+            SettingRow("Originals", help: "Move to Trash keeps a backup you can restore by renaming the file back (or ⌘Z in Finder). Keep privately does the same without cluttering the Trash: originals are kept out of sight for a while so Undo still works, then deleted.") {
                 Picker("Originals", selection: $model.originals) {
                     ForEach(OriginalsMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+            }
+            if model.originals == .backup {
+                CardDivider()
+                SettingRow("Keep for", help: "How long originals are kept so Undo still works. After that they're deleted for good.") {
+                    Picker("Keep for", selection: $model.keepOriginalsDays) {
+                        ForEach(OriginalsBackup.durations, id: \.self) { Text(OriginalsBackup.describe(days: $0)).tag($0) }
+                    }
                 }
             }
             CardDivider()

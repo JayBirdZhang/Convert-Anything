@@ -57,7 +57,9 @@ private struct JobRow: View {
         .contextMenu {
             if !job.isActive {
                 Button("Show in Finder") { model.reveal(job) }
-                if job.state == .done && job.canUndo { Button("Undo") { model.undo(job) } }
+                if job.state == .done && job.canUndo {
+                    Button("Undo") { model.undo(job) }.disabled(model.undoUnavailableReason(job) != nil)
+                }
             }
         }
         .accessibilityElement(children: .contain)
@@ -135,8 +137,13 @@ private struct JobRow: View {
 
     @ViewBuilder private var actions: some View {
         if job.state == .done && job.canUndo {
-            IconButton("Undo", symbol: "arrow.uturn.backward",
-                       help: "Bring back the original (you can also rename the file back, or press ⌘Z in Finder)") { model.undo(job) }
+            if let reason = model.undoUnavailableReason(job) {
+                IconButton("Undo", symbol: "arrow.uturn.backward", help: "Can't undo. \(reason)", enabled: false) {}
+            } else {
+                let until = model.keptUntil(job).map { " Kept until \($0.formatted(date: .abbreviated, time: .shortened))." } ?? ""
+                IconButton("Undo", symbol: "arrow.uturn.backward",
+                           help: "Bring back the original (you can also rename the file back, or press ⌘Z in Finder).\(until)") { model.undo(job) }
+            }
         }
         IconButton("Show in Finder", symbol: "magnifyingglass") { model.reveal(job) }
     }
@@ -195,7 +202,7 @@ private struct BatchRow: View {
             .contextMenu {
                 if !batch.isActive {
                     Button("Show in Finder") { model.reveal(batch) }
-                    if batch.jobs.contains(where: { $0.state == .done && $0.canUndo }) {
+                    if batch.jobs.contains(where: { $0.state == .done && $0.canUndo && model.undoUnavailableReason($0) == nil }) {
                         Button("Undo All") { model.undoAll(batch) }
                     }
                 }
@@ -248,7 +255,7 @@ private struct BatchRow: View {
     }
 
     @ViewBuilder private var actions: some View {
-        if batch.jobs.contains(where: { $0.state == .done && $0.canUndo }) {
+        if batch.jobs.contains(where: { $0.state == .done && $0.canUndo && model.undoUnavailableReason($0) == nil }) {
             IconButton("Undo All", symbol: "arrow.uturn.backward", help: "Bring back every original") {
                 model.undoAll(batch)
             }
@@ -276,17 +283,20 @@ private struct IconButton: View {
     let title: String
     let symbol: String
     let help: String
+    let enabled: Bool
     let action: () -> Void
 
-    init(_ title: String, symbol: String, help: String? = nil, action: @escaping () -> Void) {
+    /// A greyed-out (`enabled: false`) button does nothing but still shows its help on hover, which `.disabled` wouldn't.
+    init(_ title: String, symbol: String, help: String? = nil, enabled: Bool = true, action: @escaping () -> Void) {
         self.title = title
         self.symbol = symbol
         self.help = help ?? title
+        self.enabled = enabled
         self.action = action
     }
 
     var body: some View {
-        Button(action: action) {
+        Button { if enabled { action() } } label: {
             Label(title, systemImage: symbol)
                 .labelStyle(.iconOnly)
                 .font(.system(size: 12, weight: .medium))
@@ -294,8 +304,9 @@ private struct IconButton: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.borderless)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(enabled ? .secondary : .tertiary)
         .help(help)
+        .accessibilityHint(enabled ? "" : help)
     }
 }
 

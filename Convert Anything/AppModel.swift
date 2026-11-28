@@ -23,6 +23,8 @@ import UserNotifications
     let started = Date()
     var state: State = .waiting
     var originalInTrash: URL?
+    var keptAt: Date?       // With "Keep privately", when the original was put away
+    var originalGone = false    // Kept privately, then deleted: Undo is greyed out
     var keptOriginal: URL?  // With "Keep both", where the original was put back
     var resultURL: URL?     // The converted file, or a folder of images when every page was exported
     var combinedInto: URL?  // When the batch's PDFs were merged, the merged file (the separate ones are in the Trash)
@@ -87,7 +89,7 @@ enum OriginalsMode: String, CaseIterable {
     var title: String {
         switch self {
         case .trash: "Move to Trash"
-        case .backup: "Keep for 3 days"
+        case .backup: "Keep privately"
         case .keep: "Keep next to the new file"
         case .delete: "Delete"
         }
@@ -103,6 +105,14 @@ enum OriginalsMode: String, CaseIterable {
     }
     var originals: OriginalsMode {
         didSet { defaults.set(originals.rawValue, forKey: Keys.originals) }
+    }
+    /// How long "Keep privately" keeps originals. A change takes effect at once, including for ones already kept.
+    var keepOriginalsDays: Int {
+        didSet {
+            defaults.set(keepOriginalsDays, forKey: Keys.keepOriginalsDays)
+            lastBackupCleanup = .distantPast
+            cleanUpBackups()
+        }
     }
     var quality: Quality {
         didSet { defaults.set(quality.rawValue, forKey: Keys.quality) }
@@ -175,6 +185,7 @@ enum OriginalsMode: String, CaseIterable {
         static let paused = "paused"
         static let trashOriginals = "moveOriginalsToTrash"   // Older setting, replaced by `originals`
         static let originals = "originals"
+        static let keepOriginalsDays = "keepOriginalsDays"
         static let quality = "quality"
         static let combinePDFs = "combinePDFs"
         static let notifications = "showNotifications"
@@ -189,6 +200,8 @@ enum OriginalsMode: String, CaseIterable {
         isWatching = !defaults.bool(forKey: Keys.paused)
         let oldTrashSetting = defaults.object(forKey: Keys.trashOriginals) as? Bool
         originals = defaults.string(forKey: Keys.originals).flatMap(OriginalsMode.init) ?? (oldTrashSetting == false ? .delete : .trash)
+        let days = defaults.integer(forKey: Keys.keepOriginalsDays)
+        keepOriginalsDays = OriginalsBackup.durations.contains(days) ? days : 3
         quality = defaults.string(forKey: Keys.quality).flatMap(Quality.init) ?? .balanced
         combinePDFs = defaults.object(forKey: Keys.combinePDFs) as? Bool ?? true
         showNotifications = defaults.object(forKey: Keys.notifications) as? Bool ?? true
@@ -213,7 +226,7 @@ enum OriginalsMode: String, CaseIterable {
 
     private func handleRename(from oldURL: URL, to newURL: URL) {
         if let record = undoStore.records.first(where: { $0.converted == oldURL.path && $0.original == newURL.path }),
-           OriginalsBackup.isGone(URL(fileURLWithPath: record.trashed)) {
+           OriginalsBackup.isGone(URL(fileURLWithPath: record.trashed), keepFor: keepOriginalsFor) {
             // The kept original has expired: say so, then convert back as usual.
             undoStore.remove(converted: record.converted)
             originalGone(newURL.lastPathComponent)
@@ -372,6 +385,7 @@ enum OriginalsMode: String, CaseIterable {
                 job.originalInTrash = trashed as URL?
             case .backup:
                 job.originalInTrash = try OriginalsBackup.keep(input, named: job.originalURL.lastPathComponent)
+                job.keptAt = Date()
             case .keep:
                 let keep = fileManager.fileExists(atPath: job.originalURL.path) ? uniqueFileURL(job.originalURL) : job.originalURL
                 try fileManager.moveItem(at: input, to: keep)
@@ -545,8 +559,9 @@ enum OriginalsMode: String, CaseIterable {
               !undoing.contains(ObjectIdentifier(job)) else { return }
         let fileManager = FileManager.default
         let result = job.resultURL ?? job.fileURL
-        if let kept = job.originalInTrash, OriginalsBackup.isGone(kept) {
-            job.originalInTrash = nil   // Nothing left to undo, so the button goes away
+        guard !job.originalGone else { return }
+        if let kept = job.originalInTrash, OriginalsBackup.isGone(kept, keepFor: keepOriginalsFor) {
+            job.originalGone = true
             undoStore.remove(converted: job.fileURL.path)
             originalGone(job.originalURL.lastPathComponent)
             return
@@ -610,14 +625,32 @@ enum OriginalsMode: String, CaseIterable {
     /// Shown even with notifications off, since the user asked for the original back.
     private func originalGone(_ name: String) {
         log.notice("Undo: kept original of \(name, privacy: .private) has expired")
-        notify("Couldn't restore \(name)", body: OriginalsBackup.goneMessage, important: true)
+        notify("Couldn't restore \(name)", body: "The original was kept for \(OriginalsBackup.describe(days: keepOriginalsDays)) and has since been deleted.",
+               important: true)
     }
 
-    /// Deletes originals kept longer than 3 days: at launch, then at most once a day after a conversion.
+    private var keepOriginalsFor: TimeInterval { TimeInterval(keepOriginalsDays) * 24 * 60 * 60 }
+
+    /// Until when a privately kept original can still be brought back.
+    func keptUntil(_ job: Job) -> Date? {
+        job.keptAt.map { $0.addingTimeInterval(keepOriginalsFor) }
+    }
+
+    /// Why Undo is greyed out: the privately kept original has been deleted. Nil when Undo can work.
+    func undoUnavailableReason(_ job: Job) -> String? {
+        guard job.keptAt != nil else { return nil }
+        if let until = keptUntil(job), until < Date() {
+            return "The original was kept until \(until.formatted(date: .abbreviated, time: .shortened)) and has been deleted."
+        }
+        return job.originalGone ? "The original has been deleted." : nil
+    }
+
+    /// Deletes originals kept longer than the chosen time: at launch, then at most once a day after a conversion.
     private func cleanUpBackups() {
         guard Date().timeIntervalSince(lastBackupCleanup) > 24 * 60 * 60 else { return }
         lastBackupCleanup = Date()
-        Task.detached(priority: .background) { OriginalsBackup.removeExpired() }
+        let keepFor = keepOriginalsFor
+        Task.detached(priority: .background) { OriginalsBackup.removeExpired(keepFor: keepFor) }
     }
 
     /// Selects the file in Finder. If it has been moved or deleted since, opens its folder and marks the row.
@@ -632,7 +665,7 @@ enum OriginalsMode: String, CaseIterable {
     }
 
     func undoAll(_ batch: Batch) {
-        batch.jobs.filter { $0.state == .done && $0.canUndo }.forEach(undo)
+        batch.jobs.filter { $0.state == .done && $0.canUndo && undoUnavailableReason($0) == nil }.forEach(undo)
         if let combined = batch.combinedURL, FileManager.default.fileExists(atPath: combined.path) {
             try? FileManager.default.trashItem(at: combined, resultingItemURL: nil)
             batch.combinedURL = nil
