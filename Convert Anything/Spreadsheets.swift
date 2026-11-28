@@ -29,12 +29,15 @@ nonisolated enum Spreadsheets {
     }
 
     /// Unpacks the workbook and reads its sheets, leaving out empty ones.
+    /// OpenDocument spreadsheets (.ods) are read the same way, from their content.xml.
     static func sheets(of request: Converter.Request) async throws -> [Sheet] {
-        let package = request.workDir.appending(path: "xlsx")
-        try await Tools.run("/usr/bin/unzip", ["-q", "-o", request.input.path, "-d", package.path])
+        let isODS = request.from == .ods
+        let package = request.workDir.appending(path: isODS ? "ods" : "xlsx")
+        try await Tools.run("/usr/bin/unzip", ["-q", "-o", request.input.path] + (isODS ? ["content.xml"] : []) + ["-d", package.path])
         // Parsing a big workbook takes a while; keep it off the main thread.
         return try await background {
-            let sheets = try read(package).filter { !$0.rows.isEmpty }
+            let all = isODS ? try OpenDocumentSheets.read(package.appending(path: "content.xml")) : try read(package)
+            let sheets = all.filter { !$0.rows.isEmpty }
             guard !sheets.isEmpty else { throw ConversionError.failed("This spreadsheet is empty.") }
             return sheets
         }
@@ -43,7 +46,8 @@ nonisolated enum Spreadsheets {
     /// Conversions that need no other app, so they can run alongside each other.
     static func runsWithoutNumbers(from: Format, to: Format) -> Bool {
         switch (from, to) {
-        case (.xlsx, .csv), (.csv, .xlsx), (.csv, .json), (.xlsx, .json), (.json, .csv), (.json, .xlsx): true
+        case (.xlsx, .csv), (.csv, .xlsx), (.csv, .json), (.xlsx, .json), (.json, .csv), (.json, .xlsx),
+             (.ods, .csv), (.ods, .json), (.ods, .xlsx): true
         default: false
         }
     }
@@ -90,6 +94,11 @@ nonisolated enum Spreadsheets {
 
     /// Wraps a worksheet in the rest of an .xlsx package and zips it.
     static func writeXLSX(sheetXML sheet: Data, request: Converter.Request, output: URL) async throws {
+        try await writeXLSX(sheets: [(request.title, sheet)], request: request, output: output)
+    }
+
+    /// The same for several worksheets (name, worksheet part), in order.
+    static func writeXLSX(sheets: [(name: String, xml: Data)], request: Converter.Request, output: URL) async throws {
         let package = request.workDir.appending(path: "xlsx-out")
         let fileManager = FileManager.default
         for dir in ["_rels", "xl/_rels", "xl/worksheets"] {
@@ -98,7 +107,11 @@ nonisolated enum Spreadsheets {
         let header = #"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"# + "\n"
         let main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
         let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-        let sheetName = String(request.title.filter { !"[]:*?/\\".contains($0) }.prefix(31))
+        let names = sheets.enumerated().map { index, sheet in
+            let name = String(sheet.name.filter { !"[]:*?/\\".contains($0) }.prefix(31))
+            return escape(name.isEmpty ? "Sheet\(index + 1)" : name)
+        }
+        let numbers = sheets.indices.map { $0 + 1 }
 
         func write(_ path: String, _ xml: String) throws {
             try (header + xml).write(to: package.appending(path: path), atomically: true, encoding: .utf8)
@@ -108,7 +121,7 @@ nonisolated enum Spreadsheets {
             <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\#
             <Default Extension="xml" ContentType="application/xml"/>\#
             <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>\#
-            <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>\#
+            \#(numbers.map { #"<Override PartName="/xl/worksheets/sheet\#($0).xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"# }.joined())\#
             <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>\#
             </Types>
             """#)
@@ -118,12 +131,12 @@ nonisolated enum Spreadsheets {
             """#)
         try write("xl/workbook.xml", #"""
             <workbook xmlns="\#(main)" xmlns:r="\#(rel)"><sheets>\#
-            <sheet name="\#(escape(sheetName.isEmpty ? "Sheet1" : sheetName))" sheetId="1" r:id="rId1"/></sheets></workbook>
+            \#(numbers.map { #"<sheet name="\#(names[$0 - 1])" sheetId="\#($0)" r:id="rId\#($0)"/>"# }.joined())</sheets></workbook>
             """#)
         try write("xl/_rels/workbook.xml.rels", #"""
             <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\#
-            <Relationship Id="rId1" Type="\#(rel)/worksheet" Target="worksheets/sheet1.xml"/>\#
-            <Relationship Id="rId2" Type="\#(rel)/styles" Target="styles.xml"/></Relationships>
+            \#(numbers.map { #"<Relationship Id="rId\#($0)" Type="\#(rel)/worksheet" Target="worksheets/sheet\#($0).xml"/>"# }.joined())\#
+            <Relationship Id="rIdStyles" Type="\#(rel)/styles" Target="styles.xml"/></Relationships>
             """#)
         try write("xl/styles.xml", #"""
             <styleSheet xmlns="\#(main)"><fonts count="1"><font><sz val="12"/><name val="Calibri"/></font></fonts>\#
@@ -134,7 +147,9 @@ nonisolated enum Spreadsheets {
             <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>
             """#)
 
-        try (Data(header.utf8) + sheet).write(to: package.appending(path: "xl/worksheets/sheet1.xml"), options: .atomic)
+        for (number, sheet) in zip(numbers, sheets) {
+            try (Data(header.utf8) + sheet.xml).write(to: package.appending(path: "xl/worksheets/sheet\(number).xml"), options: .atomic)
+        }
 
         try await Tools.run("/usr/bin/zip", ["-q", "-X", "-D", "-nw", "-r", output.path, "[Content_Types].xml", "_rels", "xl"],
                             currentDirectory: package)

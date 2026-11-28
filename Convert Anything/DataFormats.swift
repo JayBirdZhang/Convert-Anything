@@ -13,7 +13,7 @@ import Foundation
 nonisolated enum DataFormats {
     // MARK: Spreadsheet → JSON
 
-    /// CSV and Excel are read directly. Older Excel files and Numbers go through Numbers' CSV export
+    /// CSV, Excel and OpenDocument are read directly. Older Excel files and Numbers go through Numbers' CSV export
     /// (which makes a folder when there are several tables).
     static func tableToJSON(_ request: Converter.Request, output: URL) async throws -> URL {
         switch request.from {
@@ -23,7 +23,7 @@ nonisolated enum DataFormats {
                 try json(rows: rows, emptyMessage: "This CSV file is empty.").write(to: output)
                 return output
             }
-        case .xlsx:
+        case .xlsx, .ods:
             let sheets = try await Spreadsheets.sheets(of: request)
             return try await background {
                 if sheets.count == 1 {

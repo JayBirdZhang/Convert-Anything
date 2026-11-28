@@ -6,9 +6,9 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     // More images: camera RAW, Photoshop and SVG are only read; JPEG XL and TGA are written when this macOS can
     case cr2, cr3, nef, arw, dng, raf, orf, rw2, pef, srw, psd, svg, jxl, tga, icns
     // Documents (including presentations)
-    case pdf, md, txt, html, docx, doc, rtf, odt, pages, epub, pptx, ppt, key
+    case pdf, md, txt, html, docx, doc, rtf, odt, pages, epub, pptx, ppt, key, odp
     // Spreadsheets
-    case xlsx, xls, csv, numbers, json
+    case xlsx, xls, csv, numbers, json, ods
     // Audio
     case mp3, wav, m4a, aac, flac, ogg, opus, aiff
     // Video
@@ -38,8 +38,8 @@ nonisolated enum Format: String, CaseIterable, Sendable {
         switch self {
         case .png, .jpeg, .heic, .tiff, .gif, .bmp, .webp, .avif, .ico,
              .cr2, .cr3, .nef, .arw, .dng, .raf, .orf, .rw2, .pef, .srw, .psd, .svg, .jxl, .tga, .icns: .image
-        case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .epub, .pptx, .ppt, .key: .document
-        case .xlsx, .xls, .csv, .numbers, .json: .spreadsheet
+        case .pdf, .md, .txt, .html, .docx, .doc, .rtf, .odt, .pages, .epub, .pptx, .ppt, .key, .odp: .document
+        case .xlsx, .xls, .csv, .numbers, .json, .ods: .spreadsheet
         case .mp3, .wav, .m4a, .aac, .flac, .ogg, .opus, .aiff: .audio
         case .mp4, .mov, .m4v: .video
         case .srt, .vtt: .document
@@ -58,13 +58,13 @@ nonisolated enum Format: String, CaseIterable, Sendable {
     /// JPEG XL and TGA depend on what ImageIO can write on this Mac, so they're only offered when it can.
     var isWritable: Bool {
         switch self {
-        case .svg, .psd: false
+        case .svg, .psd, .ods, .odp: false   // OpenDocument spreadsheets and presentations are only read
         case .jxl, .tga: ImageWriters.supports(self)
         default: !isRaw
         }
     }
 
-    var isSlides: Bool { [.pptx, .ppt, .key].contains(self) }
+    var isSlides: Bool { [.pptx, .ppt, .key, .odp].contains(self) }
 
     /// Apple's iWork files all look alike inside, so their old extension says which one it is.
     var isIWork: Bool { [.pages, .key, .numbers].contains(self) }
@@ -220,10 +220,13 @@ nonisolated enum Sniffer {
         return .unknown
     }
 
-    /// docx, pptx, xlsx, odt and epub are all zip archives. odt and epub name themselves in the first entry
+    /// docx, pptx, xlsx, OpenDocument and epub are all zip archives. OpenDocument and epub name themselves in the first entry
     /// (epub's is a stored file called "mimetype", so its text sits at a fixed spot near the start);
     /// Office files are told apart by the folder names listed in the zip's directory at the end of the file.
     private static func detectZip(_ url: URL, head: Data) -> Result {
+        let start = head.prefix(128)   // The "mimetype" entry, before anything an embedded object could add
+        if start.range(of: Data("application/vnd.oasis.opendocument.spreadsheet".utf8)) != nil { return .format(.ods) }
+        if start.range(of: Data("application/vnd.oasis.opendocument.presentation".utf8)) != nil { return .format(.odp) }
         if head.range(of: Data("application/vnd.oasis.opendocument.text".utf8)) != nil { return .format(.odt) }
         if head.dropFirst(30).starts(with: Data("mimetype".utf8)), head.prefix(100).range(of: Data("application/epub+zip".utf8)) != nil { return .format(.epub) }
 

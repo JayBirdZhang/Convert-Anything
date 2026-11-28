@@ -138,8 +138,10 @@ enum Converter {
             try await SlideBuilder.build(request, output: output, progress: progress)
         case .spreadsheet:
             switch (request.from, request.to) {
-            case (.xlsx, .csv):
+            case (.xlsx, .csv), (.ods, .csv):
                 result = try await Spreadsheets.xlsxToCSV(request, output: output)
+            case (.ods, .xlsx):
+                try await OpenDocumentSheets.writeXLSX(request, output: output)
             case (.csv, .xlsx):
                 try await Spreadsheets.csvToXLSX(request, output: output)
             case (_, .json):
@@ -148,8 +150,10 @@ enum Converter {
                 try await DataFormats.jsonToTable(request, output: output)
             default:
                 let format: IWork.ExportFormat = request.to == .pdf ? .pdf : request.to == .csv ? .csv : .excel
-                // Numbers can't open JSON, so it gets the table as a CSV file.
-                let source = request.from == .json ? try await DataFormats.jsonAsCSV(request) : request.input
+                // Numbers can't open JSON or OpenDocument, so it gets the table as a CSV or Excel file.
+                let source = request.from == .json ? try await DataFormats.jsonAsCSV(request)
+                    : request.from == .ods ? try await OpenDocumentSheets.writeXLSX(request, output: request.workDir.appending(path: "from-ods.xlsx"))
+                    : request.input
                 result = try await IWork.export(source, with: .numbers, as: format, to: output)
             }
         case .textRecognition:
