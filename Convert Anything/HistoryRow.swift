@@ -58,6 +58,7 @@ private struct JobRow: View {
             if !job.isActive {
                 Button("Show in Finder") { model.reveal(job) }
                 if job.state == .done && job.canUndo { Button("Undo") { model.undo(job) } }
+                if isFailure { Button("Report…") { BugReport.open(.form, for: job) }.help(BugReport.jobHelp) }
             }
         }
         .accessibilityElement(children: .contain)
@@ -137,6 +138,9 @@ private struct JobRow: View {
         if job.state == .done && job.canUndo {
             IconButton("Undo", symbol: "arrow.uturn.backward",
                        help: "Bring back the original (you can also rename the file back, or press ⌘Z in Finder)") { model.undo(job) }
+        }
+        if isFailure {
+            IconButton("Report…", symbol: "exclamationmark.bubble", help: BugReport.jobHelp) { BugReport.open(.form, for: job) }
         }
         IconButton("Show in Finder", symbol: "magnifyingglass") { model.reveal(job) }
     }

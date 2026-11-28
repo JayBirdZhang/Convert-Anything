@@ -32,6 +32,7 @@ struct SettingsView: View {
                             Button("Check Now") { updates.checkNow() }
                         }
                     }
+                    BugReportCard()
                 }
                 .toggleStyle(.switch)
                 .controlSize(.small)
