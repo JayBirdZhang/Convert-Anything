@@ -30,8 +30,8 @@ Every drag-state change is logged to `~/Library/Logs/DropZoneProto.log`.
 
 **MenuBarExtra can't do this. Use `NSStatusItem` + a borderless `NSPanel` hosting SwiftUI.**
 - SwiftUI's `MenuBarExtra` has no API to open its window.
-- Its status button isn't exposed, so it can't be a drag destination.
-- A probe found the button through `NSApp.windows`, but on macOS 27 `performClick` on it does **not** open the `.window`-style panel.
+- Its status button is reachable only through the private view hierarchy (`NSApp.windows` → `NSStatusBarWindow` → `NSStatusBarButton`). Making it a drag destination would mean adding views to a button SwiftUI owns; drag delivery to it was not tested.
+- A probe on macOS 27 found the button has no `action` or `target`. With the app active, three attempts all failed to open the `.window`-style panel, checked 0.1 s and 0.5 s later: `performClick`, `sendAction` and a synthesized `mouseDown`. SwiftUI evidently tracks the click above the button.
 - So the real feature needs MyApp.swift to drop `MenuBarExtra` and host ContentView in its own panel. The prototype's `MenuPanel` shows how: non-activating, `.popUpMenu` level, `canJoinAllSpaces` + `fullScreenAuxiliary`, and a rounded `NSVisualEffectView` mask.
 - The real app will also have to rebuild what MenuBarExtra gives for free: close on outside click, Esc, the button highlight, and positioning.
 
@@ -39,8 +39,8 @@ Every drag-state change is logged to `~/Library/Logs/DropZoneProto.log`.
 - **Icon:** a transparent `IconDropView` is added over the status button and registered for file URLs. It is the drag destination and also takes the clicks, so it has to open the menu itself and set the button highlight by hand.
 - **Menu:** a single AppKit drag destination (`PanelDropView`) covers the whole menu. SwiftUI only draws the tiles and reports their frames. The hit test maps the drag point into the flipped `NSHostingView`, and `--demo` confirms each tile's centre hits that tile.
   - SwiftUI `.onDrop` per tile was avoided because it can't tell "between tiles" from "left the menu". A drag into a menu already open by click switches it to tiles too.
-- **Drag ending elsewhere:** AppKit doesn't tell a destination that a drag it no longer hovers has ended. So while a drag is over the open menu, a 50 ms timer watches `NSEvent.pressedMouseButtons`. If the button goes up and no tile drop arrives within 0.25 s, the menu closes. The timer exists only during that drag; idle cost stays zero.
-  - `draggingEnded` is logged on both views, so the log shows whether macOS delivers it.
+- **Drag ending elsewhere:** `draggingEnded` on either view closes the menu. The SDK header doesn't say whether it arrives once the drag has moved on to another app, so there's also a backup. While a drag is over the open menu, a 50 ms timer watches `NSEvent.pressedMouseButtons`. Whichever comes first wins: if no tile drop arrives within 0.25 s, the menu closes. The log line `drag ended (…)` shows which one fired. The timer exists only during that drag; idle cost stays zero.
+  - Both timers run in the `.common` run-loop modes, so they keep firing while AppKit tracks the drag.
 - **Stealing the drag:** the panel is non-activating and shown with `orderFrontRegardless`, so Finder keeps the drag and stays frontmost. Clicking the icon normally does activate the app, so the menu's controls take the keyboard.
 - **The system way:** `NSSpringLoadingDestination` / `NSButton.isSpringLoaded` exist, but they use the system's spring-loading delay (System Settings › Accessibility), so they can't drive the slider. Worth trying in the real feature so it follows the user's setting.
 
@@ -62,7 +62,11 @@ Every drag-state change is logged to `~/Library/Logs/DropZoneProto.log`.
 What was verified:
 - the tile logic (`--selftest`)
 - rendering in light and dark mode (`--snapshot`)
-- the spring-open path, panel position, tile hit testing, and drag-ended-elsewhere closing (`--demo`)
+- with `--demo`:
+  - the spring-open path, panel position and tile hit testing
+  - drag-ended-elsewhere closing
+  - the icon overlay filling the button, registered for file URLs and receiving the click
+  - click-open: the menu becomes key and toggles closed on a second click
 - idle cost
 
 **Idle cost.** Measured over 60 s with the menu closed (`top -l 13 -s 5`, `footprint`):
@@ -70,3 +74,16 @@ What was verified:
 - 0.02 s of CPU time in the minute
 - 22 MB physical footprint (23 MB peak)
 - no timers or event monitors exist while idle
+
+## Design guesses to check by hand
+
+- Combine into PDF and More… are full-width rows below the 2×2 grid. Combine moves above the grid when it was the last choice.
+- Moving more than 3 pt restarts the spring wait. An unsteady hand may never open the menu; the log shows `spring: moved, wait restarted`.
+- For several files, tiles are the literal intersection of formats (see the 3-image case above).
+- The header is "Convert Anything" with a "drop zone prototype" tag. While dragging, the title reads "Convert IMG_2041.heic to…" or "Convert 3 files to…", with "Let go anywhere else to cancel" underneath.
+- A file dropped on the icon itself cancels rather than opening the More list.
+
+## What a hand test should log
+
+`icon: drag entered` → `spring: fired` → `panel: over .jpg` → `panel: dropped on .jpg` → `panel: closed (converted)`.
+For a cancel: `… drag ended (…)` → `panel: closed (drag ended elsewhere)`.

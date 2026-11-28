@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: MenuPanel!
     private var hosting: NSHostingView<MenuView>!
 
+    private var overlay: IconDropView!
     private var springTimer: Timer?
     private var springAnchor = NSPoint.zero
     private var springFiles: [URL] = []
@@ -39,7 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         guard let button = item.button else { return }
         button.image = Icons.prism
-        let overlay = IconDropView(frame: button.bounds)
+        overlay = IconDropView(frame: button.bounds)
         overlay.owner = self
         button.addSubview(overlay)
 
@@ -76,6 +77,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let back = self.hosting.convert(window, from: nil)
                     Log.write("demo: \(self.model.label(for: tile)) at \(frame) → hit \(self.model.tile(at: back).map(self.model.label(for:)) ?? "nothing")")
                 }
+                Log.write("demo: icon overlay \(self.overlay.frame) in button \(self.item.button?.bounds ?? .zero), types \(self.overlay.registeredDraggedTypes.map(\.rawValue))")
+                let hit = self.item.button?.window?.contentView?.hitTest(self.item.button!.convert(NSPoint(x: 10, y: 10), to: nil))
+                Log.write("demo: a click on the icon lands on \(hit.map { String(describing: type(of: $0)) } ?? "nothing")")
+            }
+            // After the drag watch has closed it: open it the way a click does.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                self.iconClicked()
+                Log.write("demo: after click, panel visible=\(self.panel.isVisible) key=\(self.panel.isKeyWindow) phase=\(self.model.phase)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.iconClicked() }
             }
         }
     }
@@ -107,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !springFiles.isEmpty || model.phase == .dragging else { return [] }
         // Like Finder: moving restarts the wait, so a drag that's just passing by never opens the menu.
         if springTimer != nil, hypot(info.draggingLocation.x - springAnchor.x, info.draggingLocation.y - springAnchor.y) > 3 {
+            Log.write("spring: moved, wait restarted")
             startSpring(at: info.draggingLocation)
         }
         return .copy
@@ -130,9 +141,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startSpring(at point: NSPoint) {
         springAnchor = point
         springTimer?.invalidate()
-        springTimer = Timer.scheduledTimer(withTimeInterval: model.springDelay, repeats: false) { [weak self] _ in
+        let timer = Timer(timeInterval: model.springDelay, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.springFired() }
         }
+        RunLoop.main.add(timer, forMode: .common)   // Also fires while AppKit runs the drag in a tracking mode
+        springTimer = timer
     }
 
     private func springFired() {
@@ -193,14 +206,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// a tile arrives as performDragOperation first; if none does, the drop landed elsewhere and the menu closes.
     private func startDragWatch() {
         guard dragWatch == nil else { return }
-        dragWatch = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, NSEvent.pressedMouseButtons & 1 == 0 else { return }
-                self.stopDragWatch()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    if self.model.phase == .dragging { self.closePanel(reason: "drag ended elsewhere") }
-                }
+                self.dragEnded(source: "mouse button up")
             }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        dragWatch = timer
+    }
+
+    /// The drag is over, from draggingEnded or the button watch, whichever comes first. A drop on a tile has
+    /// already moved the phase on by then (or does within a moment); otherwise the drop landed elsewhere.
+    func dragEnded(source: String) {
+        Log.write("drag ended (\(source))")
+        springTimer?.invalidate()
+        springTimer = nil
+        springFiles = []
+        guard dragWatch != nil else { return }
+        stopDragWatch()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            if self.model.phase == .dragging { self.closePanel(reason: "drag ended elsewhere") }
         }
     }
 
@@ -319,7 +345,7 @@ final class IconDropView: NSView {
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { owner?.iconDragUpdated(sender) ?? [] }
     override func draggingExited(_ sender: NSDraggingInfo?) { owner?.iconDragExited() }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { owner?.iconDrop() ?? false }
-    override func draggingEnded(_ sender: NSDraggingInfo) { Log.write("icon: draggingEnded") }
+    override func draggingEnded(_ sender: NSDraggingInfo) { owner?.dragEnded(source: "icon draggingEnded") }
 }
 
 /// The menu window: borderless, doesn't activate the app when it appears (a drag from Finder keeps Finder
@@ -382,5 +408,5 @@ final class PanelDropView: NSVisualEffectView {
     override func draggingExited(_ sender: NSDraggingInfo?) { owner.panelDragExited() }
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { owner.model.hovered != nil }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { owner.panelDrop() }
-    override func draggingEnded(_ sender: NSDraggingInfo) { Log.write("panel: draggingEnded") }
+    override func draggingEnded(_ sender: NSDraggingInfo) { owner.dragEnded(source: "panel draggingEnded") }
 }
