@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 /// OpenDocument spreadsheets (.ods) are a zip whose content.xml holds every sheet. Only the cells are read;
 /// the rest of the app's spreadsheet code (CSV, JSON and Excel writers) takes it from there.
@@ -125,5 +125,190 @@ extension OpenDocumentSheets {
         let parts = try await background { sheets.map { (name: $0.name, xml: Spreadsheets.sheetXML($0.rows)) } }
         try await Spreadsheets.writeXLSX(sheets: parts, request: request, output: output)
         return output
+    }
+}
+
+// MARK: - Writing .odt with pictures
+
+/// macOS's text system writes .odt with tables and styles but silently leaves out every picture. Pictures are
+/// swapped for marker text before writing, then put into the package as draw:frame elements with their files.
+nonisolated enum ODTWriter {
+    struct Picture {
+        var data: Data
+        var fileExtension: String
+        var size: CGSize      // Points
+    }
+
+    static func marker(_ index: Int) -> String { "ZZODTPIC\(index)ZZ" }
+
+    /// `pictures` are already in `text` as markers (Word pictures); attachments in `text` are added to them.
+    static func write(_ text: NSAttributedString, pictures given: [Picture] = [], output: URL, workDir: URL) async throws {
+        var pictures = given
+        let copy = NSMutableAttributedString(attributedString: text)
+        text.enumerateAttribute(.attachment, in: NSRange(location: 0, length: text.length), options: .reverse) { value, range, _ in
+            guard let attachment = value as? NSTextAttachment, let picture = picture(attachment) else { return }
+            var attributes = text.attributes(at: range.location, effectiveRange: nil)
+            attributes[.attachment] = nil
+            copy.replaceCharacters(in: range, with: NSAttributedString(string: marker(pictures.count), attributes: attributes))
+            pictures.append(picture)
+        }
+        let data = try copy.data(from: NSRange(location: 0, length: copy.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.openDocument])
+        guard !pictures.isEmpty else { return try data.write(to: output) }
+
+        let package = workDir.appending(path: "odt-out")
+        let plain = workDir.appending(path: "plain.odt")
+        try data.write(to: plain)
+        try await Tools.run("/usr/bin/unzip", ["-q", "-o", plain.path, "-d", package.path])
+        let contentURL = package.appending(path: "content.xml"), manifestURL = package.appending(path: "META-INF/manifest.xml")
+        var content = try String(contentsOf: contentURL, encoding: .utf8)
+        var manifest = try String(contentsOf: manifestURL, encoding: .utf8)
+
+        // The frame needs the drawing, link and SVG namespaces on the root element.
+        let namespaces = [("draw", "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"), ("xlink", "http://www.w3.org/1999/xlink"),
+                          ("svg", "urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0")]
+        if let root = content.range(of: "<office:document-content") {
+            let missing = namespaces.filter { !content.contains("xmlns:\($0.0)=") }.map { " xmlns:\($0.0)=\"\($0.1)\"" }.joined()
+            content.insert(contentsOf: missing, at: root.upperBound)
+        }
+        let pictureFolder = package.appending(path: "Pictures")
+        try FileManager.default.createDirectory(at: pictureFolder, withIntermediateDirectories: true)
+        var entries = ""
+        for (index, picture) in pictures.enumerated() {
+            let path = "Pictures/picture\(index + 1).\(picture.fileExtension)"
+            try picture.data.write(to: package.appending(path: path))
+            let type = picture.fileExtension == "jpg" ? "image/jpeg" : "image/\(picture.fileExtension)"
+            entries += #"<manifest:file-entry manifest:full-path="\#(path)" manifest:media-type="\#(type)"/>"#
+            let frame = #"<draw:frame draw:name="Picture \#(index + 1)" text:anchor-type="as-char" svg:width="\#(points(picture.size.width))" svg:height="\#(points(picture.size.height))" draw:z-index="\#(index)"><draw:image xlink:href="\#(path)" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>"#
+            content = content.replacingOccurrences(of: marker(index), with: frame)
+        }
+        if let end = manifest.range(of: "</manifest:manifest>") { manifest.insert(contentsOf: entries, at: end.lowerBound) }
+        try content.write(to: contentURL, atomically: true, encoding: .utf8)
+        try manifest.write(to: manifestURL, atomically: true, encoding: .utf8)
+
+        // The "mimetype" entry has to come first, uncompressed, for other apps to recognise the file.
+        try? FileManager.default.removeItem(at: output)
+        try await Tools.run("/usr/bin/zip", ["-q", "-X", "-0", output.path, "mimetype"], currentDirectory: package)
+        try await Tools.run("/usr/bin/zip", ["-q", "-X", "-D", "-r", output.path, ".", "-x", "mimetype"], currentDirectory: package)
+    }
+
+    private static func points(_ value: CGFloat) -> String { String(format: "%.2fpt", Double(value)) }
+
+    /// The picture's file and its shown size. Formats other apps may not read become PNG.
+    private static func picture(_ attachment: NSTextAttachment) -> Picture? {
+        var data = attachment.fileWrapper?.regularFileContents ?? attachment.contents
+        var image: NSImage? = attachment.image
+        if data == nil, let fileImage = image { data = fileImage.tiffRepresentation }
+        guard var bytes = data else { return nil }
+        var type = imageType(bytes)
+        if type == nil {
+            guard let bitmap = NSBitmapImageRep(data: bytes), let png = bitmap.representation(using: .png, properties: [:]) else { return nil }
+            bytes = png; type = "png"
+        }
+        if image == nil { image = NSImage(data: bytes) }
+        var size = attachment.bounds.size
+        if size.width <= 0 || size.height <= 0 { size = image?.size ?? CGSize(width: 200, height: 150) }
+        return Picture(data: bytes, fileExtension: type!, size: fitted(size))
+    }
+
+    /// PNG, JPEG and GIF go in as they are.
+    static func imageType(_ data: Data) -> String? {
+        if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "png" }
+        if data.starts(with: [0xFF, 0xD8, 0xFF]) { return "jpg" }
+        if data.starts(with: Array("GIF8".utf8)) { return "gif" }
+        return nil
+    }
+
+    /// No wider than a page's text (6.5 inches), keeping the proportions.
+    static func fitted(_ size: CGSize) -> CGSize {
+        let maxWidth: CGFloat = 468
+        return size.width > maxWidth ? CGSize(width: maxWidth, height: size.height * maxWidth / size.width) : size
+    }
+}
+
+// MARK: - Word → .odt
+
+/// The text system reads a Word file's fonts and paragraph styles well but drops its tables and pictures.
+/// Before it reads the file, tables become marker paragraphs (and HTML, which the text system does read as tables)
+/// and pictures become marker text; afterwards both are put back in place.
+enum WordToODT {   // On the main actor: the text system reads HTML there
+    static func convert(_ docx: URL, output: URL, workDir: URL) async throws {
+        let folder = workDir.appending(path: "docx")
+        try await Tools.run("/usr/bin/unzip", ["-q", "-o", docx.path, "-d", folder.path])
+        let documentURL = folder.appending(path: "word/document.xml")
+        var xml = try String(contentsOf: documentURL, encoding: .utf8)
+        let hasPictures = xml.contains("<w:drawing") || xml.contains("<w:pict"), hasTables = xml.contains("<w:tbl")
+        guard hasPictures || hasTables else {
+            return try await ODTWriter.write(NSAttributedString(url: docx, options: [:], documentAttributes: nil), output: output, workDir: workDir)
+        }
+
+        // Pictures: a drawing (or the alternate-content wrapper holding a drawing and its fallback) becomes marker text.
+        var pictures: [ODTWriter.Picture] = []
+        if hasPictures, let open = try? Regex(#"<(mc:AlternateContent|w:drawing|w:pict)\b[^>]*>"#) {
+            let relationships = Self.relationships(folder.appending(path: "word/_rels/document.xml.rels"))
+            xml = MathMarkdown.replaceBalanced(open, in: xml) { element in
+                guard let id = element.firstMatch(of: /<a:blip\b[^>]*\br:embed="([^"]+)"/)?.output.1
+                        ?? element.firstMatch(of: /<v:imagedata\b[^>]*\br:id="([^"]+)"/)?.output.1,
+                      let target = relationships[String(id)],
+                      let data = try? Data(contentsOf: folder.appending(path: target.hasPrefix("/") ? String(target.dropFirst()) : "word/" + target))
+                else { return nil }
+                var bytes = data
+                var type = ODTWriter.imageType(data)
+                if type == nil {   // EMF, TIFF, BMP…: PNG reads everywhere
+                    guard let png = NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) else { return nil }
+                    bytes = png; type = "png"
+                }
+                var size = CGSize.zero
+                if let extent = element.firstMatch(of: /<wp:extent\b[^>]*\bcx="(\d+)"[^>]*\bcy="(\d+)"/),
+                   let cx = Double(extent.output.1), let cy = Double(extent.output.2) {
+                    size = CGSize(width: cx / 12_700, height: cy / 12_700)   // EMU → points
+                } else if let image = NSImage(data: bytes) {
+                    size = image.size
+                }
+                pictures.append(ODTWriter.Picture(data: bytes, fileExtension: type!, size: ODTWriter.fitted(size)))
+                return #"<w:t xml:space="preserve">\#(ODTWriter.marker(pictures.count - 1))</w:t>"#
+            }
+        }
+
+        // Tables: their HTML first (pictures in cells are markers by now), then a marker paragraph in their place.
+        var tables: [String] = []
+        if hasTables, let open = try? Regex(#"<(w:tbl)\b[^>]*>"#) {
+            var reader = WordToHTML(folder: folder)
+            tables = try reader.tables(in: xml)
+            var index = 0
+            xml = MathMarkdown.replaceBalanced(open, in: xml) { _ in
+                defer { index += 1 }
+                return #"<w:p><w:r><w:t>ZZODTTABLE\#(index)ZZ</w:t></w:r></w:p>"#
+            }
+        }
+        try xml.write(to: documentURL, atomically: true, encoding: .utf8)
+        let prepared = workDir.appending(path: "prepared.docx")
+        try await Tools.run("/usr/bin/zip", ["-q", "-X", "-r", prepared.path, "."], currentDirectory: folder)
+        let text = NSMutableAttributedString(attributedString: try NSAttributedString(url: prepared, options: [:], documentAttributes: nil))
+
+        // Back to front, so earlier ranges stay put.
+        let string = text.string as NSString
+        let markers = try NSRegularExpression(pattern: #"ZZODTTABLE(\d+)ZZ\n?"#)
+        for match in markers.matches(in: text.string, range: NSRange(location: 0, length: string.length)).reversed() {
+            guard let index = Int(string.substring(with: match.range(at: 1))), index < tables.count else { continue }
+            let font = text.attribute(.font, at: match.range.location, effectiveRange: nil) as? NSFont
+            let css = "body { font-family: '\(font?.familyName ?? "Helvetica")'; font-size: \(Int(font?.pointSize ?? 12))pt; }"
+                + " table { border-collapse: collapse; } td, th { border: 1px solid #999; padding: 2px 5px; vertical-align: top; }"
+            let html = "<!doctype html><html><head><meta charset=\"utf-8\"><style>\(css)</style></head><body>\(tables[index])</body></html>"
+            guard let table = try? DocumentConversion.attributed(html: html, baseURL: folder) else { continue }
+            text.replaceCharacters(in: match.range, with: table)
+        }
+        try await ODTWriter.write(text, pictures: pictures, output: output, workDir: workDir)
+    }
+
+    private static func relationships(_ url: URL) -> [String: String] {
+        guard let xml = try? String(contentsOf: url, encoding: .utf8) else { return [:] }
+        var result: [String: String] = [:]
+        for match in xml.matches(of: /<Relationship\b[^>]*>/) {
+            let tag = match.output
+            if let id = tag.firstMatch(of: /\bId="([^"]+)"/)?.output.1, let target = tag.firstMatch(of: /\bTarget="([^"]+)"/)?.output.1 {
+                result[String(id)] = String(target)
+            }
+        }
+        return result
     }
 }

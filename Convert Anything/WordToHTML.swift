@@ -37,27 +37,42 @@ nonisolated struct WordToHTML {
 
     /// The document body as HTML.
     mutating func html() throws -> String {
+        let body = try load(nil)
+        let blocks = blocks(in: body)
+        // Without real heading styles, large text stands in for them.
+        let hasStyledHeadings = blocks.contains { if case .paragraph(let p) = $0 { p.heading != nil } else { false } }
+        return render(blocks, guessHeadings: !hasStyledHeadings)
+    }
+
+    /// Each outermost table as HTML, in document order. `xml` stands in for the document part (an edited copy of it).
+    mutating func tables(in xml: String) throws -> [String] {
+        var found: [String] = []
+        func search(_ element: XMLElement) {
+            for child in element.children?.compactMap({ $0 as? XMLElement }) ?? [] {
+                if child.name == "w:tbl" { found.append(table(child)) } else { search(child) }
+            }
+        }
+        search(try load(xml))
+        return found
+    }
+
+    /// Reads styles, lists and links, and returns the document's body.
+    private mutating func load(_ documentXML: String?) throws -> XMLElement {
         let word = folder.appending(path: "word")
         let documentURL = word.appending(path: "document.xml")
-        guard FileManager.default.fileExists(atPath: documentURL.path) else {
-            throw ConversionError.failed("Couldn't read this Word file.")
-        }
         readStyles(word.appending(path: "styles.xml"))
         readNumbering(word.appending(path: "numbering.xml"))
         readRelationships(word.appending(path: "_rels/document.xml.rels"))
 
         // The XML reader throws away text that is only spaces, but Word puts the space between two words in a
         // run of its own. A marker character keeps those runs alive until they're read.
-        guard let xml = try? String(contentsOf: documentURL, encoding: .utf8),
+        guard let xml = documentXML ?? (try? String(contentsOf: documentURL, encoding: .utf8)),
               let document = try? XMLDocument(xmlString: xml.replacing(/(<w:t\b[^>]*>)(\s+)(<\/w:t>)/) { "\($0.1)\(Self.spaceMarker)\($0.2)\($0.3)" },
                                               options: [.nodeLoadExternalEntitiesNever]),
               let body = document.rootElement()?.elements(forName: "w:body").first else {
             throw ConversionError.failed("Couldn't read this Word file.")
         }
-        let blocks = blocks(in: body)
-        // Without real heading styles, large text stands in for them.
-        let hasStyledHeadings = blocks.contains { if case .paragraph(let p) = $0 { p.heading != nil } else { false } }
-        return render(blocks, guessHeadings: !hasStyledHeadings)
+        return body
     }
 
     // MARK: Reading the supporting parts

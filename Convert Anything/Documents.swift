@@ -85,7 +85,7 @@ enum DocumentConversion {
                 let markdown = try Markdown.markdown(from: attributed(html: prepared?.html ?? html, baseURL: request.originalDir))
                 try MathMarkdown.restore(markdown, items: prepared?.items ?? []).write(to: output, atomically: true, encoding: .utf8)
             } else {
-                try write(text: attributed(html: html, baseURL: request.originalDir), request: request, output: output)
+                try await write(text: attributed(html: html, baseURL: request.originalDir), request: request, output: output)
             }
         case .txt:
             let text = try readText(input)
@@ -95,6 +95,8 @@ enum DocumentConversion {
                 let paragraphs = text.components(separatedBy: "\n\n").map { "<p>\(escapeHTML($0).replacingOccurrences(of: "\n", with: "<br>"))</p>" }
                 try await write(html: paragraphs.joined(separator: "\n"), title: request.title, request: request, output: output)
             }
+        case .docx where request.to == .odt:
+            try await WordToODT.convert(input, output: output, workDir: request.workDir)
         case .docx where request.to == .md:
             // Word equations come through as LaTeX, and tables as tables.
             let prepared = try await MathMarkdown.prepare(docx: input, workDir: request.workDir)
@@ -102,7 +104,7 @@ enum DocumentConversion {
             try MathMarkdown.restore(Markdown.markdown(from: text), docx: prepared).write(to: output, atomically: true, encoding: .utf8)
         default:
             let text = try NSAttributedString(url: input, options: [:], documentAttributes: nil)
-            try write(text: text, request: request, output: output)
+            try await write(text: text, request: request, output: output)
         }
     }
 
@@ -116,11 +118,11 @@ enum DocumentConversion {
         case .pdf:
             try await WebPDF.render(html: htmlPage(body: body, title: title), baseURL: request.originalDir, output: output)
         default:
-            try write(text: attributed(html: htmlPage(body: body, title: title), baseURL: request.originalDir), request: request, output: output)
+            try await write(text: attributed(html: htmlPage(body: body, title: title), baseURL: request.originalDir), request: request, output: output)
         }
     }
 
-    private static func write(text: NSAttributedString, request: Converter.Request, output: URL) throws {
+    private static func write(text: NSAttributedString, request: Converter.Request, output: URL) async throws {
         let type: NSAttributedString.DocumentType
         switch request.to {
         case .txt: return try text.string.write(to: output, atomically: true, encoding: .utf8)
@@ -129,7 +131,7 @@ enum DocumentConversion {
         case .docx: type = .officeOpenXML
         case .doc: type = .docFormat
         case .rtf: type = .rtf
-        case .odt: type = .openDocument
+        case .odt: return try await ODTWriter.write(text, output: output, workDir: request.workDir)   // Keeps the pictures
         case .html: type = .html
         default: throw ConversionError.unsupported(request.from, request.to)
         }

@@ -338,7 +338,7 @@ nonisolated enum MathMarkdown {
 
     private static let voidTags: Set<String> = ["img", "br", "hr", "input", "meta", "link", "source", "wbr"]
 
-    private static func replaceBalanced(_ open: Regex<AnyRegexOutput>, in html: String, transform: (Substring) -> String?) -> String {
+    static func replaceBalanced(_ open: Regex<AnyRegexOutput>, in html: String, transform: (Substring) -> String?) -> String {
         var result = ""
         var position = html.startIndex
         while let match = html[position...].firstMatch(of: open) {
