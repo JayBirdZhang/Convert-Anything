@@ -46,6 +46,8 @@ nonisolated private final class ODSParser: NSObject, XMLParserDelegate {
             cellValue = Self.value(attributes)
         case "office:annotation":   // A comment on the cell, not its content
             skipDepth = 1
+        case _ where inCell && name.hasPrefix("draw:"):   // A text box or shape anchored to the cell
+            skipDepth = 1
         case "text:p" where inCell, "text:h" where inCell:
             if paragraphs > 0 { cell += "\n" }
             paragraphs += 1

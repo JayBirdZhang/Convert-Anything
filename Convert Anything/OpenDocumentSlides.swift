@@ -54,7 +54,7 @@ nonisolated private final class ODPBuilder {
             for decls in root.elements(forName: "office:font-face-decls") {
                 for face in decls.elements(forName: "style:font-face") {
                     guard let name = face["style:name"] else { continue }
-                    let family = (face["svg:font-family"] ?? name).replacingOccurrences(of: "'", with: "")
+                    let family = Self.safe(face["svg:font-family"] ?? name)
                     let generic = ["roman": "Times, serif", "swiss": "Helvetica, sans-serif", "modern": "Menlo, monospace",
                                    "script": "cursive", "decorative": "fantasy"][face["style:font-family-generic"] ?? ""] ?? "Helvetica, sans-serif"
                     fonts[name] = "'\(family)', \(generic)"
@@ -75,7 +75,7 @@ nonisolated private final class ODPBuilder {
         for element in common?.children?.compactMap({ $0 as? XMLElement }) ?? [] {
             switch element.name {
             case "style:default-style": if let family = element["style:family"] { defaults[family] = element }
-            case "draw:fill-image": if let name = element["draw:name"], let href = element["xlink:href"] { fillImages[name] = href }
+            case "draw:fill-image": if let name = element["draw:name"], let href = Self.packagePath(element["xlink:href"]) { fillImages[name] = href }
             case "draw:gradient": if let name = element["draw:name"] { gradients[name] = element }
             default: break
             }
@@ -143,12 +143,12 @@ nonisolated private final class ODPBuilder {
 
     private func textCSS(_ p: [String: String]) -> String {
         var css = ""
-        if let size = p["fo:font-size"] { css += "font-size:\(size.hasSuffix("%") ? size : Self.points(size).map(Self.pt) ?? size);" }
-        if let weight = p["fo:font-weight"] { css += "font-weight:\(weight);" }
-        if let style = p["fo:font-style"] { css += "font-style:\(style == "oblique" ? "italic" : style);" }
-        if let color = p["fo:color"], p["style:use-window-font-color"] != "true" { css += "color:\(color);" }
+        if let size = p["fo:font-size"] { css += "font-size:\(size.hasSuffix("%") ? Self.safe(size) : Self.points(size).map(Self.pt) ?? "inherit");" }
+        if let weight = p["fo:font-weight"] { css += "font-weight:\(Self.safe(weight));" }
+        if let style = p["fo:font-style"] { css += "font-style:\(style == "oblique" ? "italic" : Self.safe(style));" }
+        if let color = p["fo:color"], p["style:use-window-font-color"] != "true" { css += "color:\(Self.safe(color));" }
         if let name = p["style:font-name"], let family = fonts[name] { css += "font-family:\(family);" }
-        else if let family = p["fo:font-family"] { css += "font-family:\(family), Helvetica, sans-serif;" }
+        else if let family = p["fo:font-family"] { css += "font-family:'\(Self.safe(family))', Helvetica, sans-serif;" }
         var decorations: [String] = []
         if let underline = p["style:text-underline-style"], underline != "none" { decorations.append("underline") }
         if let strike = p["style:text-line-through-style"], strike != "none" { decorations.append("line-through") }
@@ -157,10 +157,10 @@ nonisolated private final class ODPBuilder {
             css += position.hasPrefix("sub") || position.hasPrefix("-") ? "vertical-align:sub;font-size:smaller;" : "vertical-align:super;font-size:smaller;"
         }
         if p["fo:font-variant"] == "small-caps" { css += "font-variant:small-caps;" }
-        if let transform = p["fo:text-transform"], transform != "none" { css += "text-transform:\(transform);" }
+        if let transform = p["fo:text-transform"], transform != "none" { css += "text-transform:\(Self.safe(transform));" }
         if let shadow = p["fo:text-shadow"], shadow != "none" { css += "text-shadow:1pt 1pt 1pt rgba(0,0,0,.4);" }
         if let spacing = p["fo:letter-spacing"], let value = Self.points(spacing) { css += "letter-spacing:\(Self.pt(value));" }
-        if let background = p["fo:background-color"], background != "transparent" { css += "background-color:\(background);" }
+        if let background = p["fo:background-color"], background != "transparent" { css += "background-color:\(Self.safe(background));" }
         return css
     }
 
@@ -186,9 +186,9 @@ nonisolated private final class ODPBuilder {
         case "solid":
             guard let color = p["draw:fill-color"] else { return "" }
             if let opacity = p["draw:opacity"], let percent = Double(opacity.dropLast()), percent < 100 {
-                return "background-color:\(Self.rgba(color, percent / 100));"
+                return "background-color:\(Self.rgba(Self.safe(color), percent / 100));"
             }
-            return "background-color:\(color);"
+            return "background-color:\(Self.safe(color));"
         case "bitmap":
             guard let name = p["draw:fill-image-name"], let href = fillImages[name] else { return "" }
             let repeatMode = p["style:repeat"] ?? "repeat"
@@ -196,7 +196,7 @@ nonisolated private final class ODPBuilder {
             return "background-image:url('\(Self.escape(href))');background-size:\(size);background-repeat:\(repeatMode == "repeat" ? "repeat" : "no-repeat");background-position:center;"
         case "gradient":
             guard let name = p["draw:fill-gradient-name"], let gradient = gradients[name] else { return "" }
-            let start = gradient["draw:start-color"] ?? "#ffffff", end = gradient["draw:end-color"] ?? "#000000"
+            let start = Self.safe(gradient["draw:start-color"] ?? "#ffffff"), end = Self.safe(gradient["draw:end-color"] ?? "#000000")
             var angle = 0.0
             if let text = gradient["draw:angle"] {
                 angle = text.hasSuffix("deg") ? Double(text.dropLast(3)) ?? 0 : (Double(text) ?? 0) / 10   // Tenths of a degree, or "45deg"
@@ -217,7 +217,20 @@ nonisolated private final class ODPBuilder {
     private func strokeCSS(_ p: [String: String], property: String = "border") -> String {
         guard let stroke = p["draw:stroke"], stroke != "none" else { return "" }
         let width = max(Self.points(p["svg:stroke-width"]) ?? 0, 0.75)
-        return "\(property):\(Self.pt(width)) \(stroke == "dash" ? "dashed" : "solid") \(p["svg:stroke-color"] ?? "#000000");"
+        return "\(property):\(Self.pt(width)) \(stroke == "dash" ? "dashed" : "solid") \(Self.safe(p["svg:stroke-color"] ?? "#000000"));"
+    }
+
+    /// A value from the file, made safe to put in CSS: colours, names, keywords and borders only, so it can't end
+    /// the declaration or the attribute, or load anything.
+    static func safe(_ value: String?) -> String {
+        String((value ?? "").unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) || " #%.,-_".unicodeScalars.contains($0) }.map(Character.init))
+    }
+
+    /// A picture inside the package. Links to other files or the web aren't followed, so nothing leaves the Mac.
+    static func packagePath(_ href: String?) -> String? {
+        guard var path = href, !path.hasPrefix("/"), !path.contains(".."), !path.contains(where: { ":'\"()\\<>".contains($0) }) else { return nil }
+        if path.hasPrefix("./") { path.removeFirst(2) }
+        return path.isEmpty ? nil : path
     }
 
     private static func rgba(_ hex: String, _ alpha: Double) -> String {
@@ -345,7 +358,7 @@ nonisolated private final class ODPBuilder {
                   let x2 = Self.points(element["svg:x2"]), let y2 = Self.points(element["svg:y2"]), graphic["draw:stroke"] != "none" else { return "" }
             let width = max(Self.points(graphic["svg:stroke-width"]) ?? 0, 0.75)
             let dash = graphic["draw:stroke"] == "dash" ? " stroke-dasharray=\"\(width * 3) \(width * 2)\"" : ""
-            return "<svg style=\"left:0;top:0\" width=\"1\" height=\"1\"><line x1=\"\(x1 * 4 / 3)\" y1=\"\(y1 * 4 / 3)\" x2=\"\(x2 * 4 / 3)\" y2=\"\(y2 * 4 / 3)\" stroke=\"\(graphic["svg:stroke-color"] ?? "#000")\" stroke-width=\"\(width * 4 / 3)\"\(dash)/></svg>"
+            return "<svg style=\"left:0;top:0\" width=\"1\" height=\"1\"><line x1=\"\(x1 * 4 / 3)\" y1=\"\(y1 * 4 / 3)\" x2=\"\(x2 * 4 / 3)\" y2=\"\(y2 * 4 / 3)\" stroke=\"\(Self.safe(graphic["svg:stroke-color"] ?? "#000"))\" stroke-width=\"\(width * 4 / 3)\"\(dash)/></svg>"
         }
 
         // Where it sits: x/y/width/height, or a rotation and translation.
@@ -405,7 +418,7 @@ nonisolated private final class ODPBuilder {
         }
         if isTextFrame { css += fillCSS(graphic) + strokeCSS(graphic) }
         if graphic["draw:shadow"] == "visible" {
-            css += "box-shadow:\(Self.pt(Self.points(graphic["draw:shadow-offset-x"]) ?? 2)) \(Self.pt(Self.points(graphic["draw:shadow-offset-y"]) ?? 2)) 2pt \(graphic["draw:shadow-color"] ?? "#808080");"
+            css += "box-shadow:\(Self.pt(Self.points(graphic["draw:shadow-offset-x"]) ?? 2)) \(Self.pt(Self.points(graphic["draw:shadow-offset-y"]) ?? 2)) 2pt \(Self.safe(graphic["draw:shadow-color"] ?? "#808080"));"
         }
         for side in ["left", "right", "top", "bottom"] {
             if let value = Self.points(graphic["fo:padding-\(side)"]) { css += "padding-\(side):\(Self.pt(value));" }
@@ -424,7 +437,7 @@ nonisolated private final class ODPBuilder {
     /// previews) with a PNG fallback next to or inside them.
     private static func picture(in element: XMLElement) -> String? {
         for child in element.children?.compactMap({ $0 as? XMLElement }) ?? [] where child.name == "draw:image" {
-            if let href = child["xlink:href"], ["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "tif", "tiff"].contains(href.split(separator: ".").last?.lowercased() ?? "") {
+            if let href = packagePath(child["xlink:href"]), ["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "tif", "tiff"].contains(href.split(separator: ".").last?.lowercased() ?? "") {
                 return href
             }
             if let nested = picture(in: child) { return nested }
@@ -435,8 +448,8 @@ nonisolated private final class ODPBuilder {
     /// Polygons and paths, drawn as SVG in the shape's own coordinates.
     private func outline(_ element: XMLElement, graphic: [String: String], width: Double, height: Double) -> String {
         let viewBox = element["svg:viewBox"] ?? "0 0 \(width) \(height)"
-        let fill = graphic["draw:fill"] == "solid" && element.name != "draw:polyline" ? graphic["draw:fill-color"] ?? "#729fcf" : "none"
-        let stroke = graphic["draw:stroke"] == "none" ? "none" : graphic["svg:stroke-color"] ?? "#3465a4"
+        let fill = graphic["draw:fill"] == "solid" && element.name != "draw:polyline" ? Self.safe(graphic["draw:fill-color"] ?? "#729fcf") : "none"
+        let stroke = graphic["draw:stroke"] == "none" ? "none" : Self.safe(graphic["svg:stroke-color"] ?? "#3465a4")
         let strokeWidth = max(Self.points(graphic["svg:stroke-width"]) ?? 0, 0.75)
         let shape: String
         if element.name == "draw:path", let d = element["svg:d"] {
@@ -467,13 +480,13 @@ nonisolated private final class ODPBuilder {
                 let graphic = properties("graphic", "table-cell", style)
                 var css = fillCSS(graphic) + paragraphCSS(properties("paragraph", "table-cell", style)) + textCSS(properties("text", "table-cell", style))
                 let cellProperties = properties("table-cell", "table-cell", style)
-                if let border = cellProperties["fo:border"] { css += "border:\(border);" }
+                if let border = cellProperties["fo:border"] { css += "border:\(Self.safe(border));" }
                 for side in ["left", "right", "top", "bottom"] {
-                    if let border = cellProperties["fo:border-\(side)"] { css += "border-\(side):\(border);" }
+                    if let border = cellProperties["fo:border-\(side)"] { css += "border-\(side):\(Self.safe(border));" }
                 }
                 var spans = ""
-                if let columns = cell["table:number-columns-spanned"], columns != "1" { spans += " colspan=\"\(columns)\"" }
-                if let rows = cell["table:number-rows-spanned"], rows != "1" { spans += " rowspan=\"\(rows)\"" }
+                if let columns = cell["table:number-columns-spanned"].flatMap(Int.init), columns > 1 { spans += " colspan=\"\(columns)\"" }
+                if let rows = cell["table:number-rows-spanned"].flatMap(Int.init), rows > 1 { spans += " rowspan=\"\(rows)\"" }
                 html += "<td\(spans) style=\"\(css)\">\(text(cell, frame: nil))</td>"
             }
             html += "</tr>"
@@ -541,19 +554,19 @@ nonisolated private final class ODPBuilder {
                 let name = base + String(level)
                 levelCSS = paragraphCSS(properties("paragraph", "presentation", name)) + textCSS(properties("text", "presentation", name))
             }
-            // Indentation from the list level.
-            var labelWidth = 0.0
+            // Indentation from the list level, which wins over the paragraph's own (LibreOffice writes 0 there).
+            var labelWidth = 0.0, indentCSS = ""
             if let properties = levelStyle?.elements(forName: "style:list-level-properties").first {
                 if let alignment = properties.elements(forName: "style:list-level-label-alignment").first {
-                    if let margin = Self.points(alignment["fo:margin-left"]) { levelCSS = "margin-left:\(Self.pt(margin));" + levelCSS }
-                    if let indent = Self.points(alignment["fo:text-indent"]) { levelCSS = "text-indent:\(Self.pt(indent));" + levelCSS; labelWidth = -indent }
+                    if let margin = Self.points(alignment["fo:margin-left"]) { indentCSS += "margin-left:\(Self.pt(margin));" }
+                    if let indent = Self.points(alignment["fo:text-indent"]) { indentCSS += "text-indent:\(Self.pt(indent));"; labelWidth = -indent }
                 } else {
                     let before = Self.points(properties["text:space-before"]) ?? 0, label = Self.points(properties["text:min-label-width"]) ?? 0
-                    levelCSS = "margin-left:\(Self.pt(before + label));text-indent:\(Self.pt(-label));" + levelCSS
+                    indentCSS = "margin-left:\(Self.pt(before + label));text-indent:\(Self.pt(-label));"
                     labelWidth = label
                 }
             } else if bulletsByDefault {
-                levelCSS = "margin-left:\(Self.pt(Double(level) * 20));text-indent:-14pt;" + levelCSS
+                indentCSS = "margin-left:\(Self.pt(Double(level) * 20));text-indent:-14pt;"
                 labelWidth = 14
             }
             var bullet: String?
@@ -565,7 +578,7 @@ nonisolated private final class ODPBuilder {
             for part in item.children?.compactMap({ $0 as? XMLElement }) ?? [] {
                 if part.name == "text:p" || part.name == "text:h" {
                     let mark = first ? bullet.map { "<span style=\"display:inline-block;min-width:\(Self.pt(labelWidth));text-indent:0\">\($0)</span>" } : nil
-                    html += paragraph(part, bullet: mark, levelCSS: levelCSS)
+                    html += paragraph(part, bullet: mark, levelCSS: levelCSS, indentCSS: indentCSS)
                     first = false
                 } else if part.name == "text:list" {
                     html += list(part, parent: inner, outlineBase: outlineBase, bulletsByDefault: bulletsByDefault)
@@ -580,7 +593,7 @@ nonisolated private final class ODPBuilder {
         guard let level else { return byDefault ? "•" : nil }
         let props = level.elements(forName: "style:text-properties").first
         var css = ""
-        if let color = props?["fo:color"], props?["style:use-window-font-color"] != "true" { css += "color:\(color);" }
+        if let color = props?["fo:color"], props?["style:use-window-font-color"] != "true" { css += "color:\(Self.safe(color));" }
         // Bullets are drawn in LibreOffice's symbol font, where they're much bigger; shrinking a Mac font's bullet only makes it a dot.
         if let size = props?["fo:font-size"], size.hasSuffix("%"), let percent = Double(size.dropLast()), percent > 100 { css += "font-size:\(min(percent, 150))%;" }
         func styled(_ text: String) -> String { css.isEmpty ? Self.escape(text) : "<span style=\"\(css)\">\(Self.escape(text))</span>" }
@@ -621,9 +634,9 @@ nonisolated private final class ODPBuilder {
         return text
     }
 
-    private func paragraph(_ element: XMLElement, bullet: String?, levelCSS: String) -> String {
+    private func paragraph(_ element: XMLElement, bullet: String?, levelCSS: String, indentCSS: String = "") -> String {
         let name = element["text:style-name"]
-        let css = levelCSS + paragraphCSS(properties("paragraph", "paragraph", name)) + textCSS(properties("text", "paragraph", name))
+        let css = levelCSS + paragraphCSS(properties("paragraph", "paragraph", name)) + textCSS(properties("text", "paragraph", name)) + indentCSS
         let body = inline(element)
         return "<p style=\"\(css)\">\(bullet ?? "")\(body.isEmpty ? "&#8203;" : body)</p>"
     }

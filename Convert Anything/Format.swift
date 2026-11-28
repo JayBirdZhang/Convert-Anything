@@ -162,7 +162,7 @@ nonisolated enum Sniffer {
             if b[1] & 0xF6 == 0xF0 { return .format(.aac) }   // ADTS
             if b[1] & 0xE0 == 0xE0 { return .format(.mp3) }   // MPEG audio frame sync
         }
-        if at(0, "PK\u{03}\u{04}") { return detectZip(url, head: data) }
+        if at(0, "PK\u{03}\u{04}") { return detectZip(url, head: data, claimed: claimed) }
         if let subtitles = detectSubtitles(data) { return .format(subtitles) }
 
         // Text: no NUL bytes and valid UTF-8 (allowing a character cut off at the 4 KB boundary).
@@ -223,7 +223,7 @@ nonisolated enum Sniffer {
     /// docx, pptx, xlsx, OpenDocument and epub are all zip archives. OpenDocument and epub name themselves in the first entry
     /// (epub's is a stored file called "mimetype", so its text sits at a fixed spot near the start);
     /// Office files are told apart by the folder names listed in the zip's directory at the end of the file.
-    private static func detectZip(_ url: URL, head: Data) -> Result {
+    private static func detectZip(_ url: URL, head: Data, claimed: Format?) -> Result {
         let start = head.prefix(128)   // The "mimetype" entry, before anything an embedded object could add
         if start.range(of: Data("application/vnd.oasis.opendocument.spreadsheet".utf8)) != nil { return .format(.ods) }
         if start.range(of: Data("application/vnd.oasis.opendocument.presentation".utf8)) != nil { return .format(.odp) }
@@ -239,6 +239,8 @@ nonisolated enum Sniffer {
         if tail.range(of: Data("word/document.xml".utf8)) != nil { return .format(.docx) }
         if tail.range(of: Data("xl/workbook.xml".utf8)) != nil { return .format(.xlsx) }
         if tail.range(of: Data("Index/Document.iwa".utf8)) != nil { return .iWork }
+        // OpenDocument zipped without its "mimetype" entry first: the old extension says which kind it is.
+        if let claimed, [.odt, .ods, .odp].contains(claimed), tail.range(of: Data("content.xml".utf8)) != nil { return .format(claimed) }
         return .unknown
     }
 }
