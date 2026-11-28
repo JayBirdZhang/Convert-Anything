@@ -5,14 +5,18 @@ import AppKit
 /// while it's already running (a menu-bar app otherwise shows nothing at all when you open it).
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        _ = Updates.shared   // Starts Sparkle's daily check
-        // Give the menu-bar icon a moment to appear, so the panel can point at it.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-            WelcomePanel.showOnFirstLaunch()
+        BackgroundLaunch.shared.whenNormal {
+            _ = Updates.shared   // Starts Sparkle's daily check
+            // Give the menu-bar icon a moment to appear, so the panel can point at it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                WelcomePanel.showOnFirstLaunch()
+            }
         }
+        BackgroundLaunch.shared.launched(notification)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        BackgroundLaunch.shared.openedByUser()
         WelcomePanel.shared.show()
         return false
     }

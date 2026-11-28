@@ -25,10 +25,18 @@ struct ConvertFileIntent: AppIntent {
     }
 
     func perform() async throws -> some IntentResult & ReturnsValue<[IntentFile]> {
+        // Quits afterwards if the app was started just for this (BackgroundLaunch.swift).
+        await MainActor.run { BackgroundLaunch.shared.actionStarted() }
         var results: [IntentFile] = []
-        for file in files {
-            results += try await convert(file, to: format.format, replacingOriginal: replaceOriginal)
+        do {
+            for file in files {
+                results += try await convert(file, to: format.format, replacingOriginal: replaceOriginal)
+            }
+        } catch {
+            await MainActor.run { BackgroundLaunch.shared.actionFinished() }
+            throw error
         }
+        await MainActor.run { BackgroundLaunch.shared.actionFinished() }
         return .result(value: results)
     }
 

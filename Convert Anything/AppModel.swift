@@ -199,11 +199,11 @@ enum OriginalsMode: String, CaseIterable {
         IWork.needsAttention = { [weak self] title, body in
             Task { @MainActor [weak self] in self?.notify(title, body: body, important: true) }
         }
-        restartWatcher()
+        BackgroundLaunch.shared.whenNormal { [weak self] in self?.restartWatcher() }
     }
 
     private func restartWatcher() {
-        watcher.watch(isWatching ? watchedFolders : [])
+        watcher.watch(isWatching && !BackgroundLaunch.shared.isHolding ? watchedFolders : [])
     }
 
     // MARK: Deciding whether a rename is a conversion request
