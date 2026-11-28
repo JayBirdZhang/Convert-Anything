@@ -72,7 +72,7 @@ enum Converter {
     static func isHeavy(from: Format, to: Format) -> Bool {
         switch route(from: from, to: to) {
         case .media: from.kind == .video || to.kind == .video
-        case .fromSlides, .slidesExport: true
+        case .fromSlides, .slidesExport: from != .odp   // OpenDocument slides are laid out without Keynote
         case .spreadsheet: !Spreadsheets.runsWithoutNumbers(from: from, to: to)
         case .document: from == .pages || (to == .pdf && [.docx, .doc, .rtf].contains(from))
         case .documentToImage: isHeavy(from: from, to: .pdf)
@@ -117,6 +117,13 @@ enum Converter {
             }
         case .pdfToImage:
             result = try await renderPages(of: request.input, request: request, output: output, progress: progress)
+        case .fromSlides where request.from == .odp:
+            // Keynote and Quick Look can't open OpenDocument, so the app lays the slides out itself.
+            let pdf = request.to == .pdf ? output : request.workDir.appending(path: "slides.pdf")
+            try await OpenDocumentSlides.renderPDF(request.input, workDir: request.workDir, output: pdf)
+            if request.to != .pdf {
+                result = try await renderPages(of: pdf, request: request, output: output, progress: progress)
+            }
         case .fromSlides:
             let pdf = request.to == .pdf ? output : request.workDir.appending(path: "slides.pdf")
             // Keynote matches PowerPoint's fonts and layout best. When it isn't installed or fails, Quick Look
@@ -132,6 +139,12 @@ enum Converter {
             if request.to != .pdf {
                 result = try await renderPages(of: pdf, request: request, output: output, progress: progress)
             }
+        case .slidesExport where request.from == .odp:
+            // Keynote can't open OpenDocument: the slides are laid out as a PDF, which becomes a deck like any PDF.
+            let pdfRequest = Request(input: request.workDir.appending(path: "slides.pdf"), from: .pdf, to: .pptx, workDir: request.workDir,
+                                     title: request.title, originalDir: request.originalDir, editableSlides: request.editableSlides, quality: request.quality)
+            try await OpenDocumentSlides.renderPDF(request.input, workDir: request.workDir, output: pdfRequest.input)
+            try await SlideBuilder.build(pdfRequest, output: output, progress: progress)
         case .slidesExport:
             try await IWork.export(request.input, with: .keynote, as: .powerPoint, to: output)
         case .toSlides:
