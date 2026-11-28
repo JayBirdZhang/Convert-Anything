@@ -33,6 +33,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Exists only while a drag is over the open menu: notices the mouse button going up anywhere.
     private var dragWatch: Timer?
+    /// Whether the menu is open, as opposed to still fading out.
+    private var isOpen = false
+    private var fadeGeneration = 0
 
     /// Proximity open: listens only to mouse-down, mouse-dragged and mouse-up, which macOS sends only while
     /// a button is held, so nothing runs while idle. Mouse events (unlike key events) need no permission.
@@ -62,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     onQuit: { NSApp.terminate(nil) })
         NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.panel.isVisible, self.model.phase == .idle || self.model.phase == .chooser else { return }
+                guard let self, self.isOpen, self.model.phase == .idle || self.model.phase == .chooser else { return }
                 self.closePanel(reason: "app resigned active")
             }
         }
@@ -101,7 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Clicking the icon
 
     func iconClicked() {
-        if panel.isVisible { closePanel(reason: "icon clicked"); return }
+        if isOpen { closePanel(reason: "icon clicked"); return }
         model.reset()
         NSApp.activate()
         showPanel()
@@ -115,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let urls = fileURLs(info)
         Log.write("icon: drag entered with \(urls.count) file(s) at \(info.draggingLocation)")
         guard !urls.isEmpty else { return [] }
-        if panel.isVisible && model.phase == .dragging { return .copy }
+        if isOpen && model.phase == .dragging { return .copy }
         springFiles = urls
         startSpring(at: info.draggingLocation)
         return .copy
@@ -160,7 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         springTimer = nil
         Log.write("spring: fired after \(model.springDelay)s")
         beginDragMode(springFiles)
-        if !panel.isVisible { showPanel() }
+        if !isOpen { showPanel() }
     }
 
     // MARK: Opening when a file comes near
@@ -196,12 +199,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let inZone = nearZone().map { NSMouseInRect(mouse, $0, false) } ?? false
 
             // Already open from this drag: close it again if the file wanders well away without a drop.
-            if model.phase == .dragging, panel.isVisible {
+            if model.phase == .dragging, isOpen {
                 let keep = panel.frame.insetBy(dx: -120, dy: -120)
                 if !inZone && !NSMouseInRect(mouse, keep, false) { closePanel(reason: "file moved away") }
                 return
             }
-            guard inZone, !panel.isVisible || model.phase == .idle else { cancelNear(); return }
+            guard inZone, !isOpen || model.phase == .idle else { cancelNear(); return }
             if pressCarriesFiles == nil {
                 let pasteboard = NSPasteboard(name: .drag)
                 guard pasteboard.changeCount != dragChangeCountAtPress else { return }   // Not a drag session (yet)
@@ -343,8 +346,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showPanel() {
         // SwiftUI applies the model change on its next update, so lay out first or the menu opens at its old height.
         hosting.layoutSubtreeIfNeeded()
+        isOpen = true
+        fadeGeneration += 1
         resizePanel(to: hosting.fittingSize)
+        // Fade in while sliding down a few points, like a menu dropping open.
+        let final = panel.frame
+        panel.alphaValue = 0
+        panel.setFrame(final.offsetBy(dx: 0, dy: 6), display: false)
         panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
+            panel.animator().setFrame(final, display: true)
+        }
         item.button?.highlight(true)
         Log.write("panel: shown at \(panel.frame) under icon \(item.button?.window?.frame ?? .zero) on \(panel.screen?.localizedName ?? "?")")
     }
@@ -357,12 +372,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopDragWatch()
         if let monitor = outsideClickMonitor { NSEvent.removeMonitor(monitor) }
         outsideClickMonitor = nil
-        panel.orderOut(nil)
+        isOpen = false
+        fadeGeneration += 1
+        let generation = fadeGeneration
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.12
+            panel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.fadeGeneration == generation else { return }   // Reopened meanwhile
+                self.panel.orderOut(nil)
+                self.panel.alphaValue = 1
+            }
+        })
         item.button?.highlight(false)
         model.reset()
     }
 
-    /// Top-anchored under the status item, left edges aligned like a menu, kept on its screen.
+    /// Top-anchored under the status item, centred on it, kept on its screen.
     private func resizePanel(to size: CGSize) {
         guard size.height > 0, let buttonWindow = item.button?.window else { return }
         var anchor = buttonWindow.frame
@@ -377,7 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.write("panel: status window frame unknown, anchoring to the pointer")
         }
         let visible = screen?.visibleFrame ?? .zero
-        var x = anchor.minX
+        var x = anchor.midX - size.width / 2
         if let screen { x = min(max(x, screen.frame.minX + 8), screen.frame.maxX - size.width - 8) }
         let top = min(anchor.minY - 2, visible.maxY)
         let frame = NSRect(x: x, y: top - size.height, width: size.width, height: size.height).integral
@@ -391,7 +418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard outsideClickMonitor == nil else { return }
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.panel.isVisible, self.model.phase == .idle || self.model.phase == .chooser else { return }
+                guard let self, self.isOpen, self.model.phase == .idle || self.model.phase == .chooser else { return }
                 // On macOS 27 a click on our own status icon also arrives here; the icon handles that one.
                 if let icon = self.item.button?.window?.frame, NSMouseInRect(NSEvent.mouseLocation, icon, false) { return }
                 self.closePanel(reason: "clicked outside")

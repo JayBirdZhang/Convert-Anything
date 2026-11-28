@@ -23,6 +23,12 @@ Every drag-state change is logged to `~/Library/Logs/DropZoneProto.log`.
 
 ## What it does
 
+- **Look and feel (after the first hand test):**
+  - The menu is centred under the icon.
+  - It fades in while sliding down 6 pt (0.16 s) and fades out (0.12 s).
+  - The wait before opening defaults to 0.1 s; the slider goes down to 0.
+  - Recent is hidden while a file is being dropped and shows only in the menu opened by a click.
+
 - **A file coming near opens the menu.** Hold a dragged file within 90 pt below the menu bar, inside a menu-wide band around the icon, for the wait time. The distance is adjustable from 20 to 300 pt. You never have to touch the top edge, where macOS opens Mission Control.
   - This works through a global monitor for mouse down, dragged and up only. macOS sends those only while a button is held, so idle cost stays zero, and mouse monitors need no permission.
   - The drag pasteboard's change count tells a real drag from a click-drag that carries nothing. Dragging the file well away closes the menu again.

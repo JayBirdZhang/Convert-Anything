@@ -32,8 +32,8 @@ import Observation
         Recent(name: "Essay.pdf", from: "docx", to: "pdf", date: Date().addingTimeInterval(-60 * 60 * 3)),
     ]
 
-    var springDelay: Double = UserDefaults.standard.object(forKey: "springDelay") as? Double ?? 0.3 {
-        didSet { UserDefaults.standard.set(springDelay, forKey: "springDelay") }
+    var springDelay: Double = UserDefaults.standard.object(forKey: "openDelay") as? Double ?? 0.1 {
+        didSet { UserDefaults.standard.set(springDelay, forKey: "openDelay") }
     }
 
     /// How far below the menu bar a dragged file opens the menu.

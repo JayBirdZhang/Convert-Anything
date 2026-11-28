@@ -28,8 +28,10 @@ struct MenuView: View {
             if model.phase != .idle { Divider().padding(.horizontal, 16) }
             header
             Divider().padding(.horizontal, 16)
-            recent
-            Divider().padding(.horizontal, 16)
+            if model.phase == .idle {   // Not while a file is being dropped
+                recent
+                Divider().padding(.horizontal, 16)
+            }
             tuning
             Divider().padding(.horizontal, 16)
             HStack {
@@ -170,7 +172,7 @@ struct MenuView: View {
                 Spacer()
                 Text(String(format: "%.2f s", model.springDelay)).monospacedDigit().foregroundStyle(.secondary)
             }
-            Slider(value: Binding(get: { model.springDelay }, set: { model.springDelay = ($0 * 20).rounded() / 20 }), in: 0.1...1.0).controlSize(.small)
+            Slider(value: Binding(get: { model.springDelay }, set: { model.springDelay = ($0 * 20).rounded() / 20 }), in: 0...1.0).controlSize(.small)
             HStack {
                 Text("Opens within")
                 Spacer()
