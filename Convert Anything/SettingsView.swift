@@ -118,6 +118,11 @@ struct SettingsView: View {
                        help: "When several files are renamed to .pdf at once, merge them into a single Combined.pdf in name order.") {
                 Toggle("Combine PDFs", isOn: $model.combinePDFs)
             }
+            CardDivider()
+            SettingRow("Remove location from photos",
+                       help: "Converted photos keep their date, camera details and orientation. On: leave out where they were taken (GPS).") {
+                Toggle("Remove location from photos", isOn: $model.removePhotoLocation)
+            }
         }
     }
 }

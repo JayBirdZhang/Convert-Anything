@@ -67,10 +67,12 @@ nonisolated enum VideoExport {
             presets.append(AVAssetExportPresetPassthrough)
         }
         presets.append(request.quality == .small ? AVAssetExportPreset1920x1080 : AVAssetExportPresetHighestQuality)
+        let metadata = await VideoMetadata.exportItems(for: asset)
 
         for (index, preset) in presets.enumerated() {
             do {
-                try await run(asset: asset, preset: preset, output: output, fileType: MediaConversion.fileType(request.to), progress: progress)
+                try await run(asset: asset, preset: preset, output: output, fileType: MediaConversion.fileType(request.to),
+                              metadata: metadata, progress: progress)
                 return
             } catch let error as ConversionError where error.isCancellation {
                 throw error
@@ -89,11 +91,12 @@ nonisolated enum VideoExport {
         return format == .mov || mp4Codecs.contains(codec)
     }
 
-    private static func run(asset: AVAsset, preset: String, output: URL, fileType: AVFileType,
+    private static func run(asset: AVAsset, preset: String, output: URL, fileType: AVFileType, metadata: [AVMetadataItem]?,
                             progress: @escaping @Sendable (Double) -> Void) async throws {
         guard let session = AVAssetExportSession(asset: asset, presetName: preset) else {
             throw ConversionError.failed("This video can't be converted.")
         }
+        if let metadata { session.metadata = metadata }
         session.shouldOptimizeForNetworkUse = fileType != .mov
         let box = SessionBox(session)
         try await withTaskCancellationHandler {
@@ -266,9 +269,10 @@ nonisolated enum GIFVideo {
 nonisolated enum AudioConversion {
     static func convert(_ request: Converter.Request, output: URL, progress: @escaping @Sendable (Double) -> Void) async throws {
         try await background {
+            let tags = request.from.kind == .audio && AudioTags.canWrite(request.to) ? await AudioTags.load(request.input, format: request.from) : nil
             let source = try await openPCMSource(request.input, isVideo: request.from.kind == .video)
             let sink: PCMSink = request.to == .mp3
-                ? try MP3Sink(url: output, format: source.format, quality: request.quality)
+                ? try MP3Sink(url: output, format: source.format, quality: request.quality, tag: tags?.id3v2() ?? Data())
                 : try CoreAudioSink(url: output, to: request.to, format: source.format, bitDepth: source.bitDepth, quality: request.quality)
             var written: AVAudioFramePosition = 0
             while let buffer = try source.read() {
@@ -279,6 +283,7 @@ nonisolated enum AudioConversion {
             }
             guard written > 0 else { throw ConversionError.failed("This file has no audio.") }
             try sink.finish()
+            if request.to != .mp3 { await tags?.write(to: output, as: request.to) }
         }
     }
 }
@@ -421,8 +426,10 @@ nonisolated private final class MP3Sink: PCMSink {
     private let handle: FileHandle
     private let channels: Int
     private var mp3 = [UInt8](repeating: 0, count: 1 << 18)
+    private let tagSize: UInt64
 
-    init(url: URL, format: AVAudioFormat, quality: Quality) throws {
+    /// `tag` (ID3v2, possibly empty) goes first, before the audio.
+    init(url: URL, format: AVAudioFormat, quality: Quality, tag: Data) throws {
         guard let lame = lame_init() else { throw ConversionError.failed("Couldn't start the MP3 encoder.") }
         self.lame = lame
         channels = min(Int(format.channelCount), 2)
@@ -435,8 +442,9 @@ nonisolated private final class MP3Sink: PCMSink {
             lame_close(lame)
             throw ConversionError.failed("MP3 can't use this audio's sample rate.")
         }
-        FileManager.default.createFile(atPath: url.path, contents: nil)
+        FileManager.default.createFile(atPath: url.path, contents: tag)
         handle = try FileHandle(forWritingTo: url)
+        tagSize = try handle.seekToEnd()
     }
 
     deinit { lame_close(lame) }
@@ -452,11 +460,11 @@ nonisolated private final class MP3Sink: PCMSink {
     func finish() throws {
         let count = lame_encode_flush(lame, &mp3, Int32(mp3.count))
         if count > 0 { try handle.write(contentsOf: mp3[0..<Int(count)]) }
-        // The header frame at the start of a VBR file lets players show the right duration.
-        let tagSize = lame_get_lametag_frame(lame, &mp3, mp3.count)
-        if tagSize > 0 && tagSize <= mp3.count {
-            try handle.seek(toOffset: 0)
-            try handle.write(contentsOf: mp3[0..<tagSize])
+        // The header frame at the start of a VBR file (right after the tags) lets players show the right duration.
+        let frameSize = lame_get_lametag_frame(lame, &mp3, mp3.count)
+        if frameSize > 0 && frameSize <= mp3.count {
+            try handle.seek(toOffset: tagSize)
+            try handle.write(contentsOf: mp3[0..<frameSize])
         }
         try handle.close()
     }

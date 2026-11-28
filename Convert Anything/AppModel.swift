@@ -118,6 +118,9 @@ enum OriginalsMode: String, CaseIterable {
     var exportAllPages: Bool {
         didSet { defaults.set(exportAllPages, forKey: Keys.allPages) }
     }
+    var removePhotoLocation: Bool {
+        didSet { defaults.set(removePhotoLocation, forKey: Keys.removePhotoLocation) }
+    }
     var launchAtLogin: Bool {
         didSet {
             guard launchAtLogin != (SMAppService.mainApp.status == .enabled) else { return }
@@ -178,6 +181,7 @@ enum OriginalsMode: String, CaseIterable {
         static let notifications = "showNotifications"
         static let allPages = "exportAllPages"
         static let editableSlides = "editableSlides"
+        static let removePhotoLocation = "removePhotoLocation"
     }
 
     init() {
@@ -192,6 +196,7 @@ enum OriginalsMode: String, CaseIterable {
         showNotifications = defaults.object(forKey: Keys.notifications) as? Bool ?? true
         exportAllPages = defaults.object(forKey: Keys.allPages) as? Bool ?? true
         editableSlides = defaults.object(forKey: Keys.editableSlides) as? Bool ?? true
+        removePhotoLocation = defaults.bool(forKey: Keys.removePhotoLocation)
         launchAtLogin = SMAppService.mainApp.status == .enabled
 
         UNUserNotificationCenter.current().delegate = notificationDelegate
@@ -333,6 +338,7 @@ enum OriginalsMode: String, CaseIterable {
             // Work on a private copy (an instant clone on APFS) so the user's file is untouched until the end.
             let input = workDir.appending(path: "input.\(job.from.rawValue)")
             try fileManager.copyItem(at: job.fileURL, to: input)
+            let dates = OriginalDates(of: job.fileURL)   // The result keeps them, whatever its format
 
             let request = Converter.Request(
                 input: input, from: job.from, to: job.to, workDir: workDir,
@@ -341,7 +347,8 @@ enum OriginalsMode: String, CaseIterable {
                 allPages: exportAllPages,
                 outputExtension: job.fileURL.pathExtension.lowercased(),
                 editableSlides: editableSlides,
-                quality: quality)
+                quality: quality,
+                keepsLocation: !removePhotoLocation)
             let output = try await Converter.convert(request) { progress in
                 Task { @MainActor in
                     if job.isActive { job.state = .converting(progress: progress) }
@@ -378,10 +385,12 @@ enum OriginalsMode: String, CaseIterable {
                 try fileManager.removeItem(at: job.fileURL)
                 job.resultURL = folder
                 job.pageCount = try fileManager.contentsOfDirectory(atPath: folder.path).count
+                dates.apply(to: folder)
             } else {
                 // Write the new contents into the renamed file itself rather than swapping in a new file,
                 // so it stays the same file to Finder (keeping its tags and Finder's ⌘Z for the rename).
                 try overwrite(job.fileURL, with: output)
+                dates.apply(to: job.fileURL)
                 job.resultURL = job.fileURL
                 if let trashed = job.originalInTrash {
                     undoStore.add(UndoRecord(converted: job.fileURL.path, original: job.originalURL.path,
