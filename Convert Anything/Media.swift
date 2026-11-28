@@ -325,7 +325,7 @@ nonisolated private final class FileSource: PCMSource {
 /// FLAC in blocks of under 192 frames (ffmpeg writes these from MP3s), which Core Audio's FLAC decoder refuses
 /// to set up for. It decodes them fine when told the blocks are longer, since each frame's header gives its real
 /// length, so this reads the packets itself and describes them as 4096-frame blocks.
-nonisolated private final class ShortBlockFLACSource: PCMSource {
+nonisolated final class ShortBlockFLACSource: PCMSource {
     let format: AVAudioFormat
     let length: AVAudioFramePosition
     let bitDepth: UInt32
@@ -336,7 +336,25 @@ nonisolated private final class ShortBlockFLACSource: PCMSource {
 
     static func isNeeded(for file: AVAudioFile) -> Bool {
         let description = file.fileFormat.streamDescription.pointee
-        return description.mFormatID == kAudioFormatFLAC && description.mFramesPerPacket < 192
+        return description.mFormatID == kAudioFormatFLAC && (1..<192).contains(description.mFramesPerPacket)
+    }
+
+    /// Decodes the whole file into a 16-bit file at `url`, for code that needs an AVAudioFile it can read.
+    static func decode(_ input: URL, file: AVAudioFile, to url: URL) throws -> AVAudioFile {
+        let source = try ShortBlockFLACSource(url: input, file: file)
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false, AVSampleRateKey: source.format.sampleRate,
+            AVNumberOfChannelsKey: source.format.channelCount,
+        ]
+        do {   // The written file is finished when `output` goes away
+            let output = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            while let buffer = try source.read() {
+                try Task.checkCancellation()
+                try output.write(from: buffer)
+            }
+        }
+        return try AVAudioFile(forReading: url)
     }
 
     init(url: URL, file: AVAudioFile) throws {

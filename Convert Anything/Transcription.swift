@@ -43,7 +43,11 @@ nonisolated enum Transcription {
     /// Audio files are read as they are. A video's sound is first decoded into a small 16 kHz mono file
     /// (all speech recognition needs), streaming, so the whole soundtrack is never in memory.
     private static func openAudio(_ request: Converter.Request, progress: @Sendable (Double) -> Void) async throws -> AVAudioFile {
-        if request.from.kind == .audio, let file = try? AVAudioFile(forReading: request.input) { return file }
+        if request.from.kind == .audio, let file = try? AVAudioFile(forReading: request.input) {
+            // Core Audio can open this kind of FLAC but not decode it.
+            guard ShortBlockFLACSource.isNeeded(for: file) else { return file }
+            return try ShortBlockFLACSource.decode(request.input, file: file, to: request.workDir.appending(path: "decoded.caf"))
+        }
 
         let asset = AVURLAsset(url: request.input)
         guard let track = try? await asset.loadTracks(withMediaType: .audio).first else {
