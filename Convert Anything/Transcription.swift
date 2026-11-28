@@ -1,24 +1,28 @@
 import AVFoundation
 import Speech
+import os
 
 /// Writes down what's said in audio and video, entirely on this Mac: SpeechAnalyzer on macOS 26 and later,
-/// the older SFSpeechRecognizer (forced to stay on-device) before that. Nothing is uploaded.
+/// the older SFSpeechRecognizer (forced to stay on-device) before that, and also whenever SpeechAnalyzer
+/// fails or stops making progress. Nothing is uploaded.
 nonisolated enum Transcription {
+    /// Read back by bug reports, so every line says what happened without naming the file or quoting it.
+    static let log = Logger(subsystem: "io.github.jaybirdzhang.ConvertAnything", category: "transcription")
+
     @concurrent
     static func convert(_ request: Converter.Request, output: URL, progress: @escaping @Sendable (Double) -> Void) async throws {
         let audio = try await openAudio(request, progress: progress)
         let duration = Double(audio.length) / audio.processingFormat.sampleRate
         guard duration > 0 else { throw ConversionError.failed("This file has no sound to transcribe.") }
         // A video's soundtrack was decoded first and already filled the first 5% of the bar.
-        let base = audio.url.lastPathComponent == extractedName ? 0.05 : 0
+        let isVideo = audio.url.lastPathComponent == extractedName
+        let base = isVideo ? 0.05 : 0
         let progress: @Sendable (Double) -> Void = { progress(base + (1 - base) * $0) }
 
-        var tokens: [Transcript.Token]
-        if #available(macOS 26, *), SpeechTranscriber.isAvailable, !forceLegacy {
-            tokens = try await ModernEngine.transcribe(audio, duration: duration, progress: progress)
-        } else {
-            tokens = try await LegacyEngine.transcribe(audio, duration: duration, progress: progress)
-        }
+        log.notice("Transcribing \(Int(duration.rounded()), privacy: .public) s of \(isVideo ? "video soundtrack" : "audio", privacy: .public) on macOS \(ProcessInfo.processInfo.operatingSystemVersionString, privacy: .public)")
+        let started = ContinuousClock.now
+        var tokens = try await transcribe(audio.url, duration: duration, progress: progress)
+        log.notice("Transcribed in \(elapsed(since: started), privacy: .public) s")
         tokens.removeAll { $0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !tokens.isEmpty else { throw ConversionError.failed("No speech was found in this file.") }
 
@@ -31,13 +35,77 @@ nonisolated enum Transcription {
         try text.write(to: output, atomically: true, encoding: .utf8)
     }
 
-    /// Lets tests try the pre-macOS 26 engine on a newer Mac.
-    private static var forceLegacy: Bool {
-        #if DEBUG
-        ProcessInfo.processInfo.environment["CONVERT_ANYTHING_LEGACY_SPEECH"] != nil
-        #else
-        false
-        #endif
+    /// SpeechAnalyzer when it's there, and SFSpeechRecognizer when it isn't or when it fails, in the language
+    /// SpeechAnalyzer picked if it got that far.
+    private static func transcribe(_ url: URL, duration: Double, progress: @escaping @Sendable (Double) -> Void) async throws -> [Transcript.Token] {
+        var language: Locale?
+        var modernFailure: Error?
+        if #available(macOS 26, *), !Debug.isOn("CONVERT_ANYTHING_LEGACY_SPEECH") {
+            if SpeechTranscriber.isAvailable {
+                log.notice("Engine: SpeechAnalyzer")
+                do {
+                    return try await ModernEngine.transcribe(url, duration: duration, language: &language, progress: progress)
+                } catch {
+                    if Task.isCancelled || isCancellation(error) { throw ConversionError.cancelled }
+                    modernFailure = error
+                    log.error("SpeechAnalyzer failed: \(describe(error), privacy: .public). Falling back to SFSpeechRecognizer")
+                }
+            } else {
+                log.notice("Engine: SFSpeechRecognizer, because SpeechTranscriber isn't available on this Mac")
+            }
+        } else {
+            log.notice("Engine: SFSpeechRecognizer")
+        }
+        do {
+            return try await LegacyEngine.transcribe(url, duration: duration, language: language, progress: progress)
+        } catch let unavailable as LegacyEngine.Unavailable {
+            log.error("SFSpeechRecognizer can't run: \(String(describing: unavailable), privacy: .public)")
+            throw ConversionError.failed(message(for: unavailable, after: modernFailure))
+        } catch is Stalled {
+            throw ConversionError.failed("Speech recognition stopped responding. Try again, or restart your Mac if it keeps happening.")
+        } catch {
+            if Task.isCancelled || isCancellation(error) { throw ConversionError.cancelled }
+            log.error("SFSpeechRecognizer failed: \(describe(error), privacy: .public)")
+            throw error
+        }
+    }
+
+    /// What to tell someone when neither engine could run: the fix for the first engine's problem when
+    /// there is one (going online for a missing model), otherwise the fix that lets the older one run.
+    private static func message(for legacy: LegacyEngine.Unavailable, after modern: Error?) -> String {
+        guard let modern else { return legacy.message }
+        if case .download(let locale) = modern as? ModernFailure {
+            return "The speech model for \(languageName(locale)) isn't on this Mac yet and couldn't be downloaded. Connect to the internet once and try again."
+        }
+        let lead = modern is Stalled ? "Speech recognition stopped responding" : "Speech recognition failed"
+        switch legacy {
+        case .notAllowed:
+            return "\(lead). To use the older recognizer instead, allow Convert Anything in System Settings › Privacy & Security › Speech Recognition, then try again."
+        case .notOnDevice(let locale):
+            return "\(lead), and this Mac can't recognize \(languageName(locale)) speech any other way without the internet. Turn on Dictation in System Settings › Keyboard to download it, then try again."
+        case .noRecognizer:
+            return "\(lead). Try again, or restart your Mac if it keeps happening."
+        }
+    }
+
+    static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if case .cancelled? = error as? ConversionError { return true }
+        return false
+    }
+
+    /// The error's kind and code for the log; its text can quote a path, so that stays private.
+    static func describe(_ error: Error) -> String {
+        if let stalled = error as? Stalled { return "\(stalled.step) made no progress for \(stalled.seconds) s" }
+        if let failure = error as? ModernFailure { return String(describing: failure) }
+        let nsError = error as NSError
+        log.debug("Error text: \(nsError.localizedDescription, privacy: .private)")
+        return "\(type(of: error)) \(nsError.domain) \(nsError.code)"
+    }
+
+    static func elapsed(since start: ContinuousClock.Instant) -> String {
+        let duration = ContinuousClock.now - start
+        return String(format: "%.2f", Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18)
     }
 
     /// Audio files are read as they are. A video's sound is first decoded into a small 16 kHz mono file
@@ -95,64 +163,522 @@ nonisolated enum Transcription {
     }
 }
 
+// MARK: - Never waiting forever
+
+/// How long each step may go without progress before it counts as stuck. Long files and slow downloads
+/// are fine; these only measure time in which nothing at all moved.
+nonisolated enum StallLimit {
+    /// Locale lookups and format queries, which take milliseconds.
+    static var lookup: Duration { Debug.stallSeconds ?? .seconds(30) }
+    /// The model download reports progress about every 2 seconds, even on a slow connection.
+    static var download: Duration { Debug.stallSeconds ?? .seconds(90) }
+    /// The language sample takes about a second.
+    static var detection: Duration { Debug.stallSeconds ?? .seconds(30) }
+    /// SpeechAnalyzer asks for more audio, or hands back text, many times a second; the first time a model
+    /// is loaded after a download can take a while longer.
+    static var analysis: Duration { Debug.stallSeconds ?? .seconds(60) }
+    /// The older recognizer reports once per piece of up to 55 seconds, at least twice as fast as it plays.
+    static var legacyPiece: Duration { Debug.stallSeconds ?? .seconds(120) }
+    /// The system's permission prompt, which waits for the person to answer it.
+    static var permission: Duration { Debug.stallSeconds.map { $0 * 2 } ?? .seconds(180) }
+    /// How long a cancelled step gets to wind down before it's left behind.
+    static let windDown: Duration = .seconds(5)
+}
+
+/// A step that went `seconds` without progress and was stopped.
+nonisolated struct Stalled: Error {
+    let step: String
+    let seconds: Int
+}
+
+/// Lets a watched step report that it's still moving.
+nonisolated final class Heartbeat: @unchecked Sendable {
+    private let lock = NSLock()
+    // The suspending clock stands still while the Mac sleeps, so a nap isn't taken for a stall.
+    private var last = SuspendingClock.now
+
+    func beat() { lock.withLock { last = .now } }
+    var idle: Duration { SuspendingClock.now - lock.withLock { last } }
+}
+
+extension Transcription {
+    /// Runs `operation` and returns what it returns, unless it goes `limit` without calling `beat()`. Then it's
+    /// cancelled, given a few seconds to wind down, and left behind if it still hasn't (a system call that
+    /// ignores cancellation), so the conversion ends with `Stalled` instead of waiting forever.
+    nonisolated static func watch<T: Sendable>(_ step: String, limit: Duration,
+                                               _ operation: @escaping @Sendable (Heartbeat) async throws -> T) async throws -> T {
+        let heartbeat = Heartbeat()
+        let outcome = Outcome<T>()
+        let work = Task {
+            let result: Result<T, Error>
+            do { result = .success(try await operation(heartbeat)) } catch { result = .failure(error) }
+            outcome.workEnded(with: result)
+        }
+        let watchdog = Task {
+            while !outcome.isDelivered && !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard heartbeat.idle >= limit, outcome.beginStopping() else { continue }
+                let seconds = Int(limit.components.seconds)
+                log.error("\(step, privacy: .public) made no progress for \(seconds, privacy: .public) s; stopping it")
+                work.cancel()
+                let deadline = ContinuousClock.now + StallLimit.windDown
+                while !outcome.hasEnded && ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(100)) }
+                if !outcome.hasEnded { log.error("\(step, privacy: .public) didn't stop when cancelled; leaving it behind") }
+                outcome.deliver(.failure(Stalled(step: step, seconds: seconds)))
+            }
+        }
+        defer { watchdog.cancel() }
+        return try await withTaskCancellationHandler {
+            try await outcome.value()
+        } onCancel: {
+            work.cancel()
+            outcome.deliver(.failure(CancellationError()))
+        }
+    }
+
+    /// Hands a watched step's result, or its stall, to the waiting task exactly once.
+    private nonisolated final class Outcome<T: Sendable>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<T, Error>?
+        private var result: Result<T, Error>?
+        private var stopping = false
+        private var ended = false
+
+        var isDelivered: Bool { lock.withLock { result != nil } }
+        var hasEnded: Bool { lock.withLock { ended } }
+
+        /// True the first time, when the step is still running and its own result should no longer count.
+        func beginStopping() -> Bool {
+            lock.withLock {
+                guard result == nil, !stopping else { return false }
+                stopping = true
+                return true
+            }
+        }
+
+        func workEnded(with result: Result<T, Error>) {
+            let stopping = lock.withLock { ended = true; return self.stopping }
+            if !stopping { deliver(result) }
+        }
+
+        func deliver(_ newResult: Result<T, Error>) {
+            let continuation = lock.withLock { () -> CheckedContinuation<T, Error>? in
+                guard result == nil else { return nil }
+                result = newResult
+                defer { self.continuation = nil }
+                return self.continuation
+            }
+            continuation?.resume(with: newResult)
+        }
+
+        func value() async throws -> T {
+            try await withCheckedThrowingContinuation { continuation in
+                let ready = lock.withLock { () -> Result<T, Error>? in
+                    if result == nil { self.continuation = continuation }
+                    return result
+                }
+                if let ready { continuation.resume(with: ready) }
+            }
+        }
+    }
+}
+
+/// Switches for trying each failure on a Mac where nothing fails. Debug builds only.
+nonisolated enum Debug {
+    static func isOn(_ name: String) -> Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.environment[name] != nil
+        #else
+        false
+        #endif
+    }
+
+    /// CONVERT_ANYTHING_STALL_SECONDS shortens every stall limit, so the stall switches can be tried quickly.
+    static var stallSeconds: Duration? {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["CONVERT_ANYTHING_STALL_SECONDS"].flatMap(Int.init).map { .seconds($0) }
+        #else
+        nil
+        #endif
+    }
+
+    /// What a stuck system call looks like: it never returns, and cancelling it does nothing.
+    static func hang() async {
+        await withUnsafeContinuation { (_: UnsafeContinuation<Void, Never>) in }
+    }
+}
+
+/// Why SpeechAnalyzer couldn't be used, for the log and for choosing what to tell the person.
+nonisolated enum ModernFailure: Error, CustomStringConvertible {
+    case unavailable(String)
+    case download(Locale)
+
+    var description: String {
+        switch self {
+        case .unavailable(let reason): "unavailable (\(reason))"
+        case .download(let locale): "the \(locale.identifier) model couldn't be downloaded"
+        }
+    }
+}
+
+// MARK: - Languages
+
+/// Apple's recognizers can't tell which language is spoken, so it comes from the languages set on this Mac.
+nonisolated enum SpeechLanguages {
+    /// The recognizer locale for a preferred language: the same language and script, in the region the
+    /// language names, else this Mac's region, else the language's usual one. Always the same answer for
+    /// the same list (`supportedLocale(equivalentTo:)` picks a different Spanish each time for es-419).
+    static func match(_ identifier: String, in locales: [Locale]) -> Locale? {
+        let wanted = Locale.Language(identifier: Locale.Language(identifier: identifier).maximalIdentifier)
+        guard let code = wanted.languageCode else { return nil }
+        let same = locales.filter {
+            let language = Locale.Language(identifier: $0.language.maximalIdentifier)
+            return language.languageCode == code && language.script == wanted.script
+        }
+        guard !same.isEmpty else { return nil }
+        let usual = Locale.Language(identifier: Locale.Language(identifier: code.identifier).maximalIdentifier).region
+        for region in [Locale(identifier: identifier).region, Locale.current.region, wanted.region, usual].compactMap({ $0 }) {
+            if let found = same.first(where: { $0.region == region }) { return found }
+        }
+        return same.min { $0.identifier < $1.identifier }
+    }
+
+    static var preferred: [String] { Locale.preferredLanguages.isEmpty ? ["en-US"] : Locale.preferredLanguages }
+}
+
+/// Reads a file as the analyzer wants it, a second at a time, so the analyzer pulls audio only as fast as it
+/// works through it, and each pull shows it's still moving.
+nonisolated final class AnalyzerAudio: @unchecked Sendable {
+    let format: AVAudioFormat
+    private let file: AVAudioFile
+    private let converter: AVAudioConverter
+    private let input: AVAudioPCMBuffer
+    private var inputEnded = false
+    private(set) var ended = false
+    /// Frames handed out so far, in `format`.
+    private(set) var position: AVAudioFramePosition = 0
+
+    /// A fresh file for each pass, since a file remembers where it was read to.
+    init(_ url: URL, as format: AVAudioFormat) throws {
+        file = try AVAudioFile(forReading: url)
+        self.format = format
+        guard let converter = AVAudioConverter(from: file.processingFormat, to: format),
+              let input = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 32_768) else {
+            throw ConversionError.failed("Couldn't read this file's sound.")
+        }
+        self.converter = converter
+        self.input = input
+    }
+
+    var seconds: Double { Double(position) / format.sampleRate }
+
+    /// The next second of audio, or nil at the end.
+    func next() throws -> AVAudioPCMBuffer? {
+        guard !ended else { return nil }
+        guard let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(format.sampleRate)) else { return nil }
+        var readError: Error?
+        let status = converter.convert(to: output, error: nil) { [self] _, inputStatus in
+            if !inputEnded {
+                do { try file.read(into: input) } catch { readError = error }
+                if input.frameLength == 0 || readError != nil { inputEnded = true }
+            }
+            if inputEnded {
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+            inputStatus.pointee = .haveData
+            return input
+        }
+        if let readError, file.framePosition < file.length { throw readError }
+        if status == .error { throw ConversionError.failed("Couldn't read this file's sound.") }
+        if status == .endOfStream || output.frameLength == 0 { ended = true }
+        guard output.frameLength > 0 else { return nil }
+        position += AVAudioFramePosition(output.frameLength)
+        return output
+    }
+
+    /// Whether any twentieth of a second is louder than about -40 dB, the same line the older engine uses
+    /// for a pause.
+    static func hasSound(_ buffer: AVAudioPCMBuffer) -> Bool {
+        let count = Int(buffer.frameLength), window = max(1, Int(buffer.format.sampleRate / 20))
+        func loud(_ value: (Int) -> Float) -> Bool {
+            var position = 0
+            while position < count {
+                let end = min(count, position + window)
+                var energy: Float = 0
+                for index in position..<end { let sample = value(index); energy += sample * sample }
+                if energy / Float(end - position) >= 1e-4 { return true }
+                position = end
+            }
+            return false
+        }
+        if let data = buffer.int16ChannelData { return loud { Float(data[0][$0]) / 32_768 } }
+        if let data = buffer.floatChannelData { return loud { data[0][$0] } }
+        return true
+    }
+}
+
 // MARK: - macOS 26 and later
 
-/// SpeechAnalyzer reads the file itself, as fast as the Neural Engine allows, with no length limit.
+/// SpeechAnalyzer works through the file as fast as the Neural Engine allows, with no length limit.
 @available(macOS 26, *)
 nonisolated private enum ModernEngine {
-    static func transcribe(_ audio: AVAudioFile, duration: Double, progress: @escaping @Sendable (Double) -> Void) async throws -> [Transcript.Token] {
-        var locale = await SpeechTranscriber.supportedLocale(equivalentTo: .current)
-        if locale == nil { locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) }
-        guard let locale else {
-            throw ConversionError.failed("Speech recognition isn't available on this Mac.")
-        }
-        let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [],
-                                            attributeOptions: [.audioTimeRange])
-        // Each language's model is a separate system download, made the first time it's needed.
-        if let installation = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-            let watcher = Task {
-                while !Task.isCancelled {
-                    progress(installation.progress.fractionCompleted)
-                    try? await Task.sleep(for: .milliseconds(250))
-                }
-            }
-            defer { watcher.cancel() }
-            do {
-                try await installation.downloadAndInstall()
-            } catch {
-                if Task.isCancelled { throw ConversionError.cancelled }
-                throw ConversionError.failed("The speech model for \(Transcription.languageName(locale)) isn't on this Mac yet and couldn't be downloaded. Connect to the internet once and try again.")
-            }
-        }
+    /// Seconds of speech heard in each candidate language to choose between them.
+    static let sampleSeconds = 15
 
-        // Released as soon as the file is done, so the model doesn't sit in memory while the app idles.
-        let analyzer = SpeechAnalyzer(modules: [transcriber], options: .init(priority: .utility, modelRetention: .whileInUse))
-        let collector = Task {
-            var tokens: [Transcript.Token] = []
-            for try await result in transcriber.results {
-                append(result, to: &tokens)
-                progress(min(1, result.range.end.seconds / duration))
+    /// `language` is set as soon as it's known, so a fallback to the older engine can keep it.
+    static func transcribe(_ url: URL, duration: Double, language: inout Locale?,
+                           progress: @escaping @Sendable (Double) -> Void) async throws -> [Transcript.Token] {
+        if Debug.isOn("CONVERT_ANYTHING_NO_MODERN_SPEECH") { throw ModernFailure.unavailable("switched off for testing") }
+        let log = Transcription.log
+        let (primary, candidates) = try await Transcription.watch("Language lookup", limit: StallLimit.lookup) { _ in
+            await languages()
+        }
+        language = primary
+        log.notice("Preferred languages \(SpeechLanguages.preferred, privacy: .public); main language \(primary.identifier, privacy: .public); candidates \(candidates.map(\.identifier), privacy: .public)")
+        // Without the main language's model, the older engine in that language is the better bet than
+        // another language's model.
+        try await install(primary, simulatingStall: Debug.isOn("CONVERT_ANYTHING_STALL_DOWNLOAD"), progress: progress)
+
+        var chosen = candidates[0]
+        if candidates.count > 1 {
+            do {
+                let (best, sample) = try await Transcription.watch("Language detection", limit: StallLimit.detection) { heartbeat in
+                    try await detect(url, among: candidates, heartbeat: heartbeat)
+                }
+                chosen = best
+                language = best
+                if let sample {
+                    log.notice("The sample was the whole file; using its transcript")
+                    progress(1)
+                    return sample
+                }
+            } catch {
+                if Task.isCancelled || Transcription.isCancellation(error) { throw error }
+                log.error("Language detection failed: \(Transcription.describe(error), privacy: .public). Using \(chosen.identifier, privacy: .public)")
             }
-            return tokens
+        }
+        if chosen != primary { try await install(chosen, progress: progress) }
+        return try await analyze(url, in: chosen, duration: duration, progress: progress)
+    }
+
+    /// The first preferred language SpeechTranscriber knows (English if none), then every other preferred
+    /// language whose model is already on this Mac. Models are never downloaded just to compare.
+    private static func languages() async -> (primary: Locale, candidates: [Locale]) {
+        let installed = await SpeechTranscriber.installedLocales
+        var supported: [Locale]?
+        var primary: Locale?
+        var others: [Locale] = []
+        for identifier in SpeechLanguages.preferred {
+            if let locale = SpeechLanguages.match(identifier, in: installed) {
+                if primary == nil { primary = locale } else if locale != primary && !others.contains(locale) { others.append(locale) }
+            } else if primary == nil {
+                if supported == nil { supported = await SpeechTranscriber.supportedLocales }
+                primary = SpeechLanguages.match(identifier, in: supported ?? [])
+            }
+        }
+        if primary == nil {
+            if supported == nil { supported = await SpeechTranscriber.supportedLocales }
+            primary = SpeechLanguages.match("en-US", in: supported ?? []) ?? Locale(identifier: "en_US")
+        }
+        let main = primary ?? Locale(identifier: "en_US")
+        return (main, [main] + others.filter { $0 != main })
+    }
+
+    private static func transcriber(_ locale: Locale, confidence: Bool = false) -> SpeechTranscriber {
+        SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [],
+                          attributeOptions: confidence ? [.audioTimeRange, .transcriptionConfidence] : [.audioTimeRange])
+    }
+
+    /// Each language's model is a separate system download, made the first time it's needed.
+    private static func install(_ locale: Locale, simulatingStall simulateStall: Bool = false,
+                                progress: @escaping @Sendable (Double) -> Void) async throws {
+        let log = Transcription.log
+        let modules = [transcriber(locale)]
+        let started = ContinuousClock.now
+        do {
+            let downloaded = try await Transcription.watch("Model download", limit: StallLimit.download) { heartbeat -> Bool in
+                if simulateStall {
+                    log.notice("Model for \(locale.identifier, privacy: .public): downloading (simulated stall)")
+                    progress(0.16)
+                    await Debug.hang()
+                }
+                guard let installation = try await AssetInventory.assetInstallationRequest(supporting: modules) else {
+                    return false
+                }
+                log.notice("Model for \(locale.identifier, privacy: .public): downloading")
+                heartbeat.beat()
+                let watcher = Task {
+                    var last = -1.0, logged = -1
+                    while !Task.isCancelled {
+                        let fraction = installation.progress.fractionCompleted
+                        if fraction != last {
+                            last = fraction
+                            heartbeat.beat()
+                            progress(fraction)
+                            if Int(fraction * 10) > logged {
+                                logged = Int(fraction * 10)
+                                log.notice("Model download \(logged * 10, privacy: .public)%")
+                            }
+                        }
+                        try? await Task.sleep(for: .milliseconds(250))
+                    }
+                }
+                defer { watcher.cancel() }
+                try await installation.downloadAndInstall()
+                return true
+            }
+            if downloaded {
+                log.notice("Model for \(locale.identifier, privacy: .public): downloaded in \(Transcription.elapsed(since: started), privacy: .public) s")
+            } else {
+                log.notice("Model for \(locale.identifier, privacy: .public): already installed")
+            }
+        } catch {
+            if Task.isCancelled || Transcription.isCancellation(error) { throw ConversionError.cancelled }
+            log.error("Model for \(locale.identifier, privacy: .public): \(Transcription.describe(error), privacy: .public)")
+            throw ModernFailure.download(locale)
+        }
+    }
+
+    /// Transcribes about 15 seconds of speech, from the first sound on, in every candidate language at once
+    /// (one analyzer, one model per language), and keeps the language the recognizer was surest of. When the
+    /// sample turns out to be the whole file, its transcript is the result too.
+    private static func detect(_ url: URL, among candidates: [Locale], heartbeat: Heartbeat) async throws -> (Locale, [Transcript.Token]?) {
+        let log = Transcription.log
+        let started = ContinuousClock.now
+        let transcribers = candidates.map { transcriber($0, confidence: true) }
+        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: transcribers) else {
+            throw ModernFailure.unavailable("no audio format for the sample")
+        }
+        let audio = try AnalyzerAudio(url, as: format)
+        // Skip the silence before the first sound, then take the sample, and a little more rather than
+        // leaving a sliver of the file unheard.
+        var sample: [AnalyzerInput] = []
+        var lengths: [Int] = []
+        let wanted = Int(format.sampleRate) * sampleSeconds, enough = Int(format.sampleRate) * (sampleSeconds + 5)
+        while let buffer = try audio.next() {
+            heartbeat.beat()
+            if sample.isEmpty {
+                guard AnalyzerAudio.hasSound(buffer) else { continue }
+                let start = CMTime(value: audio.position - AVAudioFramePosition(buffer.frameLength), timescale: CMTimeScale(format.sampleRate))
+                sample.append(AnalyzerInput(buffer: buffer, bufferStartTime: start))
+            } else {
+                sample.append(AnalyzerInput(buffer: buffer))
+            }
+            lengths.append(Int(buffer.frameLength))
+            if lengths.reduce(0, +) >= enough { break }
+        }
+        let wholeFile = audio.ended
+        guard !sample.isEmpty else {
+            log.notice("Language detection: no sound found; using \(candidates[0].identifier, privacy: .public)")
+            return (candidates[0], wholeFile ? [] : nil)
+        }
+        if !wholeFile {
+            while lengths.count > 1 && lengths.reduce(0, +) - lengths[lengths.count - 1] >= wanted {
+                lengths.removeLast()
+                sample.removeLast()
+            }
+        }
+        let sampleSeconds = Double(lengths.reduce(0, +)) / format.sampleRate
+
+        let analyzer = SpeechAnalyzer(modules: transcribers, options: .init(priority: .utility, modelRetention: .whileInUse))
+        let collectors = transcribers.map { transcriber in
+            Task { () -> (confidence: Double, words: Int, tokens: [Transcript.Token]) in
+                var total = 0.0, words = 0
+                var tokens: [Transcript.Token] = []
+                for try await result in transcriber.results {
+                    heartbeat.beat()
+                    for run in result.text.runs {
+                        if let confidence = run.transcriptionConfidence { total += confidence; words += 1 }
+                    }
+                    append(result, to: &tokens)
+                }
+                return (words > 0 ? total / Double(words) : 0, words, tokens)
+            }
+        }
+        let inputs = sample
+        let stream = AsyncStream<AnalyzerInput> { continuation in
+            for input in inputs { continuation.yield(input) }
+            continuation.finish()
         }
         do {
             try await withTaskCancellationHandler {
-                if let end = try await analyzer.analyzeSequence(from: audio) {
+                if let end = try await analyzer.analyzeSequence(stream) {
                     try await analyzer.finalizeAndFinish(through: end)
                 } else {
                     await analyzer.cancelAndFinishNow()
                 }
             } onCancel: {
                 Task { await analyzer.cancelAndFinishNow() }
+                for collector in collectors { collector.cancel() }
             }
         } catch {
-            // Finishing the analyzer ends the results too, so the collector can't be left waiting.
-            await analyzer.cancelAndFinishNow()
-            collector.cancel()
-            throw Task.isCancelled ? ConversionError.cancelled : error
+            Task { await analyzer.cancelAndFinishNow() }
+            for collector in collectors { collector.cancel() }
+            throw error
         }
-        let tokens = try await collector.value
+        var scores: [(confidence: Double, words: Int, tokens: [Transcript.Token])] = []
+        for collector in collectors { scores.append(try await collector.value) }
+
+        // The highest average confidence per word; on a tie, the language listed first.
+        var best = 0
+        for index in scores.indices where scores[index].words > 0 && scores[index].confidence > scores[best].confidence { best = index }
+        let summary = zip(candidates, scores).map { "\($0.identifier) \(String(format: "%.3f", $1.confidence)) (\($1.words) words)" }
+        log.notice("Language detection on \(Int(sampleSeconds.rounded()), privacy: .public) s: \(summary.joined(separator: ", "), privacy: .public) → \(candidates[best].identifier, privacy: .public), in \(Transcription.elapsed(since: started), privacy: .public) s")
+        return (candidates[best], wholeFile ? scores[best].tokens : nil)
+    }
+
+    private static func analyze(_ url: URL, in locale: Locale, duration: Double,
+                                progress: @escaping @Sendable (Double) -> Void) async throws -> [Transcript.Token] {
+        let log = Transcription.log
+        let transcriber = transcriber(locale)
+        let format = try await Transcription.watch("Audio format lookup", limit: StallLimit.lookup) { _ in
+            await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+        }
+        guard let format else { throw ModernFailure.unavailable("no audio format for \(locale.identifier)") }
+        let stallAnalyzer = Debug.isOn("CONVERT_ANYTHING_STALL_ANALYZER"), stallResults = Debug.isOn("CONVERT_ANYTHING_STALL_RESULTS")
+        log.notice("Analyzer starting in \(locale.identifier, privacy: .public), \(Int(format.sampleRate), privacy: .public) Hz")
+        let started = ContinuousClock.now
+        let tokens = try await Transcription.watch("Analyzer", limit: StallLimit.analysis) { heartbeat in
+            let audio = try AnalyzerAudio(url, as: format)
+            // Released as soon as the file is done, so the model doesn't sit in memory while the app idles.
+            let analyzer = SpeechAnalyzer(modules: [transcriber], options: .init(priority: .utility, modelRetention: .whileInUse))
+            let collector = Task {
+                var tokens: [Transcript.Token] = []
+                for try await result in transcriber.results {
+                    heartbeat.beat()
+                    append(result, to: &tokens)
+                    progress(min(1, result.range.end.seconds / duration))
+                }
+                if stallResults { await Debug.hang() }
+                return tokens
+            }
+            let input = AsyncThrowingStream<AnalyzerInput, Error> {
+                heartbeat.beat()
+                if stallAnalyzer && audio.seconds >= duration * 0.2 { await Debug.hang() }
+                return try audio.next().map { AnalyzerInput(buffer: $0) }
+            }
+            do {
+                try await withTaskCancellationHandler {
+                    if let end = try await analyzer.analyzeSequence(input) {
+                        try await analyzer.finalizeAndFinish(through: end)
+                    } else {
+                        await analyzer.cancelAndFinishNow()
+                    }
+                } onCancel: {
+                    Task { await analyzer.cancelAndFinishNow() }
+                    collector.cancel()
+                }
+            } catch {
+                // Finishing the analyzer ends the results too, so the collector can't be left waiting.
+                Task { await analyzer.cancelAndFinishNow() }
+                collector.cancel()
+                throw Task.isCancelled ? ConversionError.cancelled : error
+            }
+            return try await collector.value
+        }
         if Task.isCancelled { throw ConversionError.cancelled }
+        log.notice("Analyzer finished: \(tokens.count, privacy: .public) words in \(Transcription.elapsed(since: started), privacy: .public) s")
         return tokens
     }
 
@@ -187,16 +713,44 @@ nonisolated private enum ModernEngine {
 nonisolated private enum LegacyEngine {
     static let sampleRate = 16_000.0
 
-    static func transcribe(_ audio: AVAudioFile, duration: Double, progress: @escaping @Sendable (Double) -> Void) async throws -> [Transcript.Token] {
-        try await authorize()
-        let preferred = SFSpeechRecognizer(locale: .current)
-        guard let recognizer = preferred ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US")) else {
-            throw ConversionError.failed("Speech recognition isn't available on this Mac.")
-        }
-        guard recognizer.supportsOnDeviceRecognition else {
-            throw ConversionError.failed("This Mac can't recognize \(Transcription.languageName(recognizer.locale)) speech without the internet. Turn on Dictation in System Settings › Keyboard to download it, then try again.")
+    /// Why the older engine can't run here, each with what to do about it.
+    enum Unavailable: Error, CustomStringConvertible {
+        case notAllowed
+        case noRecognizer
+        case notOnDevice(Locale)
+
+        var message: String {
+            switch self {
+            case .notAllowed:
+                "Convert Anything isn't allowed to recognize speech. Turn it on in System Settings › Privacy & Security › Speech Recognition."
+            case .noRecognizer:
+                "Speech recognition isn't available on this Mac."
+            case .notOnDevice(let locale):
+                "This Mac can't recognize \(Transcription.languageName(locale)) speech without the internet. Turn on Dictation in System Settings › Keyboard to download it, then try again."
+            }
         }
 
+        var description: String {
+            switch self {
+            case .notAllowed: "not allowed to recognize speech"
+            case .noRecognizer: "no recognizer"
+            case .notOnDevice(let locale): "no on-device model for \(locale.identifier)"
+            }
+        }
+    }
+
+    /// `language` is the one SpeechAnalyzer chose, when it got that far; otherwise the first preferred
+    /// language this recognizer knows, or English.
+    static func transcribe(_ url: URL, duration: Double, language: Locale?,
+                           progress: @escaping @Sendable (Double) -> Void) async throws -> [Transcript.Token] {
+        let log = Transcription.log
+        try await authorize()
+        guard let recognizer = recognizer(for: language) else { throw Unavailable.noRecognizer }
+        let onDevice = recognizer.supportsOnDeviceRecognition && !Debug.isOn("CONVERT_ANYTHING_NO_LEGACY_SPEECH")
+        log.notice("SFSpeechRecognizer in \(recognizer.locale.identifier, privacy: .public), on-device model \(onDevice ? "present" : "missing", privacy: .public)")
+        guard onDevice else { throw Unavailable.notOnDevice(recognizer.locale) }
+
+        let audio = try AVAudioFile(forReading: url)
         guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false),
               let converter = AVAudioConverter(from: audio.processingFormat, to: format) else {
             throw ConversionError.failed("Couldn't read this file's sound.")
@@ -206,6 +760,7 @@ nonisolated private enum LegacyEngine {
         var offset = 0.0
         var tokens: [Transcript.Token] = []
         var finished = false
+        let started = ContinuousClock.now
         while !finished || !samples.isEmpty {
             try Task.checkCancellation()
             if !finished { finished = try read(audio, through: converter, into: &samples, upTo: maxChunk) }
@@ -213,25 +768,45 @@ nonisolated private enum LegacyEngine {
                 ?? (samples.count > maxChunk ? quietestPoint(in: samples, from: searchFrom, to: maxChunk) : samples.count)
             // A silent piece (the quiet tail after the last words) makes the old recognizer invent a word.
             if hasSound(samples[0..<cut]) {
-                tokens += try await recognize(samples[0..<cut], offset: offset, with: recognizer, format: format)
+                let piece = Array(samples[0..<cut]), pieceOffset = offset
+                tokens += try await Transcription.watch("Speech recognizer", limit: StallLimit.legacyPiece) { _ in
+                    try await recognize(piece[...], offset: pieceOffset, with: recognizer, format: format)
+                }
             }
             samples.removeFirst(cut)
             offset += Double(cut) / sampleRate
             progress(min(1, offset / duration))
         }
+        log.notice("SFSpeechRecognizer finished: \(tokens.count, privacy: .public) words in \(Transcription.elapsed(since: started), privacy: .public) s")
         return tokens
+    }
+
+    private static func recognizer(for language: Locale?) -> SFSpeechRecognizer? {
+        if let language, let recognizer = SFSpeechRecognizer(locale: language) { return recognizer }
+        let supported = Array(SFSpeechRecognizer.supportedLocales())
+        for identifier in SpeechLanguages.preferred {
+            if let locale = SpeechLanguages.match(identifier, in: supported), let recognizer = SFSpeechRecognizer(locale: locale) {
+                return recognizer
+            }
+        }
+        return SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     }
 
     private static func authorize() async throws {
         var status = SFSpeechRecognizer.authorizationStatus()
         if status == .notDetermined {
-            status = await withCheckedContinuation { continuation in
-                SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
+            Transcription.log.notice("Waiting for permission to recognize speech")
+            do {
+                status = try await Transcription.watch("Permission prompt", limit: StallLimit.permission) { _ in
+                    await withCheckedContinuation { continuation in
+                        SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
+                    }
+                }
+            } catch is Stalled {
+                throw Unavailable.notAllowed
             }
         }
-        guard status == .authorized else {
-            throw ConversionError.failed("Convert Anything isn't allowed to recognize speech. Turn it on in System Settings › Privacy & Security › Speech Recognition.")
-        }
+        guard status == .authorized else { throw Unavailable.notAllowed }
     }
 
     /// Converts audio to 16 kHz mono until `samples` holds `limit` samples. Returns true at the end of the file.
