@@ -500,37 +500,50 @@ nonisolated private enum ModernEngine {
         let log = Transcription.log
         let modules = [transcriber(locale)]
         let started = ContinuousClock.now
+        let download = DownloadInProgress()
         do {
-            let downloaded = try await Transcription.watch("Model download", limit: StallLimit.download) { heartbeat -> Bool in
-                if simulateStall {
-                    log.notice("Model for \(locale.identifier, privacy: .public): downloading (simulated stall)")
-                    progress(0.16)
-                    await Debug.hang()
-                }
-                guard let installation = try await AssetInventory.assetInstallationRequest(supporting: modules) else {
-                    return false
-                }
-                log.notice("Model for \(locale.identifier, privacy: .public): downloading")
-                heartbeat.beat()
-                let watcher = Task {
-                    var last = -1.0, logged = -1
-                    while !Task.isCancelled {
-                        let fraction = installation.progress.fractionCompleted
-                        if fraction != last {
-                            last = fraction
-                            heartbeat.beat()
-                            progress(fraction)
-                            if Int(fraction * 10) > logged {
-                                logged = Int(fraction * 10)
-                                log.notice("Model download \(logged * 10, privacy: .public)%")
-                            }
-                        }
-                        try? await Task.sleep(for: .milliseconds(250))
+            // downloadAndInstall() ignores cancellation (and Progress.cancel()); giving up the language's
+            // reservation is what stops it. Only when the person cancels: after a stall it keeps going in the
+            // background, so the next try finds the model (or most of it) already there.
+            let downloaded = try await withTaskCancellationHandler {
+                try await Transcription.watch("Model download", limit: StallLimit.download) { heartbeat -> Bool in
+                    if simulateStall {
+                        log.notice("Model for \(locale.identifier, privacy: .public): downloading (simulated stall)")
+                        progress(0.16)
+                        await Debug.hang()
                     }
+                    guard let installation = try await AssetInventory.assetInstallationRequest(supporting: modules) else {
+                        return false
+                    }
+                    log.notice("Model for \(locale.identifier, privacy: .public): downloading")
+                    heartbeat.beat()
+                    let watcher = Task {
+                        var last = -1.0, logged = -1
+                        while !Task.isCancelled {
+                            let fraction = installation.progress.fractionCompleted
+                            if fraction != last {
+                                last = fraction
+                                heartbeat.beat()
+                                progress(fraction)
+                                if Int(fraction * 10) > logged {
+                                    logged = Int(fraction * 10)
+                                    log.notice("Model download \(logged * 10, privacy: .public)%")
+                                }
+                            }
+                            try? await Task.sleep(for: .milliseconds(250))
+                        }
+                    }
+                    defer { watcher.cancel(); download.end() }
+                    guard download.begin() else { throw CancellationError() }
+                    try await installation.downloadAndInstall()
+                    return true
                 }
-                defer { watcher.cancel() }
-                try await installation.downloadAndInstall()
-                return true
+            } onCancel: {
+                guard download.cancel() else { return }
+                Task {
+                    let released = await AssetInventory.release(reservedLocale: locale)
+                    log.notice("Model for \(locale.identifier, privacy: .public): download cancelled (\(released ? "stopped" : "couldn't stop it", privacy: .public))")
+                }
             }
             if downloaded {
                 log.notice("Model for \(locale.identifier, privacy: .public): downloaded in \(Transcription.elapsed(since: started), privacy: .public) s")
@@ -542,6 +555,17 @@ nonisolated private enum ModernEngine {
             log.error("Model for \(locale.identifier, privacy: .public): \(Transcription.describe(error), privacy: .public)")
             throw ModernFailure.download(locale)
         }
+    }
+
+    /// Whether a model download is under way, so cancelling knows there's one to stop.
+    private nonisolated final class DownloadInProgress: @unchecked Sendable {
+        private let lock = NSLock()
+        private var running = false, cancelled = false
+        /// False when the person already cancelled, so the download mustn't start.
+        func begin() -> Bool { lock.withLock { running = !cancelled; return running } }
+        func end() { lock.withLock { running = false } }
+        /// True when there's a download to stop.
+        func cancel() -> Bool { lock.withLock { cancelled = true; return running } }
     }
 
     /// Transcribes about 15 seconds of audio, from the first sound on, in every candidate language at once
