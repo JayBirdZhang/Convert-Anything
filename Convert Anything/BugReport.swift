@@ -146,11 +146,13 @@ nonisolated struct Redactor: Sendable {
 
     func callAsFunction(_ text: String) -> String {
         var s = text
-        // Known names first, longest first, so "Report.docx" goes before "Report".
+        // Known names first, longest first, so "Tax Return.pdf" goes before "Tax Return".
         for name in Set(names).filter({ $0.count >= 3 }).sorted(by: { $0.count > $1.count }) {
-            s = s.replacingOccurrences(of: name, with: "‹file›", options: .caseInsensitive)
+            let word = #"(?i)(?<![\p{L}\p{N}])"# + NSRegularExpression.escapedPattern(for: name) + #"(?![\p{L}\p{N}])"#
+            s = replace(word, in: s) { _ in "‹file›" }
         }
-        s = replace(#"file://[^\s"'“”‘’<>(),;\]}]*"#, in: s) { _ in "‹path›" }
+        // Percent-encoded, so it ends at whitespace or the end of its {UserInfo}; not at a trailing comma.
+        s = replace(#"file://[^\s"“”<>}]*[^\s"“”<>},.;]"#, in: s) { _ in "‹path›" }
         s = redactPaths(s)
         s = replace(#"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+"#, in: s) { _ in "‹email›" }
         // Apple quotes file names in curly quotes: The file “Report.docx” couldn’t be opened.
@@ -184,13 +186,26 @@ nonisolated struct Redactor: Sendable {
                 i += 1
                 continue
             }
-            var end = i
-            while end < chars.count, !Self.afterPath.contains(chars[end]) { end += 1 }
-            let span = String(chars[i..<end])
-            // Stop after the last file name, so the rest of the sentence survives.
-            let ns = NSRange(span.startIndex..., in: span)
-            if let last = Self.fileNameEnd.matches(in: span, range: ns).last, let range = Range(last.range, in: span) {
-                end = i + span.distance(from: span.startIndex, to: range.upperBound)
+            // Names can hold spaces, commas and parentheses, so only a clear delimiter ends a path:
+            // an unbalanced ")", or a comma before the next "Key=" of an error's UserInfo.
+            var end = i, depth = 0
+            scan: while end < chars.count {
+                switch chars[end] {
+                case "(": depth += 1
+                case ")": if depth == 0 { break scan } else { depth -= 1 }
+                case ",": if Self.keyFollows(chars, at: end + 1) { break scan }
+                case let c where Self.afterPath.contains(c): break scan
+                default: break
+                }
+                end += 1
+            }
+            // Stop after the file name that ends the last path component, so the rest of the sentence survives.
+            if let slash = chars[i..<end].lastIndex(of: "/") {
+                let tail = String(chars[slash..<end])
+                if let last = Self.fileNameEnd.matches(in: tail, range: NSRange(tail.startIndex..., in: tail)).last,
+                   let range = Range(last.range, in: tail) {
+                    end = slash + tail.distance(from: tail.startIndex, to: range.upperBound)
+                }
             }
             out += replacement(for: String(chars[i..<end]))
             i = end
@@ -206,7 +221,17 @@ nonisolated struct Redactor: Sendable {
 
     private static let fileNameEnd = try! NSRegularExpression(pattern: #"\.[A-Za-z0-9]{1,8}(?=[\s.]|$)"#)
     private static let beforePath: Set<Character> = [" ", "\t", "\n", "\"", "'", "“", "‘", "(", "[", "{", "<", "=", ":", ","]
-    private static let afterPath: Set<Character> = ["\n", "\"", "”", "’", ",", ";", ")", "]", "}", ">", "|"]
+    private static let afterPath: Set<Character> = ["\n", "\"", "”", "]", "}", ">", "|"]
+
+    /// " NSUnderlyingError=…": the next entry of a UserInfo dictionary, or nothing more at all.
+    private static func keyFollows(_ chars: [Character], at start: Int) -> Bool {
+        var j = start
+        while j < chars.count, chars[j] == " " { j += 1 }
+        guard j < chars.count else { return true }
+        let keyStart = j
+        while j < chars.count, chars[j].isASCII, chars[j].isLetter || chars[j].isNumber || chars[j] == "_" { j += 1 }
+        return j > keyStart && j < chars.count && chars[j] == "="
+    }
     private static let systemFolders: Set<String> = ["Users", "Volumes", "private", "var", "tmp", "Applications",
                                                      "Library", "System", "usr", "opt", "dev", "etc"]
 
