@@ -45,8 +45,8 @@ https://github.com/user-attachments/assets/cd589974-3f86-4b3d-a146-ac4dc21ce3fd
 | Kind | Formats |
 |---|---|
 | **Images** | PNG, JPEG, HEIC, TIFF, GIF, BMP, WebP, AVIF, ICO, ICNS (app icons), TGA. Convert *from* but not to: camera RAW (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, PEF, SRW), Photoshop (PSD), SVG and JPEG XL (to JPEG XL only where macOS can write it) |
-| **Documents** | PDF, Markdown, TXT, HTML, Word (.docx/.doc), RTF, ODT, Pages, EPUB, PowerPoint (.pptx/.ppt), Keynote |
-| **Spreadsheets** | Excel (.xlsx/.xls), CSV, Numbers, JSON |
+| **Documents** | PDF, Markdown, TXT, HTML, Word (.docx/.doc), RTF, ODT, Pages, EPUB, PowerPoint (.pptx/.ppt), Keynote. Convert *from* but not to: OpenDocument presentations (ODP) |
+| **Spreadsheets** | Excel (.xlsx/.xls), CSV, Numbers, JSON. Convert *from* but not to: OpenDocument spreadsheets (ODS) |
 | **Audio** | MP3, WAV, M4A, AAC, FLAC, Ogg, Opus, AIFF |
 | **Video** | MP4, MOV, M4V, and video → GIF |
 | **Transcripts** | Audio or video → TXT, SRT or WebVTT (.vtt) subtitles; SRT ↔ WebVTT; subtitles → TXT or any document format |
@@ -102,7 +102,7 @@ No. Conversions use macOS's own frameworks plus two small bundled libraries and 
 
 **Do I need Microsoft Office?**
 No. Keynote, Pages and Numbers (free from Apple) are optional but give the best results for
-PowerPoint → PDF and Word → PDF, and Numbers is needed for Excel → PDF. The first time the app uses
+PowerPoint → PDF and Word → PDF, and Numbers is needed for Excel → PDF (and ODS → PDF). The first time the app uses
 one, macOS asks for permission to control it: click **OK**.
 
 **How do updates work?**
