@@ -229,9 +229,9 @@ nonisolated enum ODTWriter {
 
 // MARK: - Word → .odt
 
-/// The text system reads a Word file's fonts and paragraph styles well but drops its tables and pictures.
-/// Before it reads the file, tables become marker paragraphs (and HTML, which the text system does read as tables)
-/// and pictures become marker text; afterwards both are put back in place.
+/// The text system reads a Word file's direct formatting but drops its tables and pictures and ignores its styles.
+/// Before it reads the file, style formatting is copied onto the text, tables become marker paragraphs (and HTML,
+/// which the text system does read as tables) and pictures become marker text; afterwards both are put back.
 enum WordToODT {   // On the main actor: the text system reads HTML there
     static func convert(_ docx: URL, output: URL, workDir: URL) async throws {
         let folder = workDir.appending(path: "docx")
@@ -239,9 +239,6 @@ enum WordToODT {   // On the main actor: the text system reads HTML there
         let documentURL = folder.appending(path: "word/document.xml")
         var xml = try String(contentsOf: documentURL, encoding: .utf8)
         let hasPictures = xml.contains("<w:drawing") || xml.contains("<w:pict"), hasTables = xml.contains("<w:tbl")
-        guard hasPictures || hasTables else {
-            return try await ODTWriter.write(NSAttributedString(url: docx, options: [:], documentAttributes: nil), output: output, workDir: workDir)
-        }
 
         // Pictures: a drawing (or the alternate-content wrapper holding a drawing and its fallback) becomes marker text.
         var pictures: [ODTWriter.Picture] = []
@@ -282,6 +279,7 @@ enum WordToODT {   // On the main actor: the text system reads HTML there
                 return #"<w:p><w:r><w:t>ZZODTTABLE\#(index)ZZ</w:t></w:r></w:p>"#
             }
         }
+        xml = inlineStyles(xml, folder: folder)
         try xml.write(to: documentURL, atomically: true, encoding: .utf8)
         let prepared = workDir.appending(path: "prepared.docx")
         try await Tools.run("/usr/bin/zip", ["-q", "-X", "-r", prepared.path, "."], currentDirectory: folder)
@@ -300,6 +298,108 @@ enum WordToODT {   // On the main actor: the text system reads HTML there
             text.replaceCharacters(in: match.range, with: table)
         }
         try await ODTWriter.write(text, pictures: pictures, output: output, workDir: workDir)
+    }
+
+    /// The text system ignores formatting that lives in styles.xml (the document's default font, heading sizes,
+    /// theme fonts), which is how Google Docs and many templates format everything. Copying each paragraph's and
+    /// character style's formatting onto its runs, where nothing overrides it, lets the reader see it.
+    fileprivate static func inlineStyles(_ xml: String, folder: URL) -> String {
+        let word = folder.appending(path: "word")
+        guard let styles = (try? XMLDocument(contentsOf: word.appending(path: "styles.xml"), options: [.nodeLoadExternalEntitiesNever]))?.rootElement(),
+              let document = try? XMLDocument(xmlString: xml, options: [.nodePreserveWhitespace, .nodeLoadExternalEntitiesNever])
+        else { return xml }
+
+        // Theme fonts: major (headings) and minor (body).
+        var theme: [String: String] = [:]
+        if let text = try? String(contentsOf: word.appending(path: "theme/theme1.xml"), encoding: .utf8) {
+            for match in text.matches(of: /<a:(major|minor)Font>\s*<a:latin typeface="([^"]+)"/) {
+                theme[String(match.output.1)] = String(match.output.2)
+            }
+        }
+        let runOrder = ["w:rFonts", "w:b", "w:i", "w:caps", "w:strike", "w:color", "w:sz", "w:u"]
+        let paragraphOrder = ["w:spacing", "w:ind", "w:jc"]
+        func copy(_ element: XMLElement?, _ names: [String]) -> [String: XMLElement] {
+            var result: [String: XMLElement] = [:]
+            for name in names { if let found = element?.elements(forName: name).first { result[name] = found } }
+            if let fonts = result["w:rFonts"]?.copy() as? XMLElement {   // A theme font becomes its real name
+                for (themeAttribute, attribute) in [("w:asciiTheme", "w:ascii"), ("w:hAnsiTheme", "w:hAnsi")] {
+                    guard let value = fonts.attribute(forName: themeAttribute)?.stringValue,
+                          let name = theme[value.hasPrefix("major") ? "major" : "minor"] else { continue }
+                    fonts.removeAttribute(forName: themeAttribute)
+                    fonts.addAttribute(XMLNode.attribute(withName: attribute, stringValue: name) as! XMLNode)
+                }
+                result["w:rFonts"] = fonts.attribute(forName: "w:ascii") == nil ? nil : fonts
+            }
+            return result
+        }
+
+        struct Style { var basedOn: String?; var run: [String: XMLElement]; var paragraph: [String: XMLElement] }
+        var table: [String: Style] = [:]
+        var defaultParagraph: String?
+        for element in styles.elements(forName: "w:style") {
+            guard let id = element.attribute(forName: "w:styleId")?.stringValue else { continue }
+            table[id] = Style(basedOn: element.elements(forName: "w:basedOn").first?.attribute(forName: "w:val")?.stringValue,
+                              run: copy(element.elements(forName: "w:rPr").first, runOrder),
+                              paragraph: copy(element.elements(forName: "w:pPr").first, paragraphOrder))
+            if element.attribute(forName: "w:type")?.stringValue == "paragraph", element.attribute(forName: "w:default")?.stringValue == "1" {
+                defaultParagraph = id
+            }
+        }
+        let defaults = styles.elements(forName: "w:docDefaults").first
+        let defaultRun = copy(defaults?.elements(forName: "w:rPrDefault").first?.elements(forName: "w:rPr").first, runOrder)
+        let defaultSpacing = copy(defaults?.elements(forName: "w:pPrDefault").first?.elements(forName: "w:pPr").first, paragraphOrder)
+
+        func resolved(_ id: String?) -> Style {   // Base styles first, so nearer ones win
+            var chain: [Style] = [], current = id, seen = Set<String>()
+            while let name = current, let style = table[name], seen.insert(name).inserted { chain.append(style); current = style.basedOn }
+            return chain.reversed().reduce(into: Style(run: [:], paragraph: [:])) { result, style in
+                result.run.merge(style.run) { $1 }; result.paragraph.merge(style.paragraph) { $1 }
+            }
+        }
+        var cache: [String: Style] = [:]
+        func style(_ id: String) -> Style {
+            if let hit = cache[id] { return hit }
+            let result = resolved(id); cache[id] = result; return result
+        }
+        /// Adds each property the element's own properties don't set, keeping Word's element order.
+        func fill(_ owner: XMLElement, propertiesName: String, with properties: [String: XMLElement], order: [String]) {
+            guard !properties.isEmpty else { return }
+            var target = owner.elements(forName: propertiesName).first
+            if target == nil {
+                let created = XMLElement(name: propertiesName); owner.insertChild(created, at: 0); target = created
+            }
+            guard let target else { return }
+            let anchor = target.elements(forName: "w:rStyle").first ?? target.elements(forName: "w:pStyle").first
+            var index = anchor.map { $0.index + 1 } ?? 0
+            for name in order where target.elements(forName: name).isEmpty {
+                guard let property = properties[name]?.copy() as? XMLElement else { continue }
+                // The reader takes any <w:b> as bold, even w:val="0"; leaving it out says "not bold" too.
+                if ["0", "false", "off", "none"].contains(property.attribute(forName: "w:val")?.stringValue ?? "") { continue }
+                target.insertChild(property, at: min(index, target.childCount)); index += 1
+            }
+        }
+
+        let paragraphs = (try? document.nodes(forXPath: "//*[name()='w:p']")) ?? []
+        for case let paragraph as XMLElement in paragraphs {
+            let id = paragraph.elements(forName: "w:pPr").first?.elements(forName: "w:pStyle").first?.attribute(forName: "w:val")?.stringValue
+                ?? defaultParagraph
+            var paragraphStyle = Style(run: defaultRun, paragraph: defaultSpacing)
+            if let id { let own = style(id); paragraphStyle.run.merge(own.run) { $1 }; paragraphStyle.paragraph.merge(own.paragraph) { $1 } }
+            fill(paragraph, propertiesName: "w:pPr", with: paragraphStyle.paragraph, order: paragraphOrder)
+            // Runs of this paragraph, not of a paragraph nested in a text box inside it.
+            let runs = (try? paragraph.nodes(forXPath: ".//*[name()='w:r']")) ?? []
+            for case let run as XMLElement in runs {
+                var owner = run.parent
+                while let node = owner, node.name != "w:p" { owner = node.parent }
+                guard owner === paragraph else { continue }
+                var properties = paragraphStyle.run
+                if let character = run.elements(forName: "w:rPr").first?.elements(forName: "w:rStyle").first?.attribute(forName: "w:val")?.stringValue {
+                    properties.merge(style(character).run) { $1 }
+                }
+                fill(run, propertiesName: "w:rPr", with: properties, order: runOrder)
+            }
+        }
+        return document.xmlString
     }
 
     private static func relationships(_ url: URL) -> [String: String] {
