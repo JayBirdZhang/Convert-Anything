@@ -166,11 +166,17 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Prototype tuning").font(.subheadline.weight(.medium)).foregroundStyle(.secondary)
             HStack {
-                Text("Spring-load delay")
+                Text("Wait before opening")
                 Spacer()
                 Text(String(format: "%.2f s", model.springDelay)).monospacedDigit().foregroundStyle(.secondary)
             }
             Slider(value: Binding(get: { model.springDelay }, set: { model.springDelay = ($0 * 20).rounded() / 20 }), in: 0.1...1.0).controlSize(.small)
+            HStack {
+                Text("Opens within")
+                Spacer()
+                Text("\(Int(model.openDistance)) pt below the menu bar").monospacedDigit().foregroundStyle(.secondary)
+            }
+            Slider(value: Binding(get: { model.openDistance }, set: { model.openDistance = ($0 / 10).rounded() * 10 }), in: 20...300).controlSize(.small)
             HStack {
                 Text(model.memory.isEmpty ? "No remembered formats" : "\(model.memory.count) remembered format\(model.memory.count == 1 ? "" : "s")")
                     .font(.subheadline).foregroundStyle(.secondary)

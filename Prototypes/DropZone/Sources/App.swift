@@ -33,6 +33,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Exists only while a drag is over the open menu: notices the mouse button going up anywhere.
     private var dragWatch: Timer?
+
+    /// Proximity open: listens only to mouse-down, mouse-dragged and mouse-up, which macOS sends only while
+    /// a button is held, so nothing runs while idle. Mouse events (unlike key events) need no permission.
+    private var proximityMonitor: Any?
+    private var dragChangeCountAtPress = -1
+    private var pressCarriesFiles: [URL]?    // nil = not checked yet this press
+    private var nearTimer: Timer?
     private var outsideClickMonitor: Any?
     private var iconGeneration = 0
 
@@ -60,6 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         Log.write("launched; spring delay \(model.springDelay)s")
+        startProximityMonitor()
         if CommandLine.arguments.contains("--demo") { runDemo() }
     }
 
@@ -153,6 +161,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.write("spring: fired after \(model.springDelay)s")
         beginDragMode(springFiles)
         if !panel.isVisible { showPanel() }
+    }
+
+    // MARK: Opening when a file comes near
+
+    /// The area that opens the menu: under the menu bar around the icon, as wide as the menu, reaching
+    /// `openDistance` down. The file never has to touch the top edge (where macOS opens Mission Control).
+    private func nearZone() -> NSRect? {
+        guard let icon = item.button?.window?.frame, icon.height >= 1, let screen = item.button?.window?.screen else { return nil }
+        let barBottom = screen.visibleFrame.maxY
+        let width: CGFloat = 340
+        let x = min(max(icon.midX - width / 2, screen.frame.minX), screen.frame.maxX - width)
+        return NSRect(x: x, y: barBottom - model.openDistance, width: width, height: screen.frame.maxY - barBottom + model.openDistance)
+    }
+
+    private func startProximityMonitor() {
+        proximityMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
+            MainActor.assumeIsolated { self?.proximityEvent(event.type) }
+        }
+    }
+
+    private func proximityEvent(_ type: NSEvent.EventType) {
+        switch type {
+        case .leftMouseDown:
+            // A drag writes to the drag pasteboard when it starts, so a new count later in this press means
+            // something is being dragged now (not a leftover from an earlier drag).
+            dragChangeCountAtPress = NSPasteboard(name: .drag).changeCount
+            pressCarriesFiles = nil
+        case .leftMouseUp:
+            cancelNear()
+            pressCarriesFiles = nil
+        case .leftMouseDragged:
+            let mouse = NSEvent.mouseLocation
+            let inZone = nearZone().map { NSMouseInRect(mouse, $0, false) } ?? false
+
+            // Already open from this drag: close it again if the file wanders well away without a drop.
+            if model.phase == .dragging, panel.isVisible {
+                let keep = panel.frame.insetBy(dx: -120, dy: -120)
+                if !inZone && !NSMouseInRect(mouse, keep, false) { closePanel(reason: "file moved away") }
+                return
+            }
+            guard inZone, !panel.isVisible || model.phase == .idle else { cancelNear(); return }
+            if pressCarriesFiles == nil {
+                let pasteboard = NSPasteboard(name: .drag)
+                guard pasteboard.changeCount != dragChangeCountAtPress else { return }   // Not a drag session (yet)
+                pressCarriesFiles = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+                Log.write("near: drag with \(pressCarriesFiles!.count) file(s) came within \(Int(model.openDistance)) pt")
+            }
+            guard let files = pressCarriesFiles, !files.isEmpty, nearTimer == nil else { return }
+            let timer = Timer(timeInterval: model.springDelay, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.nearTimer = nil
+                    Log.write("near: opened after \(self.model.springDelay)s near the icon")
+                    self.springFiles = files
+                    self.springFired()
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            nearTimer = timer
+        default: break
+        }
+    }
+
+    private func cancelNear() {
+        if nearTimer != nil { Log.write("near: left the area before the menu opened") }
+        nearTimer?.invalidate()
+        nearTimer = nil
     }
 
     // MARK: Dragging over the menu
@@ -271,7 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         resizePanel(to: hosting.fittingSize)
         panel.orderFrontRegardless()
         item.button?.highlight(true)
-        Log.write("panel: shown at \(panel.frame) on \(panel.screen?.localizedName ?? "?")")
+        Log.write("panel: shown at \(panel.frame) under icon \(item.button?.window?.frame ?? .zero) on \(panel.screen?.localizedName ?? "?")")
     }
 
     func closePanel(reason: String) {
@@ -317,6 +392,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.panel.isVisible, self.model.phase == .idle || self.model.phase == .chooser else { return }
+                // On macOS 27 a click on our own status icon also arrives here; the icon handles that one.
+                if let icon = self.item.button?.window?.frame, NSMouseInRect(NSEvent.mouseLocation, icon, false) { return }
                 self.closePanel(reason: "clicked outside")
             }
         }

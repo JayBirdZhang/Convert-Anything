@@ -24,14 +24,16 @@ The prototype is running: it's the second prism icon in your menu bar.
 A Finder window with test files is open.
 
 Try these:
-  1. Drag Photo.heic up onto the prism and hold still for a moment.
-     The menu opens with formats. Let go on one: a checkmark appears.
-  2. Drag a file onto the prism, then let go somewhere else. Nothing should happen.
+  1. Drag Photo.heic up toward the prism and hold it just below the menu bar.
+     No need to touch the top edge. The menu opens with formats.
+     Let go on one: a checkmark appears.
+  2. Drag a file near the prism, then let go somewhere else, or drag it away.
+     The menu should close.
   3. Select three photos (heic, png, jpg) and drag them together.
   4. Drag Mystery.xyz: it should say it can't convert it.
   5. Drop on "More…" to see every format.
   6. Drag Photo.heic again: your last choice should come first.
-  7. Click the prism to change the "Spring-load delay" if opening feels slow or fast.
+  7. Click the prism to tune "Wait before opening" and "Opens within" (how close).
 
 When you're done, come back here and press Return.
 STEPS
@@ -39,7 +41,7 @@ read -r || exit 0
 
 echo
 echo "What happened:"
-grep -E "spring: fired|dropped on|closed \(|wait restarted|drag entered" "$LOG" | sed 's/^ *[0-9.]*  /  /'
+grep -E "near: |spring: fired|dropped on|closed \(|wait restarted|drag entered" "$LOG" | sed 's/^ *[0-9.]*  /  /'
 pkill -x DropZoneProto
 echo
 echo "Prototype quit. You can delete \"Drop Zone Test Files\" from your Desktop."

@@ -36,6 +36,11 @@ import Observation
         didSet { UserDefaults.standard.set(springDelay, forKey: "springDelay") }
     }
 
+    /// How far below the menu bar a dragged file opens the menu.
+    var openDistance: Double = UserDefaults.standard.object(forKey: "openDistance") as? Double ?? 90 {
+        didSet { UserDefaults.standard.set(openDistance, forKey: "openDistance") }
+    }
+
     /// Last chosen target per source type ("heic" → "jpeg", "heic+png" → "combine").
     var memory: [String: String] = UserDefaults.standard.dictionary(forKey: "lastChoice") as? [String: String] ?? [:] {
         didSet { UserDefaults.standard.set(memory, forKey: "lastChoice") }

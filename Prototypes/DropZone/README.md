@@ -23,6 +23,11 @@ Every drag-state change is logged to `~/Library/Logs/DropZoneProto.log`.
 
 ## What it does
 
+- **A file coming near opens the menu.** Hold a dragged file within 90 pt below the menu bar, inside a menu-wide band around the icon, for the wait time. The distance is adjustable from 20 to 300 pt. You never have to touch the top edge, where macOS opens Mission Control.
+  - This works through a global monitor for mouse down, dragged and up only. macOS sends those only while a button is held, so idle cost stays zero, and mouse monitors need no permission.
+  - The drag pasteboard's change count tells a real drag from a click-drag that carries nothing. Dragging the file well away closes the menu again.
+  - Hovering on the icon itself still works too.
+
 - **Drag a file onto the prism and hold still** for the spring-load delay (default 0.3 s, adjustable in the menu, 0.1–1.0 s). The menu opens with format tiles on top. Moving more than 3 pt restarts the wait, so a drag that passes by doesn't open it.
 - **Let go on a tile** to see about 1 s of fake progress. The menu then closes, the icon shows a checkmark for 2 s, and the item is added to Recent.
 - **Let go anywhere else** (between tiles, on the icon, or off the menu) to cancel and close the menu.
