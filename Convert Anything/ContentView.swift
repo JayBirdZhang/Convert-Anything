@@ -43,6 +43,7 @@ struct ContentView: View {
             } else {
                 recent
             }
+            NotificationNote(feedback: model.feedback)
             Divider().padding(.horizontal, 16)
             footer
         }

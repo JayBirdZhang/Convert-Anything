@@ -11,6 +11,8 @@ import SwiftUI
         } label: {
             if model.hasActiveJobs {
                 Image(nsImage: StatusIcon.ring(progress: model.activeProgress, pulse: model.pulsePhase))
+            } else if model.feedback.showsCheck {
+                Image(nsImage: DoneIcon.image)
             } else {
                 Image(nsImage: IdleIcon.image)
             }

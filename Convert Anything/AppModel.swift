@@ -139,6 +139,9 @@ enum OriginalsMode: String, CaseIterable {
     private(set) var pulsePhase: Double = 0
     private var pulseTask: Task<Void, Never>?
 
+    /// The checkmark in the menu-bar icon and the notifications-off note.
+    let feedback = CompletionFeedback()
+
     /// Overall progress for the menu-bar ring: a single file's own progress (nil when it doesn't report any),
     /// or, with several files on the go, how much of all of them is done.
     var activeProgress: Double? {
@@ -413,6 +416,12 @@ enum OriginalsMode: String, CaseIterable {
                 }
             }
         } else if !hasActiveJobs {
+            // Just finished: batches not yet summarized are the ones that were converting.
+            if pulseTask != nil {
+                let recent = batches.filter { !$0.summarized }.flatMap(\.jobs)
+                feedback.conversionsFinished(succeeded: recent.contains { $0.state == .done }
+                    && !recent.contains { if case .failed = $0.state { true } else { false } })
+            }
             pulseTask?.cancel()
             pulseTask = nil
             pulsePhase = 0
@@ -431,6 +440,7 @@ enum OriginalsMode: String, CaseIterable {
             batch.summarized = true
             if combinePDFs, batch.to == .pdf { await combine(batch) }
             summarize(batch)
+            feedback.batchFinished(converted: batch.jobs.count { $0.state == .done })
         }
     }
 
