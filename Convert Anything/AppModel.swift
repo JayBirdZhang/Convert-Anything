@@ -118,9 +118,6 @@ enum OriginalsMode: String, CaseIterable {
     var exportAllPages: Bool {
         didSet { defaults.set(exportAllPages, forKey: Keys.allPages) }
     }
-    var removePhotoLocation: Bool {
-        didSet { defaults.set(removePhotoLocation, forKey: Keys.removePhotoLocation) }
-    }
     var launchAtLogin: Bool {
         didSet {
             guard launchAtLogin != (SMAppService.mainApp.status == .enabled) else { return }
@@ -181,7 +178,6 @@ enum OriginalsMode: String, CaseIterable {
         static let notifications = "showNotifications"
         static let allPages = "exportAllPages"
         static let editableSlides = "editableSlides"
-        static let removePhotoLocation = "removePhotoLocation"
     }
 
     init() {
@@ -196,7 +192,6 @@ enum OriginalsMode: String, CaseIterable {
         showNotifications = defaults.object(forKey: Keys.notifications) as? Bool ?? true
         exportAllPages = defaults.object(forKey: Keys.allPages) as? Bool ?? true
         editableSlides = defaults.object(forKey: Keys.editableSlides) as? Bool ?? true
-        removePhotoLocation = defaults.bool(forKey: Keys.removePhotoLocation)
         launchAtLogin = SMAppService.mainApp.status == .enabled
 
         UNUserNotificationCenter.current().delegate = notificationDelegate
@@ -347,8 +342,7 @@ enum OriginalsMode: String, CaseIterable {
                 allPages: exportAllPages,
                 outputExtension: job.fileURL.pathExtension.lowercased(),
                 editableSlides: editableSlides,
-                quality: quality,
-                keepsLocation: !removePhotoLocation)
+                quality: quality)
             let output = try await Converter.convert(request) { progress in
                 Task { @MainActor in
                     if job.isActive { job.state = .converting(progress: progress) }

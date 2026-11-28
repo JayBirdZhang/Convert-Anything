@@ -39,8 +39,8 @@ nonisolated struct OriginalDates: Sendable {
 
 nonisolated enum PhotoMetadata {
     /// The source's properties, ready for the converted picture: its rotation is already applied to the pixels,
-    /// EXIF's pixel size follows the new size, and the location is left out when asked.
-    static func carried(_ source: [CFString: Any], image: CGImage, keepLocation: Bool) -> [CFString: Any] {
+    /// and EXIF's pixel size follows the new size.
+    static func carried(_ source: [CFString: Any], image: CGImage) -> [CFString: Any] {
         var metadata = source
         metadata[kCGImagePropertyOrientation] = 1
         if var tiff = metadata[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
@@ -52,7 +52,6 @@ nonisolated enum PhotoMetadata {
             exif[kCGImagePropertyExifPixelYDimension] = image.height
             metadata[kCGImagePropertyExifDictionary] = exif
         }
-        if !keepLocation { metadata[kCGImagePropertyGPSDictionary] = nil }
         metadata[kCGImagePropertyPixelWidth] = nil
         metadata[kCGImagePropertyPixelHeight] = nil
         return metadata
@@ -74,6 +73,46 @@ nonisolated enum VideoMetadata {
         item.value = ISO8601DateFormatter().string(from: date) as NSString
         item.dataType = kCMMetadataBaseDataType_UTF8 as String
         return items + [item]
+    }
+
+    /// The export stamps the movie header with today's date. Writes the original's back, in place (16 bytes).
+    /// MOV and MP4 also have it in a metadata item, but for M4V the header is the only creation date macOS reads:
+    /// the export turns the item into iTunes' release date there.
+    static func stampHeader(of url: URL, with date: Date) {
+        guard let file = try? FileHandle(forUpdating: url) else { return }
+        defer { try? file.close() }
+        func box(at offset: UInt64) -> (type: String, size: UInt64, header: UInt64)? {
+            try? file.seek(toOffset: offset)
+            guard let head = try? file.read(upToCount: 16), head.count >= 8 else { return nil }
+            let size32 = head.prefix(4).reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+            let type = String(decoding: head[4..<8], as: UTF8.self)
+            if size32 == 1, head.count == 16 { return (type, head[8..<16].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }, 16) }
+            return size32 >= 8 ? (type, size32, 8) : nil
+        }
+        func find(_ type: String, from start: UInt64, to end: UInt64) -> (offset: UInt64, header: UInt64)? {
+            var offset = start
+            while offset < end, let b = box(at: offset) {
+                if b.type == type { return (offset, b.header) }
+                offset += b.size
+            }
+            return nil
+        }
+        guard let fileEnd = try? file.seekToEnd(),
+              let moov = find("moov", from: 0, to: fileEnd), let moovBox = box(at: moov.offset),
+              let mvhd = find("mvhd", from: moov.offset + moov.header, to: moov.offset + moovBox.size) else { return }
+        let body = mvhd.offset + mvhd.header
+        try? file.seek(toOffset: body)
+        guard let version = try? file.read(upToCount: 1)?.first else { return }
+        let seconds = UInt64(max(0, date.timeIntervalSince1970 + 2_082_844_800))     // the header counts from 1904
+        var stamp = Data()
+        if version == 1 {
+            stamp.appendBigEndian64(seconds); stamp.appendBigEndian64(seconds)
+        } else {
+            guard seconds <= UInt64(UInt32.max) else { return }
+            stamp.appendBigEndian(UInt32(seconds)); stamp.appendBigEndian(UInt32(seconds))
+        }
+        try? file.seek(toOffset: body + 4)
+        try? file.write(contentsOf: stamp)
     }
 }
 
@@ -393,6 +432,10 @@ nonisolated private enum MP4 {
 nonisolated extension Data {
     mutating func appendBigEndian(_ value: UInt32) {
         append(contentsOf: [UInt8(value >> 24), UInt8(value >> 16 & 0xFF), UInt8(value >> 8 & 0xFF), UInt8(value & 0xFF)])
+    }
+
+    mutating func appendBigEndian64(_ value: UInt64) {
+        appendBigEndian(UInt32(value >> 32)); appendBigEndian(UInt32(value & 0xFFFF_FFFF))
     }
 
     mutating func appendLittleEndian(_ value: UInt32) {

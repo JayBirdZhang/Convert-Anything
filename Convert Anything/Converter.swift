@@ -92,7 +92,6 @@ enum Converter {
         var outputExtension: String?   // The extension as typed (jpg vs jpeg), for naming page images
         var editableSlides = false     // PDF → pptx: editable text boxes instead of page pictures
         var quality: Quality = .balanced
-        var keepsLocation = true       // Photos keep their GPS position unless "Remove location from photos" is on
     }
 
     /// Returns the URL of the converted file inside `request.workDir`, or of a folder when the result is
@@ -109,8 +108,7 @@ enum Converter {
                 if request.to == .webp {
                     try WebP.write(imageAt: request.input, to: output, quality: request.quality)
                 } else {
-                    try ImageConversion.convert(request.input, to: request.to, output: output, quality: request.quality,
-                                                keepsLocation: request.keepsLocation)
+                    try ImageConversion.convert(request.input, to: request.to, output: output, quality: request.quality)
                 }
             }
         case .imageToPDF:
@@ -304,7 +302,7 @@ nonisolated enum ImageConversion {
         try decode(input, quality: quality, maxSide: maxSide).image
     }
 
-    static func convert(_ input: URL, to format: Format, output: URL, quality: Quality = .balanced, keepsLocation: Bool = true) throws {
+    static func convert(_ input: URL, to format: Format, output: URL, quality: Quality = .balanced) throws {
         // macOS's GIF writer keeps only the first frame and has no dithering; ours keeps animations.
         if format == .gif { return try GIFEncoder.write(imageAt: input, to: output, quality: quality) }
         var (image, properties) = try decode(input, quality: quality, maxSide: format == .ico ? 256 : format == .icns ? 1024 : nil)
@@ -321,7 +319,7 @@ nonisolated enum ImageConversion {
             image = try image.flattenedOnWhite()
         }
 
-        var metadata = PhotoMetadata.carried(properties, image: image, keepLocation: keepsLocation)
+        var metadata = PhotoMetadata.carried(properties, image: image)
         metadata[kCGImageDestinationLossyCompressionQuality] = quality.imageQuality
         try write(image, to: output, format: format, properties: metadata)
     }

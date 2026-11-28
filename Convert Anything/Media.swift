@@ -68,11 +68,13 @@ nonisolated enum VideoExport {
         }
         presets.append(request.quality == .small ? AVAssetExportPreset1920x1080 : AVAssetExportPresetHighestQuality)
         let metadata = await VideoMetadata.exportItems(for: asset)
+        let date = try? await asset.load(.creationDate)?.load(.dateValue)
 
         for (index, preset) in presets.enumerated() {
             do {
                 try await run(asset: asset, preset: preset, output: output, fileType: MediaConversion.fileType(request.to),
                               metadata: metadata, progress: progress)
+                if let date { VideoMetadata.stampHeader(of: output, with: date) }
                 return
             } catch let error as ConversionError where error.isCancellation {
                 throw error

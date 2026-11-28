@@ -35,7 +35,7 @@ https://github.com/user-attachments/assets/cd589974-3f86-4b3d-a146-ac4dc21ce3fd
 - **Just rename it.** That's all you have to do to convert a file.
 - **Lives in the menu bar.** Watches the folders you choose (Desktop, Documents and Downloads by default).
 - **Private.** Everything runs on your Mac: no uploads, no accounts, all offline.
-- **Keeps the details.** Converted files keep the original's dates, photos their EXIF (location optional), songs their tags and cover art.
+- **Keeps the details.** Converted files keep the original's dates, photos their EXIF, songs their tags and cover art.
 - **Undo by renaming back.** Change the extension back or just ⌘ + Z to get the original.
 - **Many files at once.** Select them, right-click → Rename..., and replace the extension.
 - **History by day.** Recent conversions in the menu, color-coded by kind of file.
