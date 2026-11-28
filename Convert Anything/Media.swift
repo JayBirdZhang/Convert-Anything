@@ -294,7 +294,7 @@ nonisolated private protocol PCMSource {
 /// Core Audio reads audio files directly (including FLAC and Ogg); videos go through AVFoundation.
 nonisolated private func openPCMSource(_ url: URL, isVideo: Bool) async throws -> PCMSource {
     if !isVideo, let file = try? AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false) {
-        return FileSource(file: file)
+        return ShortBlockFLACSource.isNeeded(for: file) ? try ShortBlockFLACSource(url: url, file: file) : FileSource(file: file)
     }
     return try await TrackSource.open(url)
 }
@@ -307,9 +307,101 @@ nonisolated private final class FileSource: PCMSource {
     var bitDepth: UInt32 { file.fileFormat.streamDescription.pointee.mBitsPerChannel }
 
     func read() throws -> AVAudioPCMBuffer? {
-        guard file.framePosition < file.length,
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 32_768) else { return nil }
-        try file.read(into: buffer)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 32_768) else { return nil }
+        // When Core Audio opens a file but can't decode it, `framePosition` and `read` raise an Objective-C
+        // exception rather than throw, which would quit the app.
+        var readError: Error?
+        if CACatchException({
+            guard file.framePosition < file.length else { return }
+            do { try file.read(into: buffer) } catch { readError = error }
+        }) != nil {
+            throw ConversionError.failed("This Mac can't decode this file's audio.")
+        }
+        if let readError { throw readError }
+        return buffer.frameLength > 0 ? buffer : nil
+    }
+}
+
+/// FLAC in blocks of under 192 frames (ffmpeg writes these from MP3s), which Core Audio's FLAC decoder refuses
+/// to set up for. It decodes them fine when told the blocks are longer, since each frame's header gives its real
+/// length, so this reads the packets itself and describes them as 4096-frame blocks.
+nonisolated private final class ShortBlockFLACSource: PCMSource {
+    let format: AVAudioFormat
+    let length: AVAudioFramePosition
+    let bitDepth: UInt32
+    private let audioFile: AudioFileID
+    private let converter: AVAudioConverter
+    private let packets: AVAudioCompressedBuffer
+    private var nextPacket: Int64 = 0
+
+    static func isNeeded(for file: AVAudioFile) -> Bool {
+        let description = file.fileFormat.streamDescription.pointee
+        return description.mFormatID == kAudioFormatFLAC && description.mFramesPerPacket < 192
+    }
+
+    init(url: URL, file: AVAudioFile) throws {
+        let failed = ConversionError.failed("This Mac can't decode this file's audio.")
+        var id: AudioFileID?
+        guard AudioFileOpenURL(url as CFURL, .readPermission, 0, &id) == noErr, let id else { throw failed }
+        audioFile = id
+        var size: UInt32 = 0
+        AudioFileGetPropertyInfo(id, kAudioFilePropertyMagicCookieData, &size, nil)
+        var cookie = Data(count: Int(size))
+        let status = cookie.withUnsafeMutableBytes { AudioFileGetProperty(id, kAudioFilePropertyMagicCookieData, &size, $0.baseAddress!) }
+        // The cookie is a 'dfLa' box; STREAMINFO's minimum and maximum block size follow its version and block header.
+        guard status == noErr, let box = cookie.range(of: Data("dfLa".utf8)), box.upperBound + 12 <= cookie.count else {
+            AudioFileClose(id)
+            throw failed
+        }
+        cookie.replaceSubrange(box.upperBound + 8 ..< box.upperBound + 12, with: [0x10, 0x00, 0x10, 0x00])
+
+        var description = file.fileFormat.streamDescription.pointee
+        description.mFramesPerPacket = 4096
+        var maxPacketSize: UInt32 = 0
+        size = 4
+        AudioFileGetProperty(id, kAudioFilePropertyPacketSizeUpperBound, &size, &maxPacketSize)
+        guard let input = AVAudioFormat(streamDescription: &description, channelLayout: file.fileFormat.channelLayout),
+              maxPacketSize > 0 else {
+            AudioFileClose(id)
+            throw failed
+        }
+        input.magicCookie = cookie
+        guard let converter = AVAudioConverter(from: input, to: file.processingFormat) else {
+            AudioFileClose(id)
+            throw failed
+        }
+        self.converter = converter
+        packets = AVAudioCompressedBuffer(format: input, packetCapacity: 256, maximumPacketSize: Int(maxPacketSize))
+        format = file.processingFormat
+        length = file.length
+        bitDepth = file.fileFormat.streamDescription.pointee.mBitsPerChannel
+    }
+
+    deinit { AudioFileClose(audioFile) }
+
+    func read() throws -> AVAudioPCMBuffer? {
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 32_768) else { return nil }
+        var status = AVAudioConverterOutputStatus.error
+        let exception = CACatchException {
+            status = converter.convert(to: buffer, error: nil) { [self] _, inputStatus in
+                var bytes = UInt32(packets.maximumPacketSize) * packets.packetCapacity
+                var count = packets.packetCapacity
+                let result = AudioFileReadPacketData(audioFile, false, &bytes, packets.packetDescriptions, nextPacket, &count, packets.data)
+                guard result == noErr || result == kAudioFileEndOfFileError, count > 0 else {
+                    inputStatus.pointee = .endOfStream
+                    return nil
+                }
+                for index in 0..<Int(count) { packets.packetDescriptions?[index].mVariableFramesInPacket = 0 }
+                nextPacket += Int64(count)
+                packets.packetCount = count
+                packets.byteLength = bytes
+                inputStatus.pointee = .haveData
+                return packets
+            }
+        }
+        if exception != nil || status == .error {
+            throw ConversionError.failed("This Mac can't decode this file's audio.")
+        }
         return buffer.frameLength > 0 ? buffer : nil
     }
 }
