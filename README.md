@@ -95,6 +95,8 @@ Allow notifications when asked, and turn on **Open at login** if you want it alw
 
 Hint: To convert multiple files at once, select them, right-click → Rename..., and replace the extension.
 
+**Shortcuts and Terminal.** Shortcuts has a **Convert File** action. For Terminal, click **Settings → Command-line tool → Install…**, then run `convert-anything photo.heic jpg` or `convert-anything notes.md ~/Desktop/notes.docx` (`--help` lists the options). Both save the result next to the original (unless you give an output path) and use the app's settings, without adding to the menu's history.
+
 ## FAQ
 
 **Do my files leave my Mac?**

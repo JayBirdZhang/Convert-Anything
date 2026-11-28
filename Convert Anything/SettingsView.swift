@@ -22,6 +22,8 @@ struct SettingsView: View {
                         SettingRow("Open at login") {
                             Toggle("Open at login", isOn: $model.launchAtLogin)
                         }
+                        CardDivider()
+                        CommandLineToolRow()
                     }
                     Card(title: "Updates") {
                         SettingRow("Check automatically", help: "Look for a new version about once a day and offer to install it.") {
@@ -123,7 +125,7 @@ struct SettingsView: View {
 }
 
 /// A label (and optional second line) on the left, its control on the right.
-private struct SettingRow<Control: View>: View {
+struct SettingRow<Control: View>: View {
     let title: String
     var detail: String?
     var help: String?

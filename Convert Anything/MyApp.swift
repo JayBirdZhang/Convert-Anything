@@ -1,6 +1,6 @@
 import SwiftUI
 
-@main struct MyApp: App {
+struct MyApp: App {   // Started by `Entry` (CommandLineTool.swift) unless run as a command
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AppModel()
 
